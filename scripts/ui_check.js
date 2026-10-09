@@ -171,6 +171,49 @@ function startFakeLLM() {
   check("「测试连接」打通本地模型链路", $("result-dm").className.indexOf("ok") >= 0, rtxt);
   check("探测出该模型支持工具调用", rtxt.indexOf("支持工具调用") > 0, rtxt);
 
+  // ---- 剧本卡片：读取 / 切片 / 次级 prompt ----
+  check("抽屉里有剧本卡片", !!$("script-card"), "");
+  const rows = $("script-card").querySelectorAll(".script-item");
+  check("剧本列表渲染出至少 2 个条目", rows.length >= 2, String(rows.length));
+  const activeRow = Array.from(rows).find((r) => r.querySelector(".tag").textContent === "当前");
+  check("当前活动剧本被标出", !!activeRow, Array.from(rows).map((r) => r.textContent).join(" | "));
+
+  // 点列表项 → 填进文件框
+  const otherRow = Array.from(rows).find((r) => r !== activeRow);
+  otherRow.click();
+  await sleep(600);
+  check("点击列表项会填入剧本文件", !!$("script-path").value, $("script-path").value);
+  check("切片预览出现", $("script-slots").children.length >= 1, String($("script-slots").children.length));
+  check("读取结果给出切片数", $("script-result").textContent.indexOf("切片") > 0, $("script-result").textContent);
+  check("次级 prompt（DM）已生成", $("script-prompt").textContent.indexOf("【剧本】") >= 0, $("script-prompt").textContent.slice(0, 60));
+  check("次级 prompt（小助手）已生成且不含切片索引",
+    $("script-prompt-public").textContent.indexOf("【剧本】") >= 0
+      && $("script-prompt-public").textContent.indexOf("【切片索引】") < 0,
+    $("script-prompt-public").textContent.slice(0, 60));
+
+  // 越界路径必须被服务端拦下，界面上显示为错误
+  $("script-path").value = "../../server/main.py";
+  $("script-card").querySelectorAll(".slot-actions .btn")[0].click();
+  await sleep(600);
+  check("越界路径在界面上报错", $("script-result").className.indexOf("err") >= 0, $("script-result").textContent);
+
+  // 粘贴内容也能切片
+  $("script-path").value = "";
+  $("script-content").value = "# 序章\n渡船靠岸。\n\n# 尾声\n钟声响起。";
+  $("script-card").querySelectorAll(".slot-actions .btn")[0].click();
+  await sleep(600);
+  check("粘贴内容也能切片（2 片）",
+    $("script-slots").children.length === 2 && $("script-result").className.indexOf("err") < 0,
+    $("script-slots").children.length + " / " + $("script-result").textContent);
+  $("script-content").value = "";
+
+  // 设为活动剧本（房主）—— 指向当前脚本，幂等
+  $("script-path").value = activeRow ? activeRow.querySelector(".meta").textContent.split(" · ")[0] : "";
+  $("script-card").querySelectorAll(".slot-actions .btn")[1].click();
+  await sleep(800);
+  check("房主可切换活动剧本", $("script-result").className.indexOf("ok") >= 0, $("script-result").textContent);
+  check("切换后提示写进旁白流", w.document.getElementById("log").textContent.indexOf("活动剧本已切换") > 0, "");
+
   // ---- 保存并连接 ----
   sent.length = 0;
   $("settings-save").click();
@@ -210,6 +253,10 @@ function startFakeLLM() {
   check("非房主时 DM 卡片被锁", $("card-dm").classList.contains("locked"), $("card-dm").className);
   check("非房主时 DM 无法切换模式", $("card-dm").querySelectorAll(".seg button")[0].disabled === true);
   check("非房主时给出说明文案", $("card-dm").querySelector(".lock-note").textContent.indexOf("房主") >= 0, $("card-dm").querySelector(".lock-note").textContent);
+  const scriptBtns = $("script-card").querySelectorAll(".slot-actions .btn");
+  check("非房主时剧本卡片也被锁", $("script-card").querySelector(".lock-note").textContent.indexOf("房主") >= 0, "");
+  check("非房主不能「设为活动剧本」", scriptBtns[1].disabled === true, "disabled=" + scriptBtns[1].disabled);
+  check("非房主仍可「读取并切片」（只读）", scriptBtns[0].disabled === false, "");
 
   // ---- 清除本机设置 ----
   $("settings-clear").click();

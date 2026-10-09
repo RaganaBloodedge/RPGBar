@@ -29,6 +29,7 @@ from server.dice import seed as dice_seed
 from server.dm import DM
 from server.llm import ToolCallingUnsupported, build_provider
 from server.rag import ScriptStore
+from server.script_loader import build_script_prompt, parse_script
 from server.state_machine import GameState
 
 SCRIPT = Path(__file__).resolve().parent / "sample_script.json"
@@ -256,9 +257,157 @@ async def run_unit_totsk():
         dice_mod.roll_check = real_roll
 
 
+async def run_unit_scripts():
+    """剧本读取 / 自动切片 / 次级 prompt：验证「System 管职责、次级 prompt 管内容」的分层。"""
+    print("== 进程内校验：剧本读取、切片与次级 prompt 分层 ==")
+
+    # --- 1. 结构化剧本：切片 = 剧本设定 + 每个场景一个 ---
+    st = ScriptStore(TOTSK, label="totsk_l1.json")
+    check("切片数 = 1 个设定 + 9 个场景", len(st.chunk_list) == 10, str(len(st.chunk_list)))
+    check("首个切片是剧本设定", st.chunk_list[0].kind == "meta" and st.chunk_list[0].id == "__meta__",
+          f"{st.chunk_list[0].kind}/{st.chunk_list[0].id}")
+    check("场景切片 id 与场景 id 一致",
+          {c.id for c in st.chunk_list if c.kind == "scene"} == set(st.scenes),
+          str(sorted(c.id for c in st.chunk_list if c.kind == "scene")))
+    check("设定切片包含剧本原文（世界观/语气）", st.chunk_list[0].text.strip() == st.system.strip(), "")
+    check("场景切片带关键词（供 RAG 与索引展示）",
+          any(c.keywords for c in st.chunk_list if c.kind == "scene"), "")
+    check("结构化剧本无自检告警", st.warnings == [], str(st.warnings))
+
+    # --- 2. 次级 prompt（DM）：完整版 ---
+    p_dm = st.script_prompt
+    check("次级 prompt 含剧本名", st.title in p_dm, p_dm[:60])
+    check("次级 prompt 含世界观/语气原文", "语气指南" in p_dm, p_dm[:200])
+    check("次级 prompt 含切片索引", "【切片索引】" in p_dm and "tomb_mouth" in p_dm, p_dm[-260:])
+    check("次级 prompt 只列索引、不展开正文（省 token）", "【DM 内幕】" not in p_dm, "")
+    check("次级 prompt 用相对路径而非本机绝对路径",
+          "totsk_l1.json" in p_dm and "E:\\" not in p_dm and "E:/" not in p_dm, p_dm[:120])
+
+    # --- 3. 次级 prompt（小助手）：公开版，不给索引与内幕 ---
+    p_adv = st.script_prompt_public
+    check("小助手次级 prompt 含剧本名与背景", st.title in p_adv and st.premise[:8] in p_adv, p_adv[:120])
+    check("小助手次级 prompt 不含场景索引（防剧透）",
+          not any(sid in p_adv for sid in st.scenes), p_adv)
+    check("小助手次级 prompt 不含 DM 内幕",
+          "DM 内幕" not in p_adv and "DM内幕" not in p_adv, "")
+
+    # --- 4. System prompt 只管职责：不夹带剧本内容 ---
+    state = GameState(st, st.start_scene)
+    state.add_player("A", {"cls": "战士"})
+    n_agent = NarratorAgent(st, None)
+    a_agent = AdvisorAgent(st, None)
+    n_sys = n_agent.system_prompt(NarratorContext(state=state, player_name="A"))
+    a_sys = a_agent.system_prompt(AdvisorContext(state=state, player_name="A"))
+    check("DM 的 System prompt 是职责说明（含「你的职责」）", "你的职责" in n_sys, n_sys[:60])
+    check("DM 的 System prompt 不含剧本正文", "语气指南" not in n_sys and "根窖" not in n_sys, "")
+    check("DM 的 System prompt 不含剧本标题", st.title not in n_sys, "")
+    check("DM 的 System prompt 不含场景 id",
+          not any(sid in n_sys for sid in st.scenes), "")
+    check("小助手 System prompt 是职责说明且声明不是主持人", "你的职责" in a_sys and "不是主持人" in a_sys, a_sys[:60])
+    check("小助手 System prompt 不含剧本内容", st.title not in a_sys and "语气指南" not in a_sys, "")
+
+    # --- 5. 消息分层：System(职责) → System(次级 prompt) → User ---
+    msgs = n_agent.init_messages(NarratorContext(state=state, player_name="A"), "观察四周")
+    check("消息三层结构与次序正确",
+          [m["role"] for m in msgs] == ["system", "system", "user"],
+          str([m["role"] for m in msgs]))
+    check("第 1 条 = 职责", msgs[0]["content"] == n_sys, "")
+    check("第 2 条 = 剧本次级 prompt", msgs[1]["content"] == st.script_prompt, "")
+    check("第 3 条 = 本轮上下文（含场景与行动）",
+          "当前场景" in msgs[2]["content"] and "观察四周" in msgs[2]["content"], msgs[2]["content"][:80])
+
+    # 次级 prompt 真的被送进模型（而不是只在代码里生成）
+    fake = FakeProvider([_reply(tool_call("finish", {"narration": "好的。"}))])
+    await n_agent.__class__(st, fake).run(NarratorContext(state=state, player_name="A"), "看看")
+    sent = fake.seen[0][1]
+    check("实际请求里带了第二条 system 消息",
+          len([m for m in sent if m.get("role") == "system"]) == 2,
+          str([m.get("role") for m in sent]))
+    check("实际请求里的次级 prompt 与生成的一致", sent[1]["content"] == st.script_prompt, "")
+
+    # --- 6. 确定性流水线（无模型路径）也分两层 ---
+    dm_msgs = DM(st, None)._build_messages(state, "（上下文）", "推门进去")
+    check("DM 流水线消息同样两层 system",
+          [m["role"] for m in dm_msgs] == ["system", "system", "user"],
+          str([m["role"] for m in dm_msgs]))
+
+    # --- 7. 无结构文本：自动切段 + 线性场景链 ---
+    md = (
+        "# 第一章 迷雾渡口\n夜色里渡船靠岸，船夫说河对岸有座白塔。\n\n"
+        "# 第二章 白塔\n塔里没有楼梯，只有一圈又一圈向上盘绕的坡道。\n\n"
+        "## 塔顶\n塔顶立着一只铜鸟，鸟嘴里衔着一枚钥匙。\n"
+    )
+    doc = parse_script(md, source="<inline>", name="雾港塔")
+    check("文本剧本按标题切成 3 片", len(doc.chunks) == 3, str([c.title for c in doc.chunks]))
+    check("文本剧本识别为纯文本格式", doc.fmt == "text" and not doc.structured, doc.fmt)
+    check("文本切片 id 形如 c01/c02", [c.id for c in doc.chunks] == ["c01", "c02", "c03"], str([c.id for c in doc.chunks]))
+    check("文本剧本自动合成线性场景链",
+          [s["id"] for s in doc.data["scenes"]] == ["c01", "c02", "c03"], str(doc.data["scenes"]))
+    check("线性链：每片指向下一片",
+          doc.data["scenes"][0]["exits"][0]["to"] == "c02"
+          and doc.data["scenes"][1]["exits"][0]["to"] == "c03"
+          and doc.data["scenes"][2]["exits"] == [],
+          str([s["exits"] for s in doc.data["scenes"]]))
+    check("文本剧本开局 = 第一片", doc.start_scene == "c01", doc.start_scene)
+    check("文本剧本给出降级提示", any("纯文本" in w or "无结构" in w for w in doc.warnings), str(doc.warnings))
+
+    # --- 8. 长文本会被装箱成多片 ---
+    long_text = "# 长章节\n" + "\n\n".join("这是第 %d 段。" % i + "填充" * 60 for i in range(12))
+    doc2 = parse_script(long_text, name="长文")
+    check("超长章节被切成多片", len(doc2.chunks) > 1, str([c.chars for c in doc2.chunks]))
+    check("每片都不超过上限的 1.5 倍",
+          all(c.chars <= 900 * 1.5 for c in doc2.chunks), str([c.chars for c in doc2.chunks]))
+
+    # --- 9. 无结构文本也能真跑起来（无模型 → 脚本化提示）---
+    st_txt = ScriptStore.from_content(md, name="雾港塔")
+    check("文本剧本也能建 ScriptStore", st_txt.fmt == "text" and st_txt.start_scene == "c01", st_txt.start_scene)
+    s_txt = GameState(st_txt, st_txt.start_scene)
+    s_txt.add_player("A", {"cls": "游侠"})
+    txt_dm = DM(st_txt, None)
+    evs = await txt_dm.handle_action(s_txt, "A", "继续前进")
+    check("文本剧本可用确定性流水线推进", s_txt.current_scene == "c02", s_txt.current_scene)
+    check("推进产出了旁白事件", any(e.get("type") == "narration" for e in evs), str(evs)[:80])
+
+    # --- 10. 剧本自检：断链 / 不可达 / 缺 start_scene 都会被报出来 ---
+    bad = json.dumps(
+        {
+            "title": "坏剧本",
+            "start_scene": "nope",
+            "scenes": [
+                {"id": "a", "title": "A", "exits": [{"to": "ghost", "label": "去幽灵"}]},
+                {"id": "b", "title": "B"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    doc_bad = parse_script(bad, source="bad.json")
+    warn = " ".join(doc_bad.warnings)
+    check("自检：start_scene 不存在被发现", "start_scene" in warn, warn)
+    check("自检：出口断链被发现", "ghost" in warn, warn)
+    check("自检：不可达场景被发现", "b" in warn, warn)
+    check("自检：缺 system 段被发现", "system" in warn, warn)
+    check("自检后 start_scene 已回退到可用场景", doc_bad.start_scene == "a", doc_bad.start_scene)
+
+    # --- 11. 场景字段缺省补齐（用户手写剧本也能跑）---
+    doc_min = parse_script(json.dumps({"title": "极简", "scenes": [{"id": "only"}]}, ensure_ascii=False))
+    sc = doc_min.data["scenes"][0]
+    check("缺省字段被补齐（title/location/public_text/exits）",
+          all(k in sc for k in ("title", "location", "public_text", "exits", "checks")), str(sc))
+
+    # --- 12. 小助手拿到的次级 prompt 确实是公开版 ---
+    check("两个 Agent 的次级 prompt 不同（DM 完整 / 小助手公开）",
+          n_agent.secondary_prompt(NarratorContext(state=state)) != a_agent.secondary_prompt(AdvisorContext(state=state)),
+          "")
+    check("小助手的次级 prompt = 公开版",
+          a_agent.secondary_prompt(AdvisorContext(state=state)) == st.script_prompt_public, "")
+
+    # --- 13. 相对路径标签不会把本机绝对路径写进提示词 ---
+    p_no_label = build_script_prompt(ScriptStore(TOTSK).doc, "dm")
+    check("未传 label 时退回原路径（仅本地场景）", "totsk_l1.json" in p_no_label, "")
+
+
 class FakeProvider:
     """假 Provider：按脚本依次吐出预设回复，用来在没有真实模型时验证 Agent 工具循环。
-
     `replies` 里每一项要么是 {"content","tool_calls"}，要么是一个可调用对象
     （拿 messages/tools 现场算回复），后者用于动态断言。
     """
@@ -788,18 +937,81 @@ async def run_live_model_test():
         print(f"  [SKIP] /api/models/test 不可用：{e}")
 
 
+async def run_live_scripts():
+    """实时校验剧本接口：列表 / 读取切片 / 路径越界拦截 / 切换活动剧本。"""
+    print("== 实时剧本接口校验（需服务器已启动） ==")
+    try:
+        import httpx
+
+        base = http_base()
+
+        r = httpx.get(base + "/api/scripts", timeout=15, trust_env=False)
+        d = r.json()
+        check("联机：剧本列表接口可用", r.status_code == 200 and isinstance(d.get("scripts"), list), str(d)[:120])
+        check("联机：列表含当前活动剧本", bool(d.get("active")) and bool(d.get("active_title")), str(d)[:120])
+        names = [it.get("file") for it in d.get("scripts", [])]
+        check("联机：列表能发现内置剧本", "sample_script.json" in names and "totsk_l1.json" in names, str(names))
+        check("联机：列表项带切片数", all("chunks" in it for it in d.get("scripts", [])), str(d.get("scripts"))[:120])
+
+        # 越界路径必须被拦下（服务端绑 0.0.0.0，不能变成任意文件读取）
+        r = httpx.post(base + "/api/scripts/inspect", json={"path": "../../server/main.py"}, timeout=15, trust_env=False)
+        check("联机：越界路径被拒绝", r.json().get("ok") is False, str(r.json())[:120])
+        r = httpx.post(base + "/api/scripts/inspect", json={"path": "C:/Windows/win.ini"}, timeout=15, trust_env=False)
+        check("联机：绝对路径被拒绝", r.json().get("ok") is False, str(r.json())[:120])
+
+        # 正常读取：切片 + 两份次级 prompt
+        r = httpx.post(base + "/api/scripts/inspect", json={"path": "totsk_l1.json"}, timeout=20, trust_env=False)
+        d = r.json()
+        check("联机：读取剧本成功", d.get("ok") is True and d.get("title"), str(d)[:120])
+        check("联机：返回切片清单", len(d.get("chunks") or []) == 10, str(len(d.get("chunks") or [])))
+        check("联机：返回 DM 次级 prompt", "【切片索引】" in (d.get("script_prompt") or ""), "")
+        check("联机：返回小助手次级 prompt（无索引）",
+              bool(d.get("script_prompt_public")) and "【切片索引】" not in d["script_prompt_public"], "")
+        check("联机：次级 prompt 不含本机绝对路径",
+              "E:\\" not in (d.get("script_prompt") or "") and "E:/" not in (d.get("script_prompt") or ""), "")
+
+        # 粘贴内容也能切片
+        r = httpx.post(
+            base + "/api/scripts/inspect",
+            json={"content": "# 序章\n渡船靠岸。\n\n# 尾声\n钟声响起。", "name": "临时剧本"},
+            timeout=20,
+            trust_env=False,
+        )
+        d = r.json()
+        check("联机：粘贴内容也能切片", d.get("ok") is True and d.get("fmt") == "text" and len(d["chunks"]) == 2, str(d)[:120])
+
+        # 切换活动剧本 → 版本接口跟着变 → 再切回来（不影响其它用例）
+        before = httpx.get(base + "/api/version", timeout=15, trust_env=False).json()
+        target = "sample_script.json" if before.get("script_path") != "sample_script.json" else "totsk_l1.json"
+        r = httpx.post(base + "/api/scripts/load", json={"path": target}, timeout=25, trust_env=False)
+        d = r.json()
+        check("联机：切换活动剧本成功", d.get("ok") is True, str(d)[:160])
+        after = httpx.get(base + "/api/version", timeout=15, trust_env=False).json()
+        check("联机：切换后 /api/version 跟随更新", after.get("script_path") == target, f"{after.get('script_path')} != {target}")
+        check("联机：切换后带自检信息", bool(after.get("script_info")), str(after.get("script_info"))[:120])
+
+        r = httpx.post(base + "/api/scripts/load", json={"path": before.get("script_path")}, timeout=25, trust_env=False)
+        check("联机：切回原剧本成功", r.json().get("ok") is True, str(r.json())[:120])
+        r = httpx.post(base + "/api/scripts/load", json={"path": "不存在的剧本.json"}, timeout=15, trust_env=False)
+        check("联机：载入不存在的剧本被拒", r.json().get("ok") is False, str(r.json())[:120])
+    except Exception as e:
+        print(f"  [SKIP] 剧本接口不可用：{e}")
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
     await run_unit()
     await run_unit_totsk()
     await run_unit_agents()
+    await run_unit_scripts()
     if not unit_only:
         await run_live()
         await run_live_version()
         await run_live_latejoin()
         await run_live_configure()
         await run_live_model_test()
+        await run_live_scripts()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)
 

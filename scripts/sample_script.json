@@ -1,5 +1,6 @@
 {
   "title": "古堡秘宝",
+  "premise": "一队冒险者受雇进入荒废多年的古堡，取回失窃的「月光圣杯」。",
   "system": "你是《古堡秘宝》的文字跑团 DM。故事背景：一队冒险者受雇到荒废古堡取回失窃的「月光圣杯」。风格偏奇幻、略带悬疑，叙述要简洁、有画面感，不要替玩家做决定。",
   "start_scene": "gate",
   "flags": {
@@ -126,6 +127,7 @@
         }
       ],
       "exits": [
+        { "to": "guardian_fight", "label": "取走圣杯（惊动守护者）", "keywords": ["取走圣杯", "拿走圣杯", "带走圣杯", "携圣杯", "夺杯"], "condition": "has_grail" },
         { "to": "courtyard", "label": "退回内院", "keywords": ["退回", "返回", "内院"], "condition": null }
       ]
     },

@@ -34,12 +34,23 @@ CONFIG_PATH = USER_DIR / "config.json"
 EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 
 DEFAULTS = {
-    "llm": {
-        "provider": "mock",
-        "base_url": "https://api.deepseek.com/v1",
-        "api_key": "",
-        "model": "deepseek-chat",
-        "temperature": 0.8,
+    # 两个模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/ local（本地模型）
+    # 默认全部留空 —— 游戏照常可玩，配好任意一个即自动启用对应 Agent。
+    "models": {
+        "dm": {
+            "kind": "off",
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "",
+            "model": "deepseek-chat",
+            "temperature": 0.8,
+        },
+        "advisor": {
+            "kind": "off",
+            "base_url": "http://127.0.0.1:8080/v1",
+            "api_key": "",
+            "model": "local-model",
+            "temperature": 0.7,
+        },
     },
     "server": {"host": "0.0.0.0", "port": 8000},
     # 剧本文件（相对 RESOURCE_DIR；也可写绝对路径）
@@ -57,6 +68,21 @@ def _deep_merge(base, override):
     return out
 
 
+def _apply_env_slot(slot: dict, prefix: str) -> None:
+    """按环境变量填充一个模型槽位：RPGBAR_<PREFIX>_API_KEY / _BASE_URL / _MODEL / _KIND。"""
+    env = os.environ
+    if env.get(f"{prefix}_API_KEY"):
+        slot["api_key"] = env[f"{prefix}_API_KEY"]
+        if (slot.get("kind") or "off") == "off":
+            slot["kind"] = "cloud"
+    if env.get(f"{prefix}_BASE_URL"):
+        slot["base_url"] = env[f"{prefix}_BASE_URL"]
+    if env.get(f"{prefix}_MODEL"):
+        slot["model"] = env[f"{prefix}_MODEL"]
+    if env.get(f"{prefix}_KIND"):
+        slot["kind"] = env[f"{prefix}_KIND"]
+
+
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
     if CONFIG_PATH.exists():
@@ -66,17 +92,19 @@ def load_config() -> dict:
         except Exception:
             pass
 
-    env = os.environ
-    if env.get("RPGBAR_LLM_API_KEY"):
-        cfg["llm"]["api_key"] = env["RPGBAR_LLM_API_KEY"]
-    if env.get("RPGBAR_LLM_BASE_URL"):
-        cfg["llm"]["base_url"] = env["RPGBAR_LLM_BASE_URL"]
-    if env.get("RPGBAR_LLM_MODEL"):
-        cfg["llm"]["model"] = env["RPGBAR_LLM_MODEL"]
-    if env.get("RPGBAR_SCRIPT"):
-        cfg["script"] = env["RPGBAR_SCRIPT"]
+    # 旧版（≤0.6）的 llm 段：若还在用，自动迁移到 models.dm，避免升级后静默失效
+    legacy = cfg.pop("llm", None)
+    if isinstance(legacy, dict) and legacy.get("api_key"):
+        dm = cfg["models"]["dm"]
+        if (dm.get("kind") or "off") == "off":
+            dm["kind"] = "cloud"
+            dm["api_key"] = legacy["api_key"]
+            dm["base_url"] = legacy.get("base_url", dm["base_url"])
+            dm["model"] = legacy.get("model", dm["model"])
 
-    # 有 key 即启用 openai 兼容 provider
-    if cfg["llm"].get("api_key"):
-        cfg["llm"]["provider"] = "openai"
+    _apply_env_slot(cfg["models"]["dm"], "RPGBAR_LLM")  # 兼容旧变量名
+    _apply_env_slot(cfg["models"]["dm"], "RPGBAR_DM_MODEL")
+    _apply_env_slot(cfg["models"]["advisor"], "RPGBAR_ADVISOR_MODEL")
+    if os.environ.get("RPGBAR_SCRIPT"):
+        cfg["script"] = os.environ["RPGBAR_SCRIPT"]
     return cfg

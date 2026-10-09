@@ -1,10 +1,27 @@
 {
-  "llm": {
-    "provider": "mock",
-    "base_url": "https://api.deepseek.com/v1",
-    "api_key": "",
-    "model": "deepseek-chat",
-    "temperature": 0.8
+  "_说明": [
+    "把本文件复制为 config.json 即可覆盖默认值（config.json 不进版本库）。",
+    "models.dm       = 主机端 DM（大模型）：推进剧情、投骰判定。由房主配置，全房间共用。",
+    "models.advisor  = 玩家私有小助手（小模型）：只读场景给行动建议。每位玩家可在游戏内各配各的。",
+    "kind: off=留空(走脚本化兜底，游戏照常可玩) / cloud=云 API(需 api_key) / local=本地模型(不需 key)。",
+    "两个槽位默认都是 off —— 也就是说，什么都不配也能正常玩，配一个就自动启用一个 Agent。",
+    "也可以完全不改这个文件，直接在游戏里点右下角顶栏的「⚙ 模型」接入（只存在浏览器本机）。"
+  ],
+  "models": {
+    "dm": {
+      "kind": "off",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key": "",
+      "model": "deepseek-chat",
+      "temperature": 0.8
+    },
+    "advisor": {
+      "kind": "off",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "api_key": "",
+      "model": "local-model",
+      "temperature": 0.7
+    }
   },
   "server": {
     "host": "0.0.0.0",

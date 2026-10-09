@@ -33,37 +33,63 @@ python -m server.main
 - **同一局域网**：直接连上面的局域网地址。
 - **跨网络**：给服务器电脑做公网映射 / 内网穿透（如 frp、cpolar），或把服务器部署到云主机。
 
-## DM 大模型：云 API 与本地 llama.cpp 共用一套
+## 两个 Agent 与两条模型通道
 
-默认不配置 key 时，DM 走脚本化兜底。填入 key 后启用真实 LLM 叙事：
+游戏里有**两个 Agent**，都按标准写法实现（模型自己决定调哪个工具 → 服务端执行 → 结果回灌 → 循环到收尾）：
+
+| Agent | 模型量级 | 能用的工具 | 干什么 |
+| --- | --- | --- | --- |
+| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script`（只读）+ `move_to` `set_flag` `roll_check`（改状态） | 推进剧情、投骰判定、扮 NPC |
+| **玩家小助手**（`AdvisorAgent`） | 小模型 | `read_scene` `list_valid_actions` `lookup_script`（**全是只读**） | 给你 2-4 条行动建议 |
+
+小助手改不了剧情，不是靠提示词求它别改，而是**它的工具集里根本没有写工具**。
+
+**默认两个槽位都是「留空」**——不接任何模型也能完整游玩（DM 走 `dm.py` 的确定性流水线，玩法与 v0.6.0 一致）。
+
+### 在游戏里接入（推荐，不用改配置文件）
+
+进房后点顶栏 **「⚙ 模型」**：
+
+- **云 API**：选 DeepSeek / OpenAI / 智谱 GLM 预设（或自定义 `base_url`），填 `api_key` 与模型名。
+- **本地模型**：选 llama.cpp / Ollama / LM Studio 预设，指向本机地址，**不需要 key**。
+- 点 **「测试连接」** 会真的发一次请求，并额外探测该模型**是否支持工具调用**（不支持会自动降级，见下）。
+- **API Key 只存在你自己浏览器里**，服务端从不回传；设置下次进房自动生效。
+- **主机 DM 只有房主能改**；小助手人人各配各的——正好对应「玩家机器跑本地小模型、主机额外接一个大模型」。
+
+顶栏胶囊会显示当前状态：`脚本化` / `仅 DM` / `仅助手` / `DM + 助手`。
+
+### 用配置文件 / 环境变量接入
 
 ```bash
-# 方式一：环境变量（以 DeepSeek 为例）
-export RPGBAR_LLM_API_KEY="sk-xxx"
-export RPGBAR_LLM_BASE_URL="https://api.deepseek.com/v1"
-export RPGBAR_LLM_MODEL="deepseek-chat"
+# 方式一：环境变量（主机 DM）
+export RPGBAR_DM_MODEL_API_KEY="sk-xxx"
+export RPGBAR_DM_MODEL_BASE_URL="https://api.deepseek.com/v1"
+export RPGBAR_DM_MODEL_MODEL="deepseek-chat"
 
-# 方式二：复制 config.example.json 为 config.json 并填 key
+# 玩家小助手（可指向本机 llama.cpp）
+export RPGBAR_ADVISOR_MODEL_BASE_URL="http://127.0.0.1:8080/v1"
+export RPGBAR_ADVISOR_MODEL_MODEL="qwen3-4b"
+export RPGBAR_ADVISOR_MODEL_KIND="local"
+
+# 方式二：复制 config.example.json 为 config.json 填 models.dm / models.advisor
 cp config.example.json config.json
 ```
 
+> 旧变量名 `RPGBAR_LLM_API_KEY` / `_BASE_URL` / `_MODEL` 仍然可用，会自动映射到主机 DM 槽位。
+
 DeepSeek / 智谱 GLM / 通义 Qwen 均为 OpenAI 兼容接口，改 `base_url` + `model` 即可切换。
-
-### 保留本地大模型路径（发布到玩家 PC 的关键）
-
-llama.cpp 的 `llama-server` 同样暴露 OpenAI 兼容的 `/v1/chat/completions` 接口，因此**本地模型只是改一行配置**：
+llama.cpp 的 `llama-server`、Ollama、LM Studio 同样暴露 OpenAI 兼容的 `/v1/chat/completions`，
+所以**本地模型与云 API 是同一套代码，只是 `base_url` 不同**：
 
 ```bash
-# 1. 在玩家自己的机器上启动 llama.cpp server（例如 Qwen3-8B 的 GGUF）
-llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080
-
-# 2. 指向本地
-export RPGBAR_LLM_BASE_URL="http://127.0.0.1:8080/v1"
-export RPGBAR_LLM_MODEL="qwen3-8b"
-export RPGBAR_LLM_API_KEY="none"
+llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 ```
 
-发布时由**玩家用自己算力**跑本地 DM 即走这条路；玩家端的小助手 Agent 同理。
+### 模型不支持工具调用怎么办
+
+很多小模型、老版本服务不认 `tools` 参数。这时 Agent 会自动降级为**单轮 JSON 协议**：
+把同样的意图写成 `{"narration": "...", "move_to": "...", "set_flags": [...]}`，
+功能不减，只是少了多轮工具往复。「测试连接」会直接把结果告诉你。
 
 ## 架构总览
 
@@ -72,18 +98,22 @@ export RPGBAR_LLM_API_KEY="none"
 | 剧本仓库 + RAG | `server/rag.py` | 加载结构化剧本，jieba 分词 + BM25 检索相关场景片段 |
 | 剧情状态机 | `server/state_machine.py` | 场景/flag/出口/检定，服务端权威状态 |
 | 骰子 | `server/dice.py` | 服务端投掷，可设种子复现 |
-| DM 编排 | `server/dm.py` | LLM 只提案，服务端校验后应用（护栏）；无 key 走脚本化兜底 |
-| LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider，云 API 与本地 llama.cpp 同一套 |
-| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，多玩家广播，中途加入判定与补课推送 |
-| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板 |
+| Agent 骨架 | `server/agents/base.py` | 工具注册 + 工具调用循环 + 两条降级路径 |
+| 主机 DM Agent | `server/agents/narrator.py` | 大模型；持有写工具（移动/加线索/投骰），护栏做在工具里 |
+| 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；**只有只读工具**，结构上改不了剧情 |
+| 无模型的 DM 流水线 | `server/dm.py` | 确定性剧本编排（留空 API 时的兜底），与 Agent 共用同一套状态机 |
+| LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider：云 API 与本地模型同一套；含工具调用与降级判定 |
+| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，模型槽位运行期配置，中途加入判定与补课推送 |
+| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板、**模型设置抽屉** |
 
 ## 关键设计
 
 - **服务器权威 + 客户端连接**：玩家只连服务器，不自己起服务；房间按码隔离。
 - **守剧本 = RAG + 状态机双保险**：RAG 给 DM 递当前场景与相关片段，状态机管「剧情走到哪、允许往哪走」。
-- **LLM 只提案、服务端校验**：LLM 返回的 `move_to` / `set_flags` 必须落在剧本已知的出口与 flag 白名单内，防止跑偏。
+- **护栏做在工具里，不靠提示词**：DM 的 `move_to` 只接受当前场景**已解锁**的出口、`set_flag` 只接受剧本声明过的 flag、
+  骰子只能由 `roll_check` 在服务端投——模型拿不到骰子，也就编不出结果。小助手则连写工具都没有。
 - **骰子在服务端**：玩家只发意图，结果由主机统一投掷并广播，防作弊。
-- **小助手 = 玩家的私有 Agent**：demo 里复用同一 LLM 给建议；Unity 版将下沉到玩家本地的小模型（3B/4B）。
+- **留空也能玩**：两个模型槽位默认 `off`，DM 退回确定性流水线；接了模型才启用 Agent 工具循环，两者共用同一套状态机。
 - **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
 - **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
@@ -111,15 +141,20 @@ RPGBAR_SCRIPT=scripts/totsk_l1.json python -m server.main
 ## 测试
 
 ```bash
-python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入（需先起服务器）
+python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入 + 模型设置（需先起服务器）
 python scripts/smoke_test.py --unit # 仅进程内
+
+# 可选：前端 DOM 校验（需 Node + jsdom，验证「模型设置」抽屉的交互）
+npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **64 项全绿**。实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
+当前 **116 项全绿**（Python）+ **32 项全绿**（前端 DOM，可选）。
+实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
+Agent 层的测试不需要真实模型——用一个按脚本吐回复的假 Provider 就能验完整工具循环。
 
 ## 版本
 
-当前版本 **v0.6.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
+当前版本 **v0.7.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
 
 版本号只有一个来源：`server/__init__.py` 的 `__version__`。它会显示在服务器启动横幅、`GET /api/version`，以及网页的加入页与顶栏——所以"跑的是哪一版"一眼可辨。
 
@@ -150,6 +185,6 @@ python -c "import shutil; shutil.make_archive('RPGBarServer','zip',root_dir='dis
 
 ## 后续路线
 
-1. 跑通 Web 联机 demo（当前）。
+1. 跑通 Web 联机 demo，双 Agent + 双模型通道（当前）。
 2. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
-3. 玩家端小助手下沉到本地 3B/4B 模型（llama.cpp）。
+3. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接一个大模型——通道已就位，等接默认值。

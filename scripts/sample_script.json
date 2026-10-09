@@ -1,0 +1,154 @@
+{
+  "title": "古堡秘宝",
+  "system": "你是《古堡秘宝》的文字跑团 DM。故事背景：一队冒险者受雇到荒废古堡取回失窃的「月光圣杯」。风格偏奇幻、略带悬疑，叙述要简洁、有画面感，不要替玩家做决定。",
+  "start_scene": "gate",
+  "scenes": [
+    {
+      "id": "gate",
+      "chapter": 1,
+      "title": "古堡大门",
+      "location": "古堡正门外",
+      "public_text": "暮色中，你们来到荒废的古堡前。生锈的铁门半掩着，一个驼背的老看守提着灯笼站在门边，警惕地打量着你们。",
+      "dm_notes": "老看守老周胆小又爱占小便宜，说服他或给他一点好处，就会透露后门的钥匙藏在后院水井旁。",
+      "npcs": [
+        { "name": "老周", "role": "古堡看守", "style": "胆小、絮叨、爱占小便宜", "knows": "后门钥匙在后院水井旁" }
+      ],
+      "keywords": ["大门", "铁门", "古堡", "看守", "老周", "灯笼"],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "persuade_zhou",
+          "skill": "魅力",
+          "dc": 12,
+          "keywords": ["说服", "套话", "贿赂", "银币", "老周", "打听"],
+          "success": "老周左右张望了一下，压低声音道：「后门的钥匙啊……就藏在后院那口枯井旁边的石头下面。」",
+          "fail": "老周缩了缩脖子，含混地摆手：「我什么都不知道，别为难我这把老骨头。」",
+          "success_flag": "knows_backdoor_key"
+        }
+      ],
+      "exits": [
+        { "to": "hall", "label": "推开铁门进入门厅", "keywords": ["铁门", "门厅"], "condition": null }
+      ]
+    },
+    {
+      "id": "hall",
+      "chapter": 1,
+      "title": "门厅",
+      "location": "古堡门厅",
+      "public_text": "门厅空旷而阴冷，墙上的火把忽明忽暗。正前方是一扇通往内院的厚重木门，右侧墙上挂着一幅褪色的挂毯，后面似乎藏着什么。",
+      "dm_notes": "挂毯后面是一扇锁着的暗门，可直接通往密室，需要先发现它。木门通往内院。",
+      "npcs": [],
+      "keywords": ["门厅", "火把", "木门", "挂毯", "内院", "暗门"],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "search_tapestry",
+          "skill": "调查",
+          "dc": 10,
+          "keywords": ["调查", "查看", "挂毯", "搜索", "搜寻", "翻看"],
+          "success": "你们掀开挂毯，发现背后竟藏着一扇锁着的暗门，锁孔形状古怪。",
+          "fail": "挂毯后面只有积灰的墙壁，你们什么也没发现。",
+          "success_flag": "found_secret_door"
+        }
+      ],
+      "exits": [
+        { "to": "courtyard", "label": "推开木门进入内院", "keywords": ["木门", "内院"], "condition": null },
+        { "to": "secret_room", "label": "打开暗门进入密室", "keywords": ["暗门", "密室", "开锁", "撬锁"], "condition": "found_secret_door" }
+      ]
+    },
+    {
+      "id": "courtyard",
+      "chapter": 2,
+      "title": "内院",
+      "location": "古堡内院",
+      "public_text": "内院杂草丛生，中央立着一口枯井。月光洒在井口，井边散落着几块松动的碎石。",
+      "dm_notes": "后门的钥匙就藏在井边某块石头下面。若玩家不知道线索，也可以强行撞开密室的后门。",
+      "npcs": [],
+      "keywords": ["内院", "枯井", "水井", "月光", "后门", "石头"],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "find_key",
+          "skill": "调查",
+          "dc": 8,
+          "keywords": ["找钥匙", "钥匙", "井旁", "石头", "翻找", "搜索", "寻找"],
+          "success": "你们在井边一块松动的石头下，找到了一把锈迹斑斑的铜钥匙。",
+          "fail": "你们翻遍了井边的碎石，却一无所获。",
+          "success_flag": "has_key"
+        },
+        {
+          "id": "force_backdoor",
+          "skill": "力量",
+          "dc": 15,
+          "keywords": ["撞开", "破门", "撞门", "强行", "踹", "撞"],
+          "success": "你们合力猛地一撞，腐朽的后门应声而破！",
+          "fail": "后门比想象中结实，你们被反震得连连后退，门纹丝不动。",
+          "success_flag": "has_key"
+        }
+      ],
+      "exits": [
+        { "to": "hall", "label": "返回门厅", "keywords": ["返回", "回去", "门厅"], "condition": null },
+        { "to": "secret_room", "label": "用钥匙打开后门进入密室", "keywords": ["后门", "钥匙", "密室"], "condition": "has_key" }
+      ]
+    },
+    {
+      "id": "secret_room",
+      "chapter": 3,
+      "title": "密室",
+      "location": "古堡密室",
+      "public_text": "密室里陈设着一座石台，台上静静放着一只银质的圣杯，在月光下泛着柔和的微光。石台两侧各立着一尊石像。",
+      "dm_notes": "圣杯是真的。取走圣杯会唤醒守护者石像，触发最终战斗。",
+      "npcs": [
+        { "name": "守护者", "role": "石像傀儡", "style": "沉默、无感情", "knows": "" }
+      ],
+      "keywords": ["密室", "圣杯", "石台", "月光", "银质", "石像", "傀儡", "守护者"],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "grab_grail",
+          "skill": "敏捷",
+          "dc": 14,
+          "keywords": ["拿", "取", "圣杯", "抓", "偷", "取走", "捧起"],
+          "success": "你眼疾手快抓起圣杯——石像的双眼轰然亮起猩红，守护者苏醒了！",
+          "fail": "你的手指刚碰到圣杯，机关便被触发，守护者苏醒，挥拳朝你砸来！",
+          "success_flag": "has_grail"
+        }
+      ],
+      "exits": [
+        { "to": "courtyard", "label": "退回内院", "keywords": ["退回", "返回", "内院"], "condition": null }
+      ]
+    },
+    {
+      "id": "guardian_fight",
+      "chapter": 3,
+      "title": "守护者之战",
+      "location": "古堡密室",
+      "public_text": "石像守护者苏醒了，双目猩红，巨大的拳头高高举起，带着破空声砸向你们！",
+      "dm_notes": "这是最终战。击败守护者即可带着圣杯脱身，达成结局。",
+      "npcs": [
+        { "name": "守护者", "role": "石像傀儡", "style": "沉默、无感情", "knows": "" }
+      ],
+      "keywords": ["守护者", "石像", "战斗", "攻击", "决战"],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "fight_guardian",
+          "skill": "力量",
+          "dc": 16,
+          "keywords": ["打", "攻击", "战斗", "砍", "剑", "魔法", "迎击", "反击"],
+          "success": "你们合力一击，将守护者击退，它轰然倒地、碎裂成一地石块。圣杯到手了！",
+          "fail": "守护者一拳将你们震退，你们狼狈地逃出密室，圣杯只能从长计议。",
+          "success_flag": "defeated_guardian"
+        }
+      ],
+      "exits": [
+        { "to": "courtyard", "label": "逃回内院", "keywords": ["逃", "退回", "内院", "撤退"], "condition": null }
+      ]
+    }
+  ]
+}

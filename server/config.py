@@ -15,7 +15,7 @@ DEFAULTS = {
         "model": "deepseek-chat",
         "temperature": 0.8,
     },
-    "server": {"host": "127.0.0.1", "port": 8000},
+    "server": {"host": "0.0.0.0", "port": 8000},
 }
 
 

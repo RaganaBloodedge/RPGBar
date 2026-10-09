@@ -144,6 +144,20 @@ if WEB_DIR.exists():
     app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
 
+def _lan_ip():
+    """获取本机局域网 IP，用于告知朋友连接地址。"""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        s.close()
+
+
 def main():
     import os
 
@@ -151,9 +165,13 @@ def main():
 
     s = cfg["server"]
     port = int(os.environ.get("PORT", s["port"]))
-    # 部署环境（存在 PORT）需绑定 0.0.0.0 以接受外部客户端连接
     host = "0.0.0.0" if os.environ.get("PORT") else s["host"]
     print(f"[RPGBar] 服务器监听 {host}:{port}")
+    if host in ("0.0.0.0", "::"):
+        print(f"[RPGBar] 本机访问: http://127.0.0.1:{port}")
+        lan = _lan_ip()
+        if lan:
+            print(f"[RPGBar] 局域网访问（发给朋友）: http://{lan}:{port}")
     uvicorn.run("server.main:app", host=host, port=port, reload=False)
 
 

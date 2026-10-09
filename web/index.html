@@ -52,7 +52,7 @@
       <span class="chip">地点 <b id="scene-location">—</b></span>
       <span class="chip" title="RPGBar 版本"><b id="app-version-top">—</b></span>
       <button id="copy-room" class="btn ghost" title="复制房间码">复制房间码</button>
-      <button id="settings-btn" class="btn ghost" title="接入大模型 / 本地模型">⚙ 模型</button>
+      <button id="settings-btn" class="btn ghost" title="接入大模型 / 本地模型 / 读取剧本">⚙ 设置</button>
       <span id="model-pill" class="chip model-pill" title="当前模型接线状态">模型：脚本化</span>
     </div>
   </header>
@@ -85,18 +85,26 @@
   </footer>
 </section>
 
-<!-- 模型设置抽屉 -->
+<!-- 设置抽屉：模型接线 + 剧本读取 -->
 <div id="settings-overlay" class="overlay hidden"></div>
-<aside id="settings-drawer" class="drawer hidden" aria-label="模型设置">
+<aside id="settings-drawer" class="drawer hidden" aria-label="游戏设置">
   <header class="drawer-head">
     <div>
-      <h2>模型设置</h2>
-      <p class="drawer-sub">接入后可获得真正的 Agent 体验；留空也能玩</p>
+      <h2>设置</h2>
+      <p class="drawer-sub">剧本读取与切片 · 模型接线；全部留空也能玩</p>
     </div>
     <button id="settings-close" class="icon-btn" title="关闭">✕</button>
   </header>
 
   <div class="drawer-body">
+    <h3 class="section-title">剧本</h3>
+    <p class="drawer-hint">
+      服务端读取剧本文件后<b>自动切片</b>，并生成排在 System prompt 之后的
+      <b>次级 prompt</b>（世界观、语气、切片索引）。System prompt 只管两个 Agent 各自的职责。
+    </p>
+    <div id="script-card" class="slot"></div>
+
+    <h3 class="section-title">模型</h3>
     <p class="drawer-hint">
       两个 Agent 都走标准 <b>OpenAI 兼容接口</b>，填 <b>云 API</b> 的 Key，或指向 <b>本地模型</b>
       （llama.cpp / Ollama / LM Studio）。连接后 DM 会依次调用工具推进剧情，小助手只读场景给建议。

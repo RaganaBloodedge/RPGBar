@@ -213,12 +213,19 @@ form input:focus, form select:focus { border-color: var(--accent); }
 }
 .field input:focus { border-color: var(--accent); }
 .field input:disabled { opacity: .55; }
+.field textarea {
+  width: 100%; padding: 9px 10px; font-size: 12px; resize: vertical;
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 7px; outline: none; font-family: inherit; line-height: 1.6;
+}
+.field textarea:focus { border-color: var(--accent); }
 
 .slot-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
 .slot-actions .btn { padding: 8px 14px; font-size: 12px; }
 .slot-result { font-size: 11px; color: var(--text-dim); line-height: 1.5; flex: 1; }
 .slot-result.ok { color: var(--green); }
 .slot-result.err { color: var(--red); }
+.slot-result.warn { color: var(--gold-soft); }
 
 .settings-msg {
   font-size: 12px; line-height: 1.6; padding: 10px 12px; border-radius: 8px;
@@ -226,3 +233,46 @@ form input:focus, form select:focus { border-color: var(--accent); }
 }
 .settings-msg.ok { color: var(--green); border-color: var(--green); }
 .settings-msg.err { color: var(--red); border-color: var(--red); }
+
+/* ---- 剧本卡片 ---- */
+.section-title {
+  font-size: 13px; font-weight: 600; color: var(--gold-soft);
+  margin: 4px 0 8px; letter-spacing: .04em;
+}
+.section-title:not(:first-child) {
+  margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border);
+}
+.script-list { margin-bottom: 10px; }
+.script-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; margin-bottom: 6px; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.script-item:hover { border-color: var(--accent); }
+.script-item.active { border-color: var(--green); }
+.script-item .name { font-size: 12px; color: var(--text); }
+.script-item .meta { font-size: 10px; color: var(--text-dim); }
+.script-item .tag {
+  font-size: 10px; padding: 2px 7px; border-radius: 10px; white-space: nowrap;
+  background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
+}
+.script-item.active .tag { color: var(--green); border-color: var(--green); }
+.script-slots {
+  display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 10px;
+  max-height: 150px; overflow-y: auto;
+}
+.script-slot {
+  font-size: 10px; color: var(--text-dim); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px;
+}
+.script-slot b { color: var(--gold-soft); font-weight: 500; }
+.script-prompt {
+  white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.6;
+  color: var(--text-dim); background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px; margin-top: 8px; max-height: 220px; overflow-y: auto;
+  font-family: inherit;
+}
+.script-card details summary {
+  cursor: pointer; font-size: 11px; color: var(--text-dim); margin-top: 8px; outline: none;
+}
+.script-warn { font-size: 11px; color: var(--red); line-height: 1.6; margin-top: 6px; }

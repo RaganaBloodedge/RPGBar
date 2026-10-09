@@ -452,7 +452,10 @@
 
   function rerenderSlotsIfOpen() {
     var drawer = document.getElementById("settings-drawer");
-    if (drawer && !drawer.classList.contains("hidden")) renderSlots();
+    if (drawer && !drawer.classList.contains("hidden")) {
+      renderSlots();
+      renderScriptCard(); // 房主身份变化会影响「设为活动剧本」的可点性
+    }
   }
 
   function slotPayload(key) {
@@ -544,12 +547,249 @@
       });
   }
 
+  /* ==================== 剧本卡片：读取 / 切片 / 次级 prompt ==================== */
+
+  var scriptInfo = null;      // GET /api/scripts 的结果
+  var scriptPreview = null;   // 最近一次 inspect/load 的结果
+  var scriptLast = { text: "", cls: "" }; // 最近一次提示（重建卡片后要能复原）
+  var scriptListLoading = false;
+
+  function loadScripts(done) {
+    if (scriptListLoading) return;
+    scriptListLoading = true;
+    fetch("/api/scripts")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        scriptInfo = d;
+        renderScriptCard();
+        if (done) done(null, d);
+      })
+      .catch(function (e) {
+        if (done) done(e);
+      })
+      .then(function () { scriptListLoading = false; });
+  }
+
+  function scriptPayload() {
+    var pathEl = document.getElementById("script-path");
+    var contentEl = document.getElementById("script-content");
+    var nameEl = document.getElementById("script-name");
+    var content = contentEl ? contentEl.value.trim() : "";
+    if (content) {
+      return { content: content, name: (nameEl && nameEl.value.trim()) || "粘贴的剧本" };
+    }
+    var path = pathEl ? pathEl.value.trim() : "";
+    if (path) return { path: path };
+    return null;
+  }
+
+  function scriptResult(text, cls) {
+    scriptLast = { text: text || "", cls: cls || "" };
+    paintScriptResult();
+  }
+
+  function paintScriptResult() {
+    var out = document.getElementById("script-result");
+    if (!out) return;
+    out.className = "slot-result" + (scriptLast.cls ? " " + scriptLast.cls : "");
+    out.textContent = scriptLast.text;
+  }
+
+  function showScriptPreview(info) {
+    scriptPreview = info;
+    var promptEl = document.getElementById("script-prompt");
+    if (promptEl) promptEl.textContent = info.script_prompt || "（无）";
+    var pubEl = document.getElementById("script-prompt-public");
+    if (pubEl) pubEl.textContent = info.script_prompt_public || "（无）";
+    var host = document.getElementById("script-slots");
+    if (host) {
+      host.innerHTML = "";
+      (info.chunks || []).forEach(function (c) {
+        var s = el("span", "script-slot");
+        var b = el("b", "", c.id);
+        s.appendChild(b);
+        s.appendChild(document.createTextNode(" " + (c.title || "") + " · " + c.chars + "字"));
+        s.title = c.preview || "";
+        host.appendChild(s);
+      });
+    }
+  }
+
+  function renderScriptCard() {
+    var host = document.getElementById("script-card");
+    if (!host) return;
+    host.classList.add("script-card");
+    host.innerHTML = "";
+
+    var head = el("div", "slot-head");
+    head.appendChild(el("span", "slot-title", "剧本 · 读取与切片"));
+    var badge = el("span", "slot-badge on");
+    badge.textContent = scriptInfo && scriptInfo.active_title ? scriptInfo.active_title : "—";
+    head.appendChild(badge);
+    host.appendChild(head);
+    host.appendChild(el("p", "slot-role",
+      "读取剧本文件 → 自动切片 → 生成排在 System prompt 之后的「次级 prompt」。"
+      + "System prompt 只定义两个 Agent 各自的职责。"));
+
+    if (!isOwner) {
+      var note = el("p", "lock-note",
+        "只有房主（" + (ownerName || "首位加入者") + "）可以切换活动剧本；你可以读取与预览。");
+      host.appendChild(note);
+    }
+
+    // 可用剧本列表
+    var list = el("div", "script-list");
+    var scripts = (scriptInfo && scriptInfo.scripts) || [];
+    if (!scripts.length) {
+      list.appendChild(el("div", "slot-role", "正在读取剧本列表…"));
+    }
+    scripts.forEach(function (it) {
+      var row = el("div", "script-item" + (it.path === (scriptInfo && scriptInfo.active) ? " active" : ""));
+      var left = el("div");
+      left.appendChild(el("div", "name", it.title || it.file));
+      var meta = [it.path, it.structured ? "结构化" : "纯文本"]
+        .concat(it.error ? [it.error] : [it.scenes + " 场景", it.chunks + " 切片"])
+        .join(" · ");
+      left.appendChild(el("div", "meta", meta));
+      row.appendChild(left);
+      row.appendChild(el("span", "tag", it.path === (scriptInfo && scriptInfo.active) ? "当前" : "可载入"));
+      row.onclick = function () {
+        var p = document.getElementById("script-path");
+        if (p) p.value = it.path;
+        inspectScript();
+      };
+      list.appendChild(row);
+    });
+    host.appendChild(list);
+
+    host.appendChild(field2("script-path", "读取剧本文件（限 scripts/ 目录，.json / .md / .txt）", "例如 totsk_l1.json"));
+
+    // 切片预览
+    var slots = el("div", "script-slots");
+    slots.id = "script-slots";
+    host.appendChild(slots);
+
+    var actions = el("div", "slot-actions");
+    var inspectBtn = el("button", "btn ghost", "读取并切片");
+    inspectBtn.type = "button";
+    inspectBtn.onclick = function () { inspectScript(); };
+    actions.appendChild(inspectBtn);
+
+    var loadBtn = el("button", "btn primary", "设为活动剧本");
+    loadBtn.type = "button";
+    loadBtn.disabled = !isOwner;
+    if (!isOwner) loadBtn.title = "只有房主可以切换";
+    loadBtn.onclick = function () { loadScript(); };
+    actions.appendChild(loadBtn);
+    var res = el("span", "slot-result");
+    res.id = "script-result";
+    actions.appendChild(res);
+    host.appendChild(actions);
+
+    // 粘贴内容
+    var det = document.createElement("details");
+    det.appendChild(el("summary", "", "或直接粘贴剧本内容（自动识别 JSON / Markdown）"));
+    det.appendChild(field2("script-name", "剧本名（可选）", "例如 雾港塔"));
+    var ta = document.createElement("textarea");
+    ta.id = "script-content";
+    ta.placeholder = "# 第一章 迷雾渡口\n夜色里渡船靠岸……";
+    ta.rows = 5;
+    det.appendChild(ta);
+    host.appendChild(det);
+
+    // 次级 prompt
+    var det2 = document.createElement("details");
+    det2.appendChild(el("summary", "", "查看生成的次级 prompt"));
+    var pre = el("pre", "script-prompt");
+    pre.id = "script-prompt";
+    pre.textContent = "（尚未读取）";
+    det2.appendChild(pre);
+    var pre2 = el("pre", "script-prompt");
+    pre2.id = "script-prompt-public";
+    pre2.textContent = "（尚未读取）";
+    det2.appendChild(pre2);
+    host.appendChild(det2);
+
+    if (scriptPreview) showScriptPreview(scriptPreview);
+    paintScriptResult(); // 卡片被重建后，恢复上一次的提示文字
+  }
+
+  // 通用输入框（不绑定到模型槽位）
+  function field2(id, label, ph) {
+    var wrap = el("div", "field");
+    wrap.appendChild(el("label", "", label));
+    var input = document.createElement("input");
+    input.type = "text";
+    input.id = id;
+    input.placeholder = ph || "";
+    input.autocomplete = "off";
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function inspectScript() {
+    var payload = scriptPayload();
+    if (!payload) {
+      scriptResult("请先选择剧本、填入文件名，或粘贴剧本内容。", "err");
+      return;
+    }
+    scriptResult("正在读取并切片…", "");
+    fetch("/api/scripts/inspect", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) {
+          scriptResult("读取失败：" + ((d && d.error) || "未知错误"), "err");
+          return;
+        }
+        showScriptPreview(d);
+        var warn = (d.warnings || []).length ? "；提示：" + d.warnings.join("；") : "";
+        scriptResult(
+          "《" + d.title + "》· " + d.chunks.length + " 个切片 · " + d.scenes + " 场景" + warn,
+          warn ? "warn" : "ok"
+        );
+      })
+      .catch(function (e) { scriptResult("请求失败：" + e, "err"); });
+  }
+
+  function loadScript() {
+    var payload = scriptPayload();
+    if (!payload) {
+      scriptResult("请先选择剧本、填入文件名，或粘贴剧本内容。", "err");
+      return;
+    }
+    scriptResult("正在载入…", "");
+    fetch("/api/scripts/load", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok) {
+          scriptResult("载入失败：" + ((d && d.error) || "未知错误"), "err");
+          return;
+        }
+        showScriptPreview(d);
+        scriptResult("已切换活动剧本：《" + d.title + "》。" + (d.note || ""), "ok");
+        addEntry("system", "", "活动剧本已切换为《" + d.title + "》（新开的房间生效）。");
+        loadScripts();   // 重建列表（「当前」标签要跟着换）；提示文字由 scriptLast 复原
+        loadVersion();
+      })
+      .catch(function (e) { scriptResult("请求失败：" + e, "err"); });
+  }
+
   function openSettings() {
     var drawer = document.getElementById("settings-drawer");
     var overlay = document.getElementById("settings-overlay");
     if (!drawer) return;
     loadSaved();
     renderSlots();
+    renderScriptCard();
+    loadScripts();
     hideMsg();
     overlay.classList.remove("hidden");
     drawer.classList.remove("hidden");

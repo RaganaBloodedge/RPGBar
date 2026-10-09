@@ -109,6 +109,9 @@ class GameState:
             "scene_title": cur["title"] if cur else "",
             "location": cur["location"] if cur else "",
             "flags": sorted(self.flags),
+            "flag_details": [
+                {"id": f, "label": self.store.flag_label(f)} for f in sorted(self.flags)
+            ],
             "players": [p.to_dict() for p in self.players.values()],
             "turn": self.turn,
             "ended": self.ended,

@@ -49,24 +49,38 @@ class DM:
                     best_len = len(kw)
         return hits, best_len
 
-    def detect_check(self, action, scene):
+    def _best(self, action, items, extra_keywords):
+        """在候选（检定/出口）里挑打分最高的一条，返回 (候选, 分数)。"""
         best, best_score = None, (0, 0)
-        for c in scene.get("checks", []):
-            kws = list(c.get("keywords", [])) + [c.get("id", ""), c.get("skill", "")]
+        for it in items:
+            kws = list(it.get("keywords", [])) + extra_keywords(it)
             score = self._score(action, kws)
             if score > best_score:
-                best_score, best = score, c
-        return best if best_score[0] > 0 else None
+                best_score, best = score, it
+        return best, best_score
+
+    def _best_check(self, action, scene):
+        return self._best(
+            action,
+            scene.get("checks", []),
+            lambda c: [c.get("id", ""), c.get("skill", "")],
+        )
+
+    def _best_exit(self, action, scene):
+        return self._best(
+            action,
+            scene.get("exits", []),
+            lambda e: [e.get("to", ""), e.get("label", "")],
+        )
+
+    def detect_check(self, action, scene):
+        best, score = self._best_check(action, scene)
+        return best if score[0] > 0 else None
 
     def detect_exit(self, action, scene):
         """返回最佳匹配的出口（不判条件，条件由调用方校验），无命中返回 None。"""
-        best, best_score = None, (0, 0)
-        for e in scene.get("exits", []):
-            kws = list(e.get("keywords", [])) + [e.get("to", ""), e.get("label", "")]
-            score = self._score(action, kws)
-            if score > best_score:
-                best_score, best = score, e
-        return best if best_score[0] > 0 else None
+        best, score = self._best_exit(action, scene)
+        return best if score[0] > 0 else None
 
     @staticmethod
     def _exit_ok(exit_, state):
@@ -80,12 +94,19 @@ class DM:
         events = []
         state.log(f"{player_name}：{action}")
 
-        check = self.detect_check(action, scene)
-        if check:
+        check, cscore = self._best_check(action, scene)
+        exit_, escore = self._best_exit(action, scene)
+        if cscore[0] <= 0:
+            check = None
+        if escore[0] <= 0:
+            exit_ = None
+
+        # 检定与出口都命中时比分数，谁更贴合玩家的措辞就走谁；同分优先检定
+        # （检定不改场景，误判代价更小）。
+        if check and (exit_ is None or cscore >= escore):
             return self._run_check(state, player_name, check, events)
 
-        exit_ = self.detect_exit(action, scene)
-        if exit_:
+        if exit_ is not None:
             if not self._exit_ok(exit_, state):
                 events.append(
                     {

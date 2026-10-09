@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RPGBar · 古堡秘宝</title>
+<title>RPGBar</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -31,7 +31,7 @@
       <label>房间码（留空自动建房，也可输入朋友的房间码加入）</label>
       <input id="join-room" type="text" placeholder="留空新建，或输入如 ABC12" autocomplete="off">
 
-      <button type="submit" class="btn primary">进入古堡</button>
+      <button type="submit" class="btn primary">进入游戏</button>
     </form>
     <p class="hint">开多个标签页、或让朋友连你的局域网 IP，输入同一房间码即可联机。</p>
     <p class="hint small">中途加入也没问题：填上朋友的房间码，DM 会为你补上之前的剧情。</p>
@@ -44,7 +44,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="logo-die">⚄</span>
-      <span class="brand-name">RPGBar · 古堡秘宝</span>
+      <span class="brand-name">RPGBar</span>
     </div>
     <div class="room-info">
       <span class="chip">房间 <b id="room-code">—</b></span>
@@ -77,7 +77,7 @@
     <div id="suggestions" class="suggestions"></div>
     <div class="composer-row">
       <button id="suggest-btn" class="btn ghost">助手建议</button>
-      <input id="action-input" type="text" placeholder="描述你的行动，例如：说服老周 / 调查挂毯 / 推开铁门进入门厅" autocomplete="off">
+      <input id="action-input" type="text" placeholder="描述你的行动，例如：观察四周 / 检查石门 / 合力抬开石闩" autocomplete="off">
       <button id="send-btn" class="btn primary">行动</button>
     </div>
   </footer>

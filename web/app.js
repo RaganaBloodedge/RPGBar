@@ -20,17 +20,30 @@
 
   var ws = null;
   var you = "";
+  var currentScript = "";
+
+  // 剧本名由服务端提供（/api/version 与 welcome），界面各处跟随它，不再写死。
+  function setScript(name) {
+    if (!name) return;
+    currentScript = name;
+    var brand = document.querySelector(".brand-name");
+    if (brand) brand.textContent = "RPGBar · " + name;
+    document.title = "RPGBar · " + name;
+  }
 
   function loadVersion() {
     fetch("/api/version")
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        if (!d || !d.version) return;
-        var v = "v" + d.version;
-        ["app-version", "app-version-top"].forEach(function (id) {
-          var el = document.getElementById(id);
-          if (el) el.textContent = v;
-        });
+        if (!d) return;
+        if (d.script) setScript(d.script);
+        if (d.version) {
+          var v = "v" + d.version;
+          var el = document.getElementById("app-version");
+          if (el) el.textContent = v + (d.script ? " · " + d.script : "");
+          var top = document.getElementById("app-version-top");
+          if (top) top.textContent = v;
+        }
       })
       .catch(function () {});
   }
@@ -53,7 +66,6 @@
 
   function renderState(state) {
     if (!state) return;
-    roomCode.textContent = "";
     sceneTitle.textContent = state.scene_title || "—";
     sceneLocation.textContent = state.location || "—";
 
@@ -65,14 +77,19 @@
     });
 
     flagsEl.innerHTML = "";
-    if (!state.flags || state.flags.length === 0) {
+    var details = state.flag_details;
+    if (!details || !details.length) {
+      details = (state.flags || []).map(function (f) { return { id: f, label: f }; });
+    }
+    if (!details.length) {
       var empty = document.createElement("li");
       empty.textContent = "（暂无）";
       flagsEl.appendChild(empty);
     } else {
-      state.flags.forEach(function (f) {
+      details.forEach(function (f) {
         var li = document.createElement("li");
-        li.textContent = f;
+        li.textContent = f.label || f.id;
+        if (f.id) li.title = f.id;
         flagsEl.appendChild(li);
       });
     }
@@ -129,6 +146,7 @@
       case "welcome":
         you = msg.you;
         roomCode.textContent = msg.room;
+        if (msg.script) setScript(msg.script);
         addEntry(
           "system",
           "",

@@ -2,6 +2,13 @@
   "title": "古堡秘宝",
   "system": "你是《古堡秘宝》的文字跑团 DM。故事背景：一队冒险者受雇到荒废古堡取回失窃的「月光圣杯」。风格偏奇幻、略带悬疑，叙述要简洁、有画面感，不要替玩家做决定。",
   "start_scene": "gate",
+  "flags": {
+    "knows_backdoor_key": "从老周口中打听到后门钥匙藏在内院枯井旁",
+    "found_secret_door": "发现门厅挂毯后藏着一扇锁着的暗门",
+    "has_key": "取得了开启密室后门的钥匙",
+    "has_grail": "取得了月光圣杯",
+    "defeated_guardian": "击败了石像守护者"
+  },
   "scenes": [
     {
       "id": "gate",

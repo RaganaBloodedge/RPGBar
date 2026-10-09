@@ -87,6 +87,31 @@ async def run_unit():
     opts = await dm.suggest(state3)
     check("助手建议非空", isinstance(opts, list) and len(opts) > 0, str(opts))
 
+    # ---- 中途加入：进度判定 / 剧情回顾 / DM 引导 ----
+    store2 = ScriptStore(SCRIPT)
+    check("剧本驱动 flag 全集", {"has_key", "found_secret_door"} <= store2.flag_ids, str(sorted(store2.flag_ids)))
+    check("flag 有中文描述", store2.flag_label("has_key") != "has_key", store2.flag_label("has_key"))
+
+    fresh = GameState(store2, "gate")
+    check("未开局的房间不算中途加入", not fresh.is_in_progress())
+    fresh.add_player("A", {"cls": "战士"})
+    check("首个玩家 joined_at_turn=0", fresh.players["A"].joined_at_turn == 0, str(fresh.players["A"].joined_at_turn))
+
+    prog = GameState(store2, "gate")
+    prog.add_player("A", {"cls": "战士"})
+    await dm.handle_action(prog, "A", "推开铁门进入门厅")
+    check("推进后判定为已开局", prog.is_in_progress())
+    check("行程记录为 古堡大门→门厅", prog.scene_path() == ["古堡大门", "门厅"], str(prog.scene_path()))
+    prog.set_flag("found_secret_door")
+    r = prog.recap()
+    check("回顾含中文线索", any(f["label"] != f["id"] for f in r["flags"]), str(r["flags"]))
+
+    intro = await dm.introduce(prog, "梅林", {"cls": "法师"})
+    check("引导旁白非空", bool(intro and intro.strip()))
+    check("引导旁白含新玩家名字与职业", "梅林" in intro and "法师" in intro, intro[:60])
+    check("引导旁白复述此前行程", "门厅" in intro, intro[:80])
+    check("引导旁白复述已获线索", "暗门" in intro, intro[:120])
+
 
 async def recv_until(ws, pred, timeout=6.0):
     end = time.time() + timeout
@@ -151,10 +176,96 @@ async def run_live():
         await b.close()
 
 
+async def collect(ws, count, timeout=8.0):
+    """按顺序收集若干条消息（不丢弃中间消息，便于断言顺序）。"""
+    msgs = []
+    end = time.time() + timeout
+    while len(msgs) < count and time.time() < end:
+        try:
+            msgs.append(json.loads(await asyncio.wait_for(ws.recv(), timeout=end - time.time())))
+        except (asyncio.TimeoutError, Exception):
+            break
+    return msgs
+
+
+async def run_live_latejoin():
+    print("== 实时中途加入校验（需服务器已启动） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过")
+        return
+
+    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+    # 独立房间码，保证「先到者」进的是全新房间（否则会误判为中途加入）
+    room = "LATE" + str(int(time.time() * 1000) % 100000)
+    try:
+        a = await websockets.connect(ws_url, proxy=None)
+    except Exception as e:
+        print(f"  [SKIP] 无法连接服务器 {ws_url}：{e}")
+        return
+
+    b = None
+    try:
+        await a.send(json.dumps({"type": "join", "name": "先到者", "room": room, "character": {"cls": "战士"}}, ensure_ascii=False))
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        check("联机：首人加入 welcome.late=False", bool(wa) and wa.get("late") is False, str(wa))
+
+        # 先到者推进剧情：进入门厅
+        await a.send(json.dumps({"type": "action", "text": "推开铁门进入门厅"}, ensure_ascii=False))
+        st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == "hall")
+        check("联机：先到者推进到门厅", bool(st), "未到达 hall")
+        await a.send(json.dumps({"type": "action", "text": "调查挂毯"}, ensure_ascii=False))
+        await recv_until(a, lambda m: m["type"] == "dice")
+
+        # 新玩家中途加入同一房间
+        b = await websockets.connect(ws_url, proxy=None)
+        await b.send(json.dumps({"type": "join", "name": "迟到者", "room": room, "character": {"cls": "法师"}}, ensure_ascii=False))
+        b_msgs = await collect(b, 6)
+        types = [m["type"] for m in b_msgs]
+
+        wb = next((m for m in b_msgs if m["type"] == "welcome"), None)
+        check("联机：中途加入 welcome.late=True", bool(wb) and wb.get("late") is True, str(wb))
+        check("联机：welcome 先于补课消息", bool(types) and types[0] == "welcome", str(types))
+
+        cap = next((m for m in b_msgs if m["type"] == "recap"), None)
+        check("联机：新玩家收到私有故事回顾", bool(cap), str(types))
+        rc = (cap or {}).get("recap", {})
+        check("联机：回顾含已走过的行程", "门厅" in (rc.get("scene_path") or []), str(rc.get("scene_path")))
+
+        intro = next((m for m in b_msgs if m["type"] == "narration"), None)
+        check(
+            "联机：DM 给出带入新人的旁白",
+            bool(intro) and ("迟到者" in intro.get("text", "") or "法师" in intro.get("text", "")),
+            str(intro)[:100],
+        )
+
+        # 老玩家也应看到「中场加入」广播与同一段旁白
+        a_msgs = await collect(a, 6)
+        check(
+            "联机：老玩家收到中场加入广播",
+            any(m["type"] == "system" and "中途加入" in m.get("text", "") for m in a_msgs),
+            str([m["type"] for m in a_msgs]),
+        )
+        check(
+            "联机：老玩家看到引导旁白",
+            any(m["type"] == "narration" for m in a_msgs),
+            str([m["type"] for m in a_msgs]),
+        )
+    finally:
+        for w in (a, b):
+            if w is not None:
+                try:
+                    await w.close()
+                except Exception:
+                    pass
+
+
 async def main():
     global PASS, FAIL
     await run_unit()
     await run_live()
+    await run_live_latejoin()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)
 

@@ -91,6 +91,20 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .entry.system .body { color: var(--text-dim); font-style: italic; }
 .entry.system { text-align: center; }
 
+/* ---- 故事回顾（中途加入补课）---- */
+.entry.recap {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--gold);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin: 10px 0 18px;
+}
+.entry.recap .meta { color: var(--gold); letter-spacing: 1px; margin-bottom: 8px; }
+.entry.recap .body { font-size: 14px; line-height: 1.8; color: var(--text); }
+.entry.recap .body b { color: var(--gold-soft); font-weight: 600; margin-right: 4px; }
+.entry.recap .recap-history { color: var(--text-dim); font-size: 13px; padding-left: 6px; }
+
 /* ---- 底部输入 ---- */
 .composer { padding: 12px 20px; background: var(--bg-2); border-top: 1px solid var(--border); }
 .suggestions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; min-height: 0; }

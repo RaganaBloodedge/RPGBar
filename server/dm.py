@@ -13,7 +13,7 @@ import re
 
 from . import dice
 
-# flag 白名单：LLM 只能设置剧本里真实存在的 flag
+# flag 白名单兜底：剧本未声明任何 flag 时使用
 FLAG_WHITELIST = {
     "knows_backdoor_key",
     "found_secret_door",
@@ -27,6 +27,11 @@ class DM:
     def __init__(self, store, provider):
         self.store = store
         self.provider = provider  # None 表示脚本化兜底
+
+    def _flag_whitelist(self):
+        """优先用剧本里真实存在的 flag（剧本驱动），否则退回内置白名单。"""
+        ids = getattr(self.store, "flag_ids", None)
+        return ids if ids else FLAG_WHITELIST
 
     # ---- 匹配 ----
     @staticmethod
@@ -159,7 +164,7 @@ class DM:
             f"   当前可用出口：{legal_exits or '无'}\n"
             "4. 骰子由系统投掷，你不得编造骰子结果。\n"
             "5. 只输出 JSON：{\"narration\":\"旁白\",\"move_to\":\"场景id或null\",\"set_flags\":[\"flag或空数组\"]}。\n"
-            f"   已知 flag：{sorted(FLAG_WHITELIST)}\n"
+            f"   已知 flag：{sorted(self._flag_whitelist())}\n"
         )
         state_info = (
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
@@ -182,7 +187,7 @@ class DM:
                     state.turn += 1
                     break
         for f in obj.get("set_flags", []) or []:
-            if f in FLAG_WHITELIST:
+            if f in self._flag_whitelist():
                 state.set_flag(f)
 
     def _scripted_narration(self, scene, action):
@@ -194,6 +199,56 @@ class DM:
         if checks:
             hints.append(f"可以尝试：{checks}")
         return f"（DM）{action}——" + " ".join(hints)
+
+    # ---- 中途加入：给新玩家补剧情 ----
+    async def introduce(self, state, name, character):
+        """新玩家中途加入时，生成一段把他带入当前剧情的旁白。"""
+        recap = state.recap()
+        if self.provider is None:
+            return self._scripted_intro(state, name, character, recap)
+        try:
+            scene = state.current()
+            sys_msg = (
+                "你是一场中文文字跑团的 DM。\n"
+                + self.store.system
+                + "\n【任务】有一位新玩家中途加入了本局，请用 2-4 句旁白完成两件事：\n"
+                "1. 自然地让他/她登场（说明他/她如何出现在当前场景），不要打断剧情节奏；\n"
+                "2. 顺带简要复述此前的关键进展，让新玩家跟得上，语气当作对着所有人讲述。\n"
+                "【硬性规则】\n"
+                "- 不得剧透只有 DM 知道的内幕；\n"
+                "- 不得编造剧本之外的走向、NPC、物品或地点；\n"
+                "- 不要替任何玩家做决定；\n"
+                "- 只输出 JSON：{\"narration\":\"旁白\"}。\n"
+            )
+            user_msg = (
+                f"当前场景：{state.current_scene} {scene.get('title', '')}（{scene.get('location', '')}）\n"
+                f"当前场景描述：{scene.get('public_text', '')}\n"
+                f"此前走过的场景：{' → '.join(recap['scene_path']) or '无'}\n"
+                f"队伍已掌握的线索：{'；'.join(f['label'] for f in recap['flags']) or '无'}\n"
+                f"最近发生的事：\n{state.recent_history_text(8) or '（尚无）'}\n"
+                f"新加入的玩家：{name}（{character.get('cls', '冒险者')}）"
+            )
+            raw = await self.provider.chat(
+                [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
+                json_mode=True,
+            )
+            text = (_parse_json(raw).get("narration") or "").strip()
+            return text or self._scripted_intro(state, name, character, recap)
+        except Exception:
+            return self._scripted_intro(state, name, character, recap)
+
+    def _scripted_intro(self, state, name, character, recap):
+        """无 LLM 时的兜底引导：拼接行程 + 线索 + 当前场景。"""
+        cls = (character or {}).get("cls", "冒险者")
+        scene = state.current()
+        path = recap["scene_path"]
+        journey = f"此前你们已经走过：{' → '.join(path[:-1])}。" if len(path) > 1 else ""
+        labels = "；".join(f["label"] for f in recap["flags"])
+        clue = f"目前掌握的线索：{labels}。" if labels else ""
+        return (
+            f"（DM）脚步声由远及近——{name}（{cls}）赶上了队伍，出现在{scene.get('location', '此地')}。"
+            f"{journey}{clue}此刻：{scene.get('public_text', '')}"
+        )
 
     # ---- 小助手建议 ----
     async def suggest(self, state):

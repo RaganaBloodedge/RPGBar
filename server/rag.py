@@ -27,8 +27,26 @@ class ScriptStore:
         self.system = self.data.get("system", "")
         self.start_scene = self.data.get("start_scene")
         self.scenes = {s["id"]: s for s in self.data.get("scenes", [])}
+        # flag 中文描述（剧本可选提供，用于给玩家复述线索）
+        self.flag_desc = self.data.get("flags", {}) or {}
+        self.flag_ids = self._collect_flags()
         self._corpus, self._ids = self._build_corpus()
         self._bm25 = BM25Okapi(self._corpus)
+
+    def _collect_flags(self) -> set:
+        """剧本里出现过的全部 flag（显式声明 + 场景/检定引用），作为 LLM 白名单。"""
+        ids = set(self.flag_desc)
+        for s in self.scenes.values():
+            ids.update(s.get("flags_set", []) or [])
+            ids.update(s.get("flags_required", []) or [])
+            for c in s.get("checks", []) or []:
+                if c.get("success_flag"):
+                    ids.add(c["success_flag"])
+        return ids
+
+    def flag_label(self, fid: str) -> str:
+        """flag 的可读描述，剧本未提供时退回 flag 本身。"""
+        return self.flag_desc.get(fid, fid)
 
     def get_scene(self, scene_id):
         return self.scenes.get(scene_id)

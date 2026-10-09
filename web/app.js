@@ -63,12 +63,67 @@
     }
   }
 
+  function renderRecap(recap) {
+    if (!recap) return;
+    var div = document.createElement("div");
+    div.className = "entry recap";
+
+    var meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = "故事回顾 · DM 为你补课";
+
+    var body = document.createElement("div");
+    body.className = "body";
+
+    if (recap.scene_path && recap.scene_path.length > 1) {
+      body.appendChild(recapLine("行程", recap.scene_path.join(" → ")));
+    }
+    var flags = (recap.flags || []).map(function (f) {
+      return (f && f.label) ? f.label : (f && f.id) ? f.id : String(f);
+    });
+    if (flags.length) {
+      body.appendChild(recapLine("线索", flags.join("；")));
+    }
+    if (recap.recent && recap.recent.length) {
+      body.appendChild(recapLine("最近动态", ""));
+      recap.recent.forEach(function (h) {
+        var p = document.createElement("div");
+        p.className = "recap-history";
+        p.textContent = "· " + h;
+        body.appendChild(p);
+      });
+    }
+
+    div.appendChild(meta);
+    div.appendChild(body);
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function recapLine(label, text) {
+    var p = document.createElement("div");
+    var b = document.createElement("b");
+    b.textContent = label + "：";
+    p.appendChild(b);
+    if (text) p.appendChild(document.createTextNode(text));
+    return p;
+  }
+
   function handleMessage(msg) {
     switch (msg.type) {
       case "welcome":
         you = msg.you;
         roomCode.textContent = msg.room;
-        addEntry("system", "", "你已加入房间 " + msg.room + "（你是 " + you + "）");
+        addEntry(
+          "system",
+          "",
+          msg.late
+            ? "你中途加入了房间 " + msg.room + "（你是 " + you + "），DM 正在为你补上之前的剧情…"
+            : "你已加入房间 " + msg.room + "（你是 " + you + "）"
+        );
+        break;
+      case "recap":
+        renderRecap(msg.recap);
         break;
       case "system":
         addEntry("system", "", msg.text);

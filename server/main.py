@@ -7,11 +7,12 @@
     {"type":"suggest"}
     {"type":"roll"}
   服务端 → 客户端：
-    {"type":"welcome","room":"...","you":"..."}
+    {"type":"welcome","room":"...","you":"...","late":bool}   # late=true 表示中途加入
     {"type":"system","text":"..."}
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
     {"type":"suggestions","options":[...]}
+    {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
     {"type":"state","state":{...}}
     {"type":"error","message":"..."}
 """
@@ -56,16 +57,35 @@ class Room:
             except Exception:
                 pass
 
+    @staticmethod
+    async def send_to(ws, msg):
+        try:
+            await ws.send_text(json.dumps(msg, ensure_ascii=False))
+        except Exception:
+            pass
+
     async def send_state(self):
         await self.broadcast({"type": "state", "state": self.state.snapshot()})
 
     async def on_join(self, name, character, ws):
-        self.state.add_player(name, character)
-        self.clients.append((name, ws))
-        await ws.send_text(json.dumps({"type": "welcome", "room": self.code, "you": name}, ensure_ascii=False))
-        await self.broadcast({"type": "system", "text": f"{name} 加入了队伍"})
-        await self.broadcast({"type": "narration", "author": "DM", "text": self.state.current().get("public_text", "")})
-        await self.send_state()
+        async with self.lock:
+            # 加入前已开局 → 视为「中途加入」，需要 DM 补剧情
+            late = self.state.is_in_progress()
+            self.state.add_player(name, character)
+            self.clients.append((name, ws))
+            await self.send_to(ws, {"type": "welcome", "room": self.code, "you": name, "late": late})
+            if not late:
+                await self.broadcast({"type": "system", "text": f"{name} 加入了队伍"})
+                await self.broadcast(
+                    {"type": "narration", "author": "DM", "text": self.state.current().get("public_text", "")}
+                )
+            else:
+                await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
+                intro = await self.dm.introduce(self.state, name, character)
+                await self.broadcast({"type": "narration", "author": "DM", "text": intro})
+                # 只发给新玩家：结构化「故事回顾」
+                await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
+            await self.send_state()
 
     async def on_action(self, name, text):
         async with self.lock:

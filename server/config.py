@@ -42,6 +42,8 @@ DEFAULTS = {
         "temperature": 0.8,
     },
     "server": {"host": "0.0.0.0", "port": 8000},
+    # 剧本文件（相对 RESOURCE_DIR；也可写绝对路径）
+    "script": "scripts/sample_script.json",
 }
 
 
@@ -71,6 +73,8 @@ def load_config() -> dict:
         cfg["llm"]["base_url"] = env["RPGBAR_LLM_BASE_URL"]
     if env.get("RPGBAR_LLM_MODEL"):
         cfg["llm"]["model"] = env["RPGBAR_LLM_MODEL"]
+    if env.get("RPGBAR_SCRIPT"):
+        cfg["script"] = env["RPGBAR_SCRIPT"]
 
     # 有 key 即启用 openai 兼容 provider
     if cfg["llm"].get("api_key"):

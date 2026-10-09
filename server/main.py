@@ -7,17 +7,18 @@
     {"type":"suggest"}
     {"type":"roll"}
   服务端 → 客户端：
-    {"type":"welcome","room":"...","you":"...","late":bool}   # late=true 表示中途加入
+    {"type":"welcome","room":"...","you":"...","late":bool,"script":"剧本名"}  # late=true 表示中途加入
     {"type":"system","text":"..."}
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
     {"type":"suggestions","options":[...]}
     {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
-    {"type":"state","state":{...}}
+    {"type":"state","state":{...}}   # state.flag_details = [{"id":..,"label":..}]
     {"type":"error","message":"..."}
 """
 import asyncio
 import json
+import os
 import secrets
 import string
 from pathlib import Path
@@ -34,9 +35,23 @@ from .rag import ScriptStore
 from .state_machine import GameState
 
 cfg = load_config()
-store = ScriptStore(RESOURCE_DIR / "scripts" / "sample_script.json")
+
+
+def _resolve_script(rel: str) -> Path:
+    """解析剧本路径：相对路径按只读资源目录解析；不存在则回退到内置样例剧本。"""
+    p = Path(rel)
+    path = p if p.is_absolute() else (RESOURCE_DIR / p)
+    if path.exists():
+        return path
+    fallback = RESOURCE_DIR / "scripts" / "sample_script.json"
+    print(f"[RPGBar] 剧本「{rel}」不存在，已回退到 {fallback.name}")
+    return fallback
+
+
+store = ScriptStore(_resolve_script(cfg.get("script") or "scripts/sample_script.json"))
 provider = build_provider(cfg)
 
+print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag）")
 if provider is None:
     print("[RPGBar] 未配置 LLM API key，DM 走脚本化兜底（玩法完整可玩）。")
 else:
@@ -74,7 +89,16 @@ class Room:
             late = self.state.is_in_progress()
             self.state.add_player(name, character)
             self.clients.append((name, ws))
-            await self.send_to(ws, {"type": "welcome", "room": self.code, "you": name, "late": late})
+            await self.send_to(
+                ws,
+                {
+                    "type": "welcome",
+                    "room": self.code,
+                    "you": name,
+                    "late": late,
+                    "script": store.title,
+                },
+            )
             if not late:
                 await self.broadcast({"type": "system", "text": f"{name} 加入了队伍"})
                 await self.broadcast(
@@ -117,7 +141,7 @@ app = FastAPI(title="RPGBar", version=__version__)
 @app.get("/api/version")
 async def api_version():
     """版本信息，供客户端展示（版本号来自 server/__init__.py）。"""
-    return {"name": "RPGBar", "version": __version__}
+    return {"name": "RPGBar", "version": __version__, "script": store.title}
 
 
 @app.websocket("/ws")
@@ -186,8 +210,6 @@ def _lan_ip():
 
 
 def main():
-    import os
-
     import uvicorn
 
     s = cfg["server"]

@@ -48,7 +48,7 @@ python -m server.main
 
 ### 在游戏里接入（推荐，不用改配置文件）
 
-进房后点顶栏 **「⚙ 模型」**：
+进房后点顶栏 **「⚙ 设置」** 里的**模型**部分：
 
 - **云 API**：选 DeepSeek / OpenAI / 智谱 GLM 预设（或自定义 `base_url`），填 `api_key` 与模型名。
 - **本地模型**：选 llama.cpp / Ollama / LM Studio 预设，指向本机地址，**不需要 key**。
@@ -95,20 +95,22 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 
 | 模块 | 文件 | 职责 |
 | --- | --- | --- |
-| 剧本仓库 + RAG | `server/rag.py` | 加载结构化剧本，jieba 分词 + BM25 检索相关场景片段 |
+| 剧本读取 + 自动切片 | `server/script_loader.py` | 读剧本文件 → 切片 → 生成次级 prompt；含剧本自检 |
+| 剧本仓库 + RAG | `server/rag.py` | 持有已切片的剧本，jieba 分词 + BM25 检索相关场景片段 |
 | 剧情状态机 | `server/state_machine.py` | 场景/flag/出口/检定，服务端权威状态 |
 | 骰子 | `server/dice.py` | 服务端投掷，可设种子复现 |
-| Agent 骨架 | `server/agents/base.py` | 工具注册 + 工具调用循环 + 两条降级路径 |
-| 主机 DM Agent | `server/agents/narrator.py` | 大模型；持有写工具（移动/加线索/投骰），护栏做在工具里 |
-| 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；**只有只读工具**，结构上改不了剧情 |
+| Agent 骨架 | `server/agents/base.py` | 两层提示词 + 工具注册 + 工具调用循环 + 两条降级路径 |
+| 主机 DM Agent | `server/agents/narrator.py` | 大模型；System prompt 写职责，次级 prompt 给剧本 |
+| 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；**只有只读工具**，次级 prompt 为公开版 |
 | 无模型的 DM 流水线 | `server/dm.py` | 确定性剧本编排（留空 API 时的兜底），与 Agent 共用同一套状态机 |
 | LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider：云 API 与本地模型同一套；含工具调用与降级判定 |
-| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，模型槽位运行期配置，中途加入判定与补课推送 |
-| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板、**模型设置抽屉** |
+| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，模型槽位运行期配置，剧本读取/切换接口，中途加入推送 |
+| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板、**设置抽屉（模型 + 剧本）** |
 
 ## 关键设计
 
 - **服务器权威 + 客户端连接**：玩家只连服务器，不自己起服务；房间按码隔离。
+- **职责与内容分层**：System prompt 只写 Agent 职责；剧本内容由 `script_loader` 自动切片后生成次级 prompt，换剧本不动人格。
 - **守剧本 = RAG + 状态机双保险**：RAG 给 DM 递当前场景与相关片段，状态机管「剧情走到哪、允许往哪走」。
 - **护栏做在工具里，不靠提示词**：DM 的 `move_to` 只接受当前场景**已解锁**的出口、`set_flag` 只接受剧本声明过的 flag、
   骰子只能由 `roll_check` 在服务端投——模型拿不到骰子，也就编不出结果。小助手则连写工具都没有。
@@ -117,9 +119,31 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 - **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
 - **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
+## 提示词分层：System 管职责，次级 prompt 管剧本
+
+两个 Agent 的提示词都分两层：
+
+| 层 | 内容 | 随什么变 |
+| --- | --- | --- |
+| **System prompt** | Agent 的**职责**与边界（DM 是主持人；小助手只读给建议） | 基本不变 |
+| **次级 prompt** | 剧本的**内容**：世界观、语气、切片索引 | 换剧本就换它 |
+
+次级 prompt 排在 System prompt 之后，作为**第二条 system 消息**发给模型。这样职责与内容解耦：换剧本不用动 Agent 的人格的护栏。
+
+小助手拿到的是次级 prompt 的**公开版**——只有剧本名、公开背景与「只能建议剧本里真实存在的行动」这条约束，**不含场景索引与 DM 内幕**（最小权限 + 防剧透）。
+
+### 剧本读取、切片与次级 prompt 怎么来的
+
+`server/script_loader.py` 是「读取文件 → 自动切片 → 生成次级 prompt」的单一入口：
+
+- **结构化剧本 JSON**：一个场景 = 一个切片，另加一个「剧本设定」切片。
+- **无结构文本**（`.md` / `.txt`）：按 Markdown 标题切段，超长章节按段落装箱（默认 900 字/片），
+  并**自动合成一条线性场景链**（每片指向下一片），让纯文本剧本也能直接开局试玩。
+- 读取时顺带**自检**：出口断链、无法到达的场景、`start_scene` 不存在、缺 `system` 段都会报出来。
+
 ## 剧本
 
-剧本是结构化 JSON，放在 `scripts/`，用 `config.json` 的 `script` 字段或环境变量选：
+剧本放在 `scripts/`，用 `config.json` 的 `script` 字段或环境变量选：
 
 ```bash
 # 默认：原创剧本《古堡秘宝》
@@ -138,23 +162,44 @@ RPGBAR_SCRIPT=scripts/totsk_l1.json python -m server.main
 
 剧本名会显示在启动横幅、`/api/version` 与网页上——**一眼看出这局跑的是哪个本**。
 
+### 运行期读取与切换剧本
+
+不用重启服务器，在游戏里点顶栏 **「⚙ 设置」** 的**剧本**卡片就能：读取某个剧本文件（预览切片与生成的次级 prompt）、
+房主一键切换活动剧本，或直接粘贴剧本内容（自动识别 JSON / Markdown）。
+
+对应的接口：
+
+| 接口 | 作用 |
+| --- | --- |
+| `GET /api/scripts` | 列出可用的剧本文件（标题 / 场景数 / 切片数 / 自检告警） |
+| `POST /api/scripts/inspect` | 读取剧本 → 自动切片 → 返回切片清单与两份次级 prompt（只看不改） |
+| `POST /api/scripts/load` | 读取并切换「活动剧本」（新开的房间生效；进行中的对局不受影响） |
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/scripts/inspect \
+  -H "Content-Type: application/json" -d '{"path":"totsk_l1.json"}'
+```
+
+> 出于安全考虑，`path` 只允许指向 `scripts/` 目录内的文件（服务端默认绑 `0.0.0.0`，不能变成任意文件读取接口）；
+> 想用别处的剧本，就把它拷进 `scripts/`，或者用 `content` 直接提交内容。
+
 ## 测试
 
 ```bash
-python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入 + 模型设置（需先起服务器）
+python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入 + 模型设置 + 剧本接口（需先起服务器）
 python scripts/smoke_test.py --unit # 仅进程内
 
-# 可选：前端 DOM 校验（需 Node + jsdom，验证「模型设置」抽屉的交互）
+# 可选：前端 DOM 校验（需 Node + jsdom，验证设置抽屉的交互）
 npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **116 项全绿**（Python）+ **32 项全绿**（前端 DOM，可选）。
+当前 **181 项全绿**（Python）+ **47 项全绿**（前端 DOM，可选）。
 实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
 Agent 层的测试不需要真实模型——用一个按脚本吐回复的假 Provider 就能验完整工具循环。
 
 ## 版本
 
-当前版本 **v0.7.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
+当前版本 **v0.8.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
 
 版本号只有一个来源：`server/__init__.py` 的 `__version__`。它会显示在服务器启动横幅、`GET /api/version`，以及网页的加入页与顶栏——所以"跑的是哪一版"一眼可辨。
 
@@ -185,6 +230,7 @@ python -c "import shutil; shutil.make_archive('RPGBarServer','zip',root_dir='dis
 
 ## 后续路线
 
-1. 跑通 Web 联机 demo，双 Agent + 双模型通道（当前）。
+1. 跑通 Web 联机 demo：双 Agent + 双模型通道 + 剧本读取/切片（当前）。
 2. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
 3. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接一个大模型——通道已就位，等接默认值。
+4. 有模型时用模型给切片做摘要（现在切片索引是按场景/标题生成的，摘要可交给小模型离线生成后缓存）。

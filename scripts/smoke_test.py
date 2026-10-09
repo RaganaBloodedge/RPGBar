@@ -10,12 +10,14 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from server import __version__
 from server.dice import seed as dice_seed
 from server.dm import DM
 from server.rag import ScriptStore
@@ -40,6 +42,15 @@ async def run_unit():
     print("== 进程内校验 ==")
     store = ScriptStore(SCRIPT)
     check("剧本加载（5 场景）", len(store.scenes) == 5, f"实际 {len(store.scenes)}")
+
+    # 版本机制：__version__ 必须与 CHANGELOG 最新版本一致
+    changelog = (SCRIPT.parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+    m = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.M)
+    check(
+        "版本号与 CHANGELOG 一致",
+        bool(m) and m.group(1) == __version__,
+        f"CHANGELOG={m.group(1) if m else '未找到'} 代码={__version__}",
+    )
 
     # RAG 检索：搜"钥匙"应命中内院
     related = store.retrieve("gate", "我想找后门钥匙")
@@ -176,6 +187,20 @@ async def run_live():
         await b.close()
 
 
+async def run_live_version():
+    """校验 /api/version（版本号是发版机制的一环，打包后也必须可用）。"""
+    import httpx
+
+    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+    http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
+    try:
+        r = httpx.get(http_url + "/api/version", timeout=8, trust_env=False)
+        data = r.json()
+        check("联机：/api/version 返回版本号", r.status_code == 200 and bool(data.get("version")), str(data))
+    except Exception as e:
+        print(f"  [SKIP] /api/version 不可用：{e}")
+
+
 async def collect(ws, count, timeout=8.0):
     """按顺序收集若干条消息（不丢弃中间消息，便于断言顺序）。"""
     msgs = []
@@ -265,6 +290,7 @@ async def main():
     global PASS, FAIL
     await run_unit()
     await run_live()
+    await run_live_version()
     await run_live_latejoin()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)

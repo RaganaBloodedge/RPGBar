@@ -25,6 +25,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .config import RESOURCE_DIR, load_config
 from .dice import roll
 from .dm import DM
@@ -110,7 +111,13 @@ def gen_code():
     return "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
 
 
-app = FastAPI(title="RPGBar")
+app = FastAPI(title="RPGBar", version=__version__)
+
+
+@app.get("/api/version")
+async def api_version():
+    """版本信息，供客户端展示（版本号来自 server/__init__.py）。"""
+    return {"name": "RPGBar", "version": __version__}
 
 
 @app.websocket("/ws")
@@ -186,7 +193,7 @@ def main():
     s = cfg["server"]
     port = int(os.environ.get("PORT", s["port"]))
     host = "0.0.0.0" if os.environ.get("PORT") else s["host"]
-    print(f"[RPGBar] 服务器监听 {host}:{port}")
+    print(f"[RPGBar] v{__version__} 服务器监听 {host}:{port}")
     if host in ("0.0.0.0", "::"):
         print(f"[RPGBar] 本机访问: http://127.0.0.1:{port}")
         lan = _lan_ip()

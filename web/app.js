@@ -21,6 +21,21 @@
   var ws = null;
   var you = "";
 
+  function loadVersion() {
+    fetch("/api/version")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.version) return;
+        var v = "v" + d.version;
+        ["app-version", "app-version-top"].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.textContent = v;
+        });
+      })
+      .catch(function () {});
+  }
+  loadVersion();
+
   function addEntry(kind, author, text) {
     var div = document.createElement("div");
     div.className = "entry " + kind;

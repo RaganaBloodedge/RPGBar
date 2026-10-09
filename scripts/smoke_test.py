@@ -18,8 +18,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server import __version__
+from server.agents import (
+    AdvisorAgent,
+    AdvisorContext,
+    NarratorAgent,
+    NarratorContext,
+    describe_agents,
+)
 from server.dice import seed as dice_seed
 from server.dm import DM
+from server.llm import ToolCallingUnsupported, build_provider
 from server.rag import ScriptStore
 from server.state_machine import GameState
 
@@ -248,10 +256,228 @@ async def run_unit_totsk():
         dice_mod.roll_check = real_roll
 
 
+class FakeProvider:
+    """假 Provider：按脚本依次吐出预设回复，用来在没有真实模型时验证 Agent 工具循环。
+
+    `replies` 里每一项要么是 {"content","tool_calls"}，要么是一个可调用对象
+    （拿 messages/tools 现场算回复），后者用于动态断言。
+    """
+
+    name = "fake"
+    supports_tools = True
+
+    def __init__(self, replies, allow_tools=True):
+        self.replies = list(replies)
+        self.seen = []  # [(kind, messages, tools?)]
+        self.allow_tools = allow_tools
+
+    async def chat(self, messages, json_mode=False):
+        self.seen.append(("chat", messages))
+        r = self.replies.pop(0) if self.replies else ""
+        if callable(r):
+            return await r(messages, json_mode)
+        return r if isinstance(r, str) else (r.get("content") or "")
+
+    async def chat_with_tools(self, messages, tools):
+        self.seen.append(("tools", messages, tools))
+        if not self.allow_tools:
+            raise ToolCallingUnsupported("fake: 该模型不支持工具调用")
+        r = self.replies.pop(0) if self.replies else {}
+        return r
+
+    async def close(self):
+        pass
+
+
+def tool_call(name, args=None, cid=None):
+    return {
+        "id": cid or f"call_{name}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args or {}, ensure_ascii=False)},
+    }
+
+
+def _reply(*calls, content=""):
+    return {"content": content, "tool_calls": list(calls)}
+
+
+async def run_unit_agents():
+    """Agent 层校验：工具循环、护栏、降级路径、槽位清洗 —— 全部不需要真实模型。"""
+    print("== 进程内校验：Agent 工具循环与降级（无真实模型） ==")
+    store = ScriptStore(SCRIPT)
+    start = store.start_scene
+    first_exit = store.scenes[start]["exits"][0]["to"]
+    first_check = (store.scenes[start].get("checks") or [{}])[0].get("id")
+
+    # --- 1. 标准工具循环：模型调 move_to → 回灌结果 → 再调 finish ---
+    state = GameState(store, start)
+    state.add_player("亚瑟", {"cls": "战士"})
+    fake = FakeProvider(
+        [
+            _reply(tool_call("move_to", {"scene_id": first_exit})),
+            _reply(tool_call("finish", {"narration": "你推门而入。"})),
+        ]
+    )
+    res = await NarratorAgent(store, fake).run(
+        NarratorContext(state=state, player_name="亚瑟"), "推门进去"
+    )
+    check("Agent：工具循环真的改了状态（move_to 生效）", state.current_scene == first_exit, state.current_scene)
+    check("Agent：finish 收尾给出旁白", res.text == "你推门而入。", res.text)
+    check("Agent：trace 按序记录工具", res.used_tools == ["move_to", "finish"], str(res.used_tools))
+    check("Agent：source 标为 llm", res.source == "llm", res.source)
+    second_msgs = fake.seen[1][1]
+    check(
+        "Agent：工具结果以 role=tool 回灌给模型",
+        any(m.get("role") == "tool" for m in second_msgs),
+        str([m.get("role") for m in second_msgs]),
+    )
+    check(
+        "Agent：工具声明下发给模型（含 move_to）",
+        bool(fake.seen[0][2]) and any(t["function"]["name"] == "move_to" for t in fake.seen[0][2]),
+        "",
+    )
+
+    # --- 2. 护栏：非法出口被工具拒绝，状态不变 ---
+    s2 = GameState(store, start)
+    s2.add_player("A", {"cls": "战士"})
+    fake2 = FakeProvider([_reply(tool_call("move_to", {"scene_id": "atlantis"})), _reply(tool_call("finish", {"narration": "没有这条路。"}))])
+    res2 = await NarratorAgent(store, fake2).run(NarratorContext(state=s2, player_name="A"), "去亚特兰蒂斯")
+    check("Agent 护栏：不存在的出口被拒、场景不变", s2.current_scene == start, s2.current_scene)
+    check(
+        "Agent 护栏：拒绝以 error 回灌（模型可重试）",
+        "error" in json.dumps(res2.steps[0].result, ensure_ascii=False),
+        str(res2.steps[0].result)[:80],
+    )
+
+    # --- 3. 护栏：未声明的 flag 被拒 ---
+    s3 = GameState(store, start)
+    s3.add_player("A", {"cls": "战士"})
+    fake3 = FakeProvider([_reply(tool_call("set_flag", {"flag": "made_up_flag"})), _reply(tool_call("finish", {"narration": "嗯。"}))])
+    await NarratorAgent(store, fake3).run(NarratorContext(state=s3, player_name="A"), "乱记一笔")
+    check("Agent 护栏：剧本没声明的 flag 记不进去", "made_up_flag" not in s3.flags, str(sorted(s3.flags)))
+
+    # --- 4. 骰子只能由服务端投（roll_check 产生 dice 事件） ---
+    if first_check:
+        s4 = GameState(store, start)
+        s4.add_player("A", {"cls": "战士"})
+        dice_seed(20261009)
+        fake4 = FakeProvider([_reply(tool_call("roll_check", {"check_id": first_check})), _reply(tool_call("finish", {"narration": "你仔细查看。"}))])
+        ctx4 = NarratorContext(state=s4, player_name="A")
+        await NarratorAgent(store, fake4).run(ctx4, "检查")
+        dice_evs = [e for e in ctx4.events if e.get("type") == "dice"]
+        check("Agent：roll_check 由服务端投骰并产出 dice 事件", len(dice_evs) == 1, str(ctx4.events)[:100])
+        check("Agent：投骰结果不由模型编造（含真实 roll 值）", bool(dice_evs) and isinstance(dice_evs[0].get("roll"), int), str(dice_evs)[:80])
+
+    # --- 5. 权限边界：小助手的工具集里没有写工具 ---
+    adv = AdvisorAgent(store, None)
+    adv_tools = adv.build_tools(AdvisorContext(state=GameState(store, start)))
+    check("小助手：工具全部只读", all(t.read_only for t in adv_tools), str([(t.name, t.read_only) for t in adv_tools]))
+    check(
+        "小助手：结构上拿不到写工具",
+        not any(t.name in ("move_to", "set_flag", "roll_check") for t in adv_tools),
+        str([t.name for t in adv_tools]),
+    )
+    check(
+        "小助手：读场景不下发 DM 内幕",
+        "dm_notes" not in json.dumps(adv_tools[0].handler(AdvisorContext(state=GameState(store, start))), ensure_ascii=False),
+        "",
+    )
+
+    # --- 6. 小助手：接了模型走工具循环，没接走脚本化 ---
+    s6 = GameState(store, start)
+    s6.add_player("A", {"cls": "法师"})
+    adv_fake = FakeProvider([_reply(tool_call("finish", {"options": ["检查石门", "观察四周", "听一听"]}))])
+    r6 = await AdvisorAgent(store, adv_fake).suggest(AdvisorContext(state=s6, player_name="A"))
+    check("小助手：模型给的建议入列", r6.data.get("options") == ["检查石门", "观察四周", "听一听"], str(r6.data))
+    check("小助手：用了 finish 工具", r6.used_tools == ["finish"], str(r6.used_tools))
+    r6b = await AdvisorAgent(store, None).suggest(AdvisorContext(state=s6, player_name="A"))
+    check(
+        "小助手：无模型时给脚本化建议",
+        bool(r6b.data.get("options")) and r6b.source == "scripted",
+        f"{r6b.data} / {r6b.source}",
+    )
+
+    # --- 7. 无 provider：DM 退化为确定性流水线，玩法不变 ---
+    s7 = GameState(store, start)
+    s7.add_player("A", {"cls": "战士"})
+    n7 = NarratorAgent(store, None)
+    ctx7 = NarratorContext(state=s7, player_name="A")
+    r7 = await n7.run(ctx7, "我环顾四周，警惕地观察")
+    check("无模型：stopped=no_provider", r7.stopped == "no_provider", r7.stopped)
+    check("无模型：交给确定性流水线（产出可广播的事件）", bool(ctx7.events), str(ctx7.events)[:100])
+    check("无模型：不经过 provider.chat", not isinstance(n7.provider, FakeProvider) and n7.provider is None, str(n7.provider))
+
+    # --- 8. 模型不支持工具调用 → 自动降级为单轮 JSON 协议 ---
+    s8 = GameState(store, start)
+    s8.add_player("A", {"cls": "战士"})
+    no_tools = FakeProvider(
+        [_reply(tool_call("move_to", {"scene_id": first_exit}))],
+        allow_tools=False,
+    )
+
+    async def _json_reply(messages, json_mode=False):
+        return json.dumps({"narration": "你环顾四周。", "move_to": first_exit, "set_flags": []}, ensure_ascii=False)
+
+    no_tools.replies = [_json_reply]
+    r8 = await NarratorAgent(store, no_tools).run(NarratorContext(state=s8, player_name="A"), "进去看看")
+    check("降级：模型不支持工具 → 单轮 JSON 生效", s8.current_scene == first_exit, s8.current_scene)
+    check("降级：旁白取自 JSON", "环顾四周" in r8.text, r8.text)
+    check("降级：stopped=no_tools / source=degraded", r8.stopped == "no_tools" and r8.source == "degraded", f"{r8.stopped}/{r8.source}")
+
+    # --- 9. Provider 槽位矩阵 ---
+    check("provider：kind=off → None", build_provider({"kind": "off"}) is None, "")
+    check("provider：云 API 缺 key → None", build_provider({"kind": "cloud", "base_url": "https://x/v1", "model": "m"}) is None, "")
+    p_cloud = build_provider({"kind": "cloud", "base_url": "https://x/v1", "model": "m", "api_key": "sk-1"})
+    check("provider：云 API 齐活 → 可用", p_cloud is not None and p_cloud.label == "cloud", "")
+    if p_cloud:
+        await p_cloud.close()
+    p_local = build_provider({"kind": "local", "base_url": "http://127.0.0.1:8080/v1", "model": "m"})
+    check("provider：本地模型免 key → 可用", p_local is not None and p_local.label == "local", "")
+    if p_local:
+        await p_local.close()
+
+    # --- 10. 槽位清洗：白名单 + 类型 + 取值范围 ---
+    from server.main import clean_slot_patch, merge_slot
+
+    dirty = clean_slot_patch(
+        {
+            "kind": "HACKED",
+            "base_url": "ftp://evil",
+            "model": "  m1  ",
+            "temperature": 99,
+            "api_key": " sk-x ",
+            "drop_table": True,
+        }
+    )
+    check("清洗：非法 kind 被丢", "kind" not in dirty, str(dirty))
+    check("清洗：非 http(s) 的 base_url 被丢", "base_url" not in dirty, str(dirty))
+    check("清洗：白名单外的字段被丢", "drop_table" not in dirty, str(dirty))
+    check("清洗：temperature 被夹到 [0,2]", dirty.get("temperature") == 2.0, str(dirty.get("temperature")))
+    check("清洗：字符串两端空白被去掉", dirty.get("model") == "m1" and dirty.get("api_key") == "sk-x", str(dirty))
+    slot = {"kind": "cloud", "api_key": "sk-old", "model": "a"}
+    merge_slot(slot, {"model": "b"})
+    check("合并：未提交的 api_key 保持原值", slot["api_key"] == "sk-old", str(slot))
+
+    # --- 11. 对外状态描述绝不泄露 api_key ---
+    pub = describe_agents(
+        {"kind": "cloud", "base_url": "https://x/v1", "model": "m", "api_key": "sk-secret"},
+        {"kind": "off", "api_key": ""},
+    )
+    blob = json.dumps(pub, ensure_ascii=False)
+    check(
+        "对外状态：不暴露 api_key 字段（只留 has_api_key 布尔）",
+        all("api_key" not in (pub[k] or {}) for k in ("dm", "advisor")),
+        blob[:110],
+    )
+    check("对外状态：不含明文密钥内容", "sk-secret" not in blob, blob[:110])
+    check("对外状态：只暴露 has_api_key 布尔", pub["dm"].get("has_api_key") is True, str(pub["dm"]))
+    check("对外状态：云 API 齐活即 ready", pub["dm"].get("ready") is True and pub["dm"].get("mode") == "model", str(pub["dm"]))
+    check("对外状态：留空即 scripted", pub["advisor"].get("ready") is False and pub["advisor"].get("mode") == "scripted", str(pub["advisor"]))
+
+
 def http_base():
     ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
     return ws_url.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
-
 
 def ws_url():
     return os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
@@ -456,13 +682,124 @@ async def run_live_latejoin():
                     pass
 
 
+async def run_live_configure():
+    """实时校验「游戏内接入模型」这条链路：房主权限、槽位清洗、key 不外泄。"""
+    print("== 实时模型设置校验（需服务器已启动） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过")
+        return
+
+    url = ws_url()
+    room = "CFG" + str(int(time.time() * 1000) % 100000)
+    try:
+        a = await websockets.connect(url, proxy=None)
+    except Exception as e:
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
+        return
+
+    b = None
+    try:
+        await a.send(json.dumps({"type": "join", "name": "房主", "room": room, "character": {"cls": "战士"}}, ensure_ascii=False))
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        agents = (wa or {}).get("agents") or {}
+        check("联机：welcome 带两个模型槽位状态", "dm" in agents and "advisor" in agents, str(agents)[:90])
+        check("联机：welcome 标出房主", agents.get("owner") == "房主", str(agents.get("owner")))
+        check(
+            "联机：槽位状态不回传 api_key（只留布尔）",
+            all("api_key" not in (agents.get(k) or {}) for k in ("dm", "advisor")),
+            str(agents)[:90],
+        )
+        check("联机：默认留空即脚本化", agents.get("dm", {}).get("ready") is False, str(agents.get("dm"))[:90])
+
+        # 房主把自己的小助手接到本地模型（本地不需要 key）
+        await a.send(
+            json.dumps(
+                {"type": "configure", "advisor": {"kind": "local", "base_url": "http://127.0.0.1:8080/v1", "model": "qwen2.5:3b"}},
+                ensure_ascii=False,
+            )
+        )
+        st = await recv_until(a, lambda m: m["type"] == "agent_status")
+        adv = ((st or {}).get("agents") or {}).get("advisor") or {}
+        check("联机：小助手可接入本地模型", adv.get("ready") is True and adv.get("kind") == "local", str(adv)[:110])
+        check("联机：agent_status 标出 changed=advisor", (st or {}).get("changed") == ["advisor"], str((st or {}).get("changed")))
+
+        # 房主把主机 DM 接到云 API
+        await a.send(
+            json.dumps(
+                {
+                    "type": "configure",
+                    "dm": {"kind": "cloud", "base_url": "https://api.deepseek.com/v1", "model": "deepseek-chat", "api_key": "sk-smoketest"},
+                },
+                ensure_ascii=False,
+            )
+        )
+        st2 = await recv_until(a, lambda m: m["type"] == "agent_status" and "dm" in (m.get("changed") or []))
+        dm = ((st2 or {}).get("agents") or {}).get("dm") or {}
+        check("联机：房主可改主机 DM", dm.get("ready") is True and dm.get("has_api_key") is True, str(dm)[:110])
+        check("联机：回传不含明文 key", "sk-smoketest" not in json.dumps(st2, ensure_ascii=False), str(st2)[:80])
+
+        # 非房主改 DM → 被拒
+        b = await websockets.connect(url, proxy=None)
+        await b.send(json.dumps({"type": "join", "name": "路人", "room": room, "character": {"cls": "法师"}}, ensure_ascii=False))
+        wb = await recv_until(b, lambda m: m["type"] == "welcome")
+        check("联机：第二人不算房主", ((wb or {}).get("agents") or {}).get("owner") == "房主", str(((wb or {}).get("agents") or {}).get("owner")))
+        await b.send(json.dumps({"type": "configure", "dm": {"kind": "cloud", "base_url": "https://x/v1", "model": "m", "api_key": "sk-evil"}}, ensure_ascii=False))
+        err = await recv_until(b, lambda m: m["type"] in ("error", "agent_status"))
+        check("联机：非房主改 DM 被拒", (err or {}).get("type") == "error" and "房主" in (err or {}).get("message", ""), str(err)[:100])
+
+        # 脏字段（非法 kind / 非 http 的 base_url / 白名单外字段）应被静默丢弃
+        await b.send(
+            json.dumps(
+                {"type": "configure", "advisor": {"kind": "hacked", "base_url": "ftp://evil", "model": "m", "drop_table": True}},
+                ensure_ascii=False,
+            )
+        )
+        st3 = await recv_until(b, lambda m: m["type"] == "agent_status")
+        adv3 = ((st3 or {}).get("agents") or {}).get("advisor") or {}
+        check("联机：非法 kind 被忽略（仍为 off）", adv3.get("kind") == "off", str(adv3)[:110])
+        check("联机：非 http 的 base_url 被丢弃", adv3.get("base_url") != "ftp://evil", str(adv3.get("base_url")))
+    finally:
+        for w in (a, b):
+            if w is not None:
+                try:
+                    await w.close()
+                except Exception:
+                    pass
+
+
+async def run_live_model_test():
+    """实时校验 /api/models/test（设置界面「测试连接」按钮的后端）。"""
+    print("== 实时模型探测接口校验（需服务器已启动） ==")
+    try:
+        import httpx
+
+        r = httpx.post(
+            http_base() + "/api/models/test",
+            json={"slot": {"kind": "off"}},
+            timeout=15,
+            trust_env=False,
+        )
+        d = r.json()
+        check("联机：测试接口拒绝空配置", r.status_code == 200 and d.get("ok") is False, str(d)[:120])
+        check("联机：测试接口给出可读错误", "error" in d and bool(d["error"]), str(d)[:120])
+    except Exception as e:
+        print(f"  [SKIP] /api/models/test 不可用：{e}")
+
+
 async def main():
     global PASS, FAIL
+    unit_only = "--unit" in sys.argv
     await run_unit()
     await run_unit_totsk()
-    await run_live()
-    await run_live_version()
-    await run_live_latejoin()
+    await run_unit_agents()
+    if not unit_only:
+        await run_live()
+        await run_live_version()
+        await run_live_latejoin()
+        await run_live_configure()
+        await run_live_model_test()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)
 

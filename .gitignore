@@ -14,6 +14,10 @@ config.json
 .pytest_cache/
 .mypy_cache/
 
+# 前端校验（scripts/ui_check.js）用的 Node 依赖
+node_modules/
+package-lock.json
+
 # 编辑器
 .vscode/
 .idea/

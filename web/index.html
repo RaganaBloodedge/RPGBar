@@ -52,6 +52,8 @@
       <span class="chip">地点 <b id="scene-location">—</b></span>
       <span class="chip" title="RPGBar 版本"><b id="app-version-top">—</b></span>
       <button id="copy-room" class="btn ghost" title="复制房间码">复制房间码</button>
+      <button id="settings-btn" class="btn ghost" title="接入大模型 / 本地模型">⚙ 模型</button>
+      <span id="model-pill" class="chip model-pill" title="当前模型接线状态">模型：脚本化</span>
     </div>
   </header>
 
@@ -82,6 +84,35 @@
     </div>
   </footer>
 </section>
+
+<!-- 模型设置抽屉 -->
+<div id="settings-overlay" class="overlay hidden"></div>
+<aside id="settings-drawer" class="drawer hidden" aria-label="模型设置">
+  <header class="drawer-head">
+    <div>
+      <h2>模型设置</h2>
+      <p class="drawer-sub">接入后可获得真正的 Agent 体验；留空也能玩</p>
+    </div>
+    <button id="settings-close" class="icon-btn" title="关闭">✕</button>
+  </header>
+
+  <div class="drawer-body">
+    <p class="drawer-hint">
+      两个 Agent 都走标准 <b>OpenAI 兼容接口</b>，填 <b>云 API</b> 的 Key，或指向 <b>本地模型</b>
+      （llama.cpp / Ollama / LM Studio）。连接后 DM 会依次调用工具推进剧情，小助手只读场景给建议。
+    </p>
+
+    <div id="slot-dm"></div>
+    <div id="slot-advisor"></div>
+
+    <div id="settings-msg" class="settings-msg hidden"></div>
+  </div>
+
+  <footer class="drawer-foot">
+    <button id="settings-clear" class="btn ghost" title="清空本机保存的设置">清除本机设置</button>
+    <button id="settings-save" class="btn primary">保存并连接</button>
+  </footer>
+</aside>
 
 <script src="app.js"></script>
 </body>

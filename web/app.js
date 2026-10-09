@@ -147,6 +147,8 @@
         you = msg.you;
         roomCode.textContent = msg.room;
         if (msg.script) setScript(msg.script);
+        isOwner = !!(msg.agents && msg.agents.owner === you);
+        applyAgents(msg.agents);
         addEntry(
           "system",
           "",
@@ -154,6 +156,16 @@
             ? "你中途加入了房间 " + msg.room + "（你是 " + you + "），DM 正在为你补上之前的剧情…"
             : "你已加入房间 " + msg.room + "（你是 " + you + "）"
         );
+        pushSavedModels();
+        break;
+      case "agent_status":
+        applyAgents(msg.agents);
+        if (msg.changed && msg.changed.length) {
+          var names = msg.changed.map(function (k) {
+            return k === "dm" ? "主机 DM" : "玩家小助手";
+          });
+          addEntry("system", "", "模型设置已更新：" + names.join("、"));
+        }
         break;
       case "recap":
         renderRecap(msg.recap);
@@ -179,6 +191,18 @@
           chip.onclick = function () { sendAction(opt); };
           suggestionsEl.appendChild(chip);
         });
+        var ag = msg.agent || {};
+        if (ag.source === "scripted") {
+          var tag = document.createElement("span");
+          tag.className = "suggest-src";
+          tag.textContent = "脚本化兜底";
+          suggestionsEl.appendChild(tag);
+        } else if (ag.source) {
+          var tag2 = document.createElement("span");
+          tag2.className = "suggest-src on";
+          tag2.textContent = "小模型" + (ag.tools && ag.tools.length ? " · 用了 " + ag.tools.join("/") : "");
+          suggestionsEl.appendChild(tag2);
+        }
         break;
       case "state":
         renderState(msg.state);
@@ -194,6 +218,389 @@
       ws.send(JSON.stringify(obj));
     }
   }
+
+  /* ==================== 模型设置抽屉 ==================== */
+
+  var SETTINGS_KEY = "rpgbar.models";
+  var PRESETS = {
+    cloud: [
+      { label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
+      { label: "OpenAI", base_url: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+      { label: "智谱 GLM", base_url: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4-flash" },
+      { label: "自定义", base_url: "", model: "" }
+    ],
+    local: [
+      { label: "llama.cpp", base_url: "http://127.0.0.1:8080/v1", model: "local-model" },
+      { label: "Ollama", base_url: "http://127.0.0.1:11434/v1", model: "qwen2.5:7b" },
+      { label: "LM Studio", base_url: "http://127.0.0.1:1234/v1", model: "local-model" }
+    ]
+  };
+  var SLOT_META = {
+    dm: { title: "主机 DM · 大模型", role: "推进剧情、投骰判定、扮演 NPC。由房主配置，全房间共用。" },
+    advisor: { title: "玩家小助手 · 小模型", role: "只读场景，给你 2-4 条行动建议。每位玩家配自己的，可指向本地模型。" }
+  };
+  var slotState = {
+    dm: { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 },
+    advisor: { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 }
+  };
+  var serverAgents = null; // 服务端回传的接线状态（永远不含 api_key）
+  var isOwner = false;
+  var ownerName = "";
+
+  function loadSaved() {
+    try {
+      var raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) return;
+      var obj = JSON.parse(raw);
+      ["dm", "advisor"].forEach(function (k) {
+        if (obj && obj[k]) {
+          var s = obj[k];
+          slotState[k] = {
+            kind: s.kind || "off",
+            base_url: s.base_url || "",
+            model: s.model || "",
+            api_key: s.api_key || "",
+            temperature: typeof s.temperature === "number" ? s.temperature : slotState[k].temperature
+          };
+        }
+      });
+    } catch (e) {}
+  }
+
+  function persistSaved() {
+    try {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+        dm: slotState.dm,
+        advisor: slotState.advisor
+      }));
+    } catch (e) {}
+  }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  // 根据服务端状态 + 本机保存值，构建一个槽位的表单
+  function buildSlotCard(key) {
+    var meta = SLOT_META[key];
+    var s = slotState[key];
+    var card = el("div", "slot");
+    card.id = "card-" + key;
+
+    var head = el("div", "slot-head");
+    head.appendChild(el("span", "slot-title", meta.title));
+    var badge = el("span", "slot-badge");
+    badge.id = "badge-" + key;
+    paintBadge(badge, key);
+    head.appendChild(badge);
+    card.appendChild(head);
+    card.appendChild(el("p", "slot-role", meta.role));
+
+    var locked = key === "dm" && !isOwner;
+    if (locked) {
+      card.classList.add("locked");
+      card.appendChild(el("p", "lock-note",
+        "只有房主（" + (ownerName || "首位加入者") + "）可以修改主机 DM 模型。你可以照常配置自己的小助手。"));
+    }
+
+    // 模式切换
+    var seg = el("div", "seg");
+    [["off", "关闭"], ["cloud", "云 API"], ["local", "本地模型"]].forEach(function (pair) {
+      var b = el("button", s.kind === pair[0] ? "active" : "", pair[1]);
+      b.type = "button";
+      b.disabled = locked;
+      b.onclick = function () { switchKind(key, pair[0]); };
+      seg.appendChild(b);
+    });
+    card.appendChild(seg);
+
+    if (s.kind === "off") {
+      card.appendChild(el("p", "slot-role", "未接入 —— 该 Agent 走脚本化兜底，玩法完整可玩。"));
+      return card;
+    }
+
+    // 预设通道
+    var presets = el("div", "presets");
+    (PRESETS[s.kind] || []).forEach(function (p) {
+      var chip = el("span", "preset", p.label);
+      chip.onclick = function () {
+        if (p.base_url) slotState[key].base_url = p.base_url;
+        if (p.model) slotState[key].model = p.model;
+        renderSlot(key);
+      };
+      presets.appendChild(chip);
+    });
+    card.appendChild(presets);
+
+    card.appendChild(field(key, "base_url", "接口地址 Base URL", "https://api.deepseek.com/v1", locked, "text"));
+    if (s.kind === "cloud") {
+      card.appendChild(field(key, "api_key", "API Key", "sk-…（仅保存在本机浏览器）", locked, "password"));
+    }
+    card.appendChild(field(key, "model", "模型名", s.kind === "cloud" ? "deepseek-chat" : "local-model", locked, "text"));
+
+    var actions = el("div", "slot-actions");
+    var testBtn = el("button", "btn ghost", "测试连接");
+    testBtn.type = "button";
+    testBtn.onclick = function () { testSlot(key, testBtn); };
+    actions.appendChild(testBtn);
+    var result = el("span", "slot-result");
+    result.id = "result-" + key;
+    actions.appendChild(result);
+    card.appendChild(actions);
+
+    return card;
+  }
+
+  // 切换通道模式：若当前地址是「另一种通道的默认值」，则换成新通道的默认值
+  function switchKind(key, kind) {
+    var s = slotState[key];
+    s.kind = kind;
+    if (kind !== "off") {
+      var others = [];
+      ["cloud", "local"].forEach(function (k2) {
+        if (k2 !== kind) {
+          PRESETS[k2].forEach(function (p) { if (p.base_url) others.push(p.base_url); });
+        }
+      });
+      var cur = (s.base_url || "").trim();
+      if (!cur || others.indexOf(cur) >= 0) {
+        s.base_url = PRESETS[kind][0].base_url;
+        s.model = PRESETS[kind][0].model;
+      }
+    }
+    renderSlot(key);
+  }
+
+  function field(key, prop, label, ph, disabled, type) {
+    var wrap = el("div", "field");
+    wrap.appendChild(el("label", "", label));
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = ph || "";
+    input.value = slotState[key][prop] || "";
+    input.disabled = !!disabled;
+    input.autocomplete = "off";
+    input.oninput = function () { slotState[key][prop] = input.value; };
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function renderSlot(key) {
+    var host = document.getElementById("slot-" + key);
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(buildSlotCard(key));
+  }
+
+  function renderSlots() {
+    renderSlot("dm");
+    renderSlot("advisor");
+  }
+
+  function badgeInfo(key) {
+    var info = serverAgents && serverAgents[key];
+    if (info && info.ready) {
+      return { on: true, text: "已连接" + (info.model ? " · " + info.model : "") };
+    }
+    if (slotState[key].kind === "off") return { on: false, text: "未接入（脚本化）" };
+    return { on: false, text: "待保存" };
+  }
+
+  function paintBadge(badgeEl, key) {
+    if (!badgeEl) return;
+    var b = badgeInfo(key);
+    badgeEl.className = "slot-badge" + (b.on ? " on" : "");
+    badgeEl.textContent = b.text;
+  }
+
+  function refreshBadge(key) {
+    paintBadge(document.getElementById("badge-" + key), key);
+  }
+
+  function updateModelPill() {
+    var pill = document.getElementById("model-pill");
+    if (!pill) return;
+    var dmOn = serverAgents && serverAgents.dm && serverAgents.dm.ready;
+    var advOn = serverAgents && serverAgents.advisor && serverAgents.advisor.ready;
+    if (dmOn && advOn) pill.textContent = "模型：DM + 助手";
+    else if (dmOn) pill.textContent = "模型：仅 DM";
+    else if (advOn) pill.textContent = "模型：仅助手";
+    else pill.textContent = "模型：脚本化";
+    pill.className = "chip model-pill" + (dmOn ? " on" : "");
+  }
+
+  function applyAgents(agents) {
+    if (!agents) return;
+    var wasOwner = isOwner;
+    serverAgents = agents;
+    if (typeof agents.owner === "string") ownerName = agents.owner;
+    isOwner = typeof agents.owner === "string" && agents.owner === you;
+    ["dm", "advisor"].forEach(function (k) {
+      var info = agents[k];
+      if (info && info.base_url && !slotState[k].base_url) slotState[k].base_url = info.base_url;
+      if (info && info.model && !slotState[k].model) slotState[k].model = info.model;
+    });
+    refreshBadge("dm");
+    refreshBadge("advisor");
+    updateModelPill();
+    // 房主身份变化（例如服务端换人/重连）时，DM 卡片的可编辑性跟着变
+    if (wasOwner !== isOwner) rerenderSlotsIfOpen();
+  }
+
+  function rerenderSlotsIfOpen() {
+    var drawer = document.getElementById("settings-drawer");
+    if (drawer && !drawer.classList.contains("hidden")) renderSlots();
+  }
+
+  function slotPayload(key) {
+    var s = slotState[key];
+    var p = { kind: s.kind, temperature: s.temperature };
+    if (s.kind !== "off") {
+      p.base_url = (s.base_url || "").trim();
+      p.model = (s.model || "").trim();
+    }
+    // 云 API 才带 key；传空串表示清除（本地模型不需要）
+    if (s.kind === "cloud") p.api_key = s.api_key || "";
+    else if (s.kind === "off") p.api_key = "";
+    return p;
+  }
+
+  function sendConfigure() {
+    var payload = { type: "configure" };
+    if (isOwner) payload.dm = slotPayload("dm"); // 主机 DM 仅房主可改
+    payload.advisor = slotPayload("advisor");
+    send(payload);
+  }
+
+  function saveSettings() {
+    persistSaved();
+    sendConfigure();
+  }
+
+  // 加入房间后，把本机已保存的模型设置自动推给服务端（DM 仅房主可推）
+  function pushSavedModels() {
+    loadSaved();
+    var payload = { type: "configure" };
+    var has = false;
+    if (isOwner && slotState.dm.kind !== "off") {
+      payload.dm = slotPayload("dm");
+      has = true;
+    }
+    if (slotState.advisor.kind !== "off") {
+      payload.advisor = slotPayload("advisor");
+      has = true;
+    }
+    if (has) send(payload);
+  }
+
+  function testSlot(key, btn) {
+    var s = slotState[key];
+    var out = document.getElementById("result-" + key);
+    if (!out) return;
+    if (s.kind === "off") {
+      out.className = "slot-result";
+      out.textContent = "当前为「关闭」，无需测试。";
+      return;
+    }
+    var payload = slotPayload(key);
+    if (s.kind === "cloud" && !payload.api_key) {
+      out.className = "slot-result err";
+      out.textContent = "云 API 需要填写 API Key。";
+      return;
+    }
+    btn.disabled = true;
+    var old = btn.textContent;
+    btn.textContent = "测试中…";
+    out.className = "slot-result";
+    out.textContent = "正在连接 " + payload.base_url + " …";
+    fetch("/api/models/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot: payload, probe_tools: true })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) {
+          out.className = "slot-result ok";
+          var extra = "";
+          if (d.tool_calling === true) extra = " · 支持工具调用（走标准 Agent 循环）";
+          else if (d.tool_calling === false) extra = " · 不支持工具调用（自动降级为单轮 JSON）";
+          out.textContent = "连接成功（" + d.elapsed_ms + "ms）：" + (d.reply || "就绪") + extra;
+        } else {
+          out.className = "slot-result err";
+          out.textContent = "失败：" + (d.error || "未知错误");
+        }
+      })
+      .catch(function (e) {
+        out.className = "slot-result err";
+        out.textContent = "请求失败：" + e;
+      })
+      .then(function () {
+        btn.disabled = false;
+        btn.textContent = old;
+      });
+  }
+
+  function openSettings() {
+    var drawer = document.getElementById("settings-drawer");
+    var overlay = document.getElementById("settings-overlay");
+    if (!drawer) return;
+    loadSaved();
+    renderSlots();
+    hideMsg();
+    overlay.classList.remove("hidden");
+    drawer.classList.remove("hidden");
+  }
+
+  function closeSettings() {
+    var drawer = document.getElementById("settings-drawer");
+    var overlay = document.getElementById("settings-overlay");
+    if (drawer) drawer.classList.add("hidden");
+    if (overlay) overlay.classList.add("hidden");
+  }
+
+  function showMsg(text, cls) {
+    var box = document.getElementById("settings-msg");
+    if (!box) return;
+    box.className = "settings-msg" + (cls ? " " + cls : "");
+    box.textContent = text;
+    box.classList.remove("hidden");
+  }
+
+  function hideMsg() {
+    var box = document.getElementById("settings-msg");
+    if (box) box.classList.add("hidden");
+  }
+
+  (function initSettings() {
+    var openBtn = document.getElementById("settings-btn");
+    var closeBtn = document.getElementById("settings-close");
+    var overlay = document.getElementById("settings-overlay");
+    var saveBtn = document.getElementById("settings-save");
+    var clearBtn = document.getElementById("settings-clear");
+    if (openBtn) openBtn.onclick = openSettings;
+    if (closeBtn) closeBtn.onclick = closeSettings;
+    if (overlay) overlay.onclick = closeSettings;
+    if (saveBtn) saveBtn.onclick = function () {
+      saveSettings();
+      showMsg("已提交，正在重建 Agent…", "");
+      setTimeout(function () {
+        showMsg("已保存到本机浏览器，并推送到当前房间。", "ok");
+      }, 400);
+    };
+    if (clearBtn) clearBtn.onclick = function () {
+      try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
+      slotState.dm = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 };
+      slotState.advisor = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 };
+      sendConfigure(); // 通知服务端回到脚本化，但不再写回本机
+      renderSlots();
+      showMsg("已清除本机设置，两个 Agent 回到脚本化兜底。", "ok");
+    };
+    loadSaved();
+  })();
 
   function sendAction(text) {
     text = (text || "").trim();

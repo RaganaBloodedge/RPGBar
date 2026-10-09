@@ -114,6 +114,11 @@ form input:focus, form select:focus { border-color: var(--accent); }
   transition: background .15s;
 }
 .suggestion:hover { background: var(--panel-2); }
+.suggest-src {
+  font-size: 11px; color: var(--text-dim); align-self: center;
+  padding: 4px 10px; border-radius: 14px; border: 1px dashed var(--border);
+}
+.suggest-src.on { color: var(--green); border-color: var(--green); border-style: solid; }
 .composer-row { display: flex; gap: 10px; }
 #action-input {
   flex: 1; padding: 12px 14px; font-size: 15px;
@@ -131,3 +136,93 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .btn.primary { background: var(--accent); color: #1a1208; font-weight: 600; }
 .btn.ghost { background: var(--panel); color: var(--text-dim); border: 1px solid var(--border); }
 .btn.dice-btn { width: 100%; background: var(--panel-2); color: var(--gold-soft); border: 1px solid var(--accent); }
+
+/* ---- 模型设置抽屉 ---- */
+.model-pill { cursor: default; }
+.model-pill.on { color: var(--green); border-color: var(--green); }
+.model-pill.on b { color: var(--green); }
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.5);
+  z-index: 40; backdrop-filter: blur(2px);
+}
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 440px; max-width: 92vw;
+  background: var(--panel); border-left: 1px solid var(--border);
+  z-index: 50; display: flex; flex-direction: column;
+  box-shadow: -20px 0 60px rgba(0,0,0,.5);
+}
+.drawer-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  padding: 18px 20px; border-bottom: 1px solid var(--border);
+}
+.drawer-head h2 { font-size: 17px; color: var(--gold-soft); font-weight: 600; }
+.drawer-sub { font-size: 12px; color: var(--text-dim); margin-top: 3px; }
+.icon-btn {
+  background: transparent; border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 8px; width: 30px; height: 30px; cursor: pointer; font-size: 14px;
+}
+.icon-btn:hover { color: var(--text); border-color: var(--accent); }
+.drawer-body { flex: 1; overflow-y: auto; padding: 18px 20px; }
+.drawer-hint { font-size: 12px; color: var(--text-dim); line-height: 1.7; margin-bottom: 18px; }
+.drawer-hint b { color: var(--gold-soft); font-weight: 600; }
+.drawer-foot {
+  padding: 14px 20px; border-top: 1px solid var(--border);
+  display: flex; gap: 10px; justify-content: space-between;
+}
+
+.slot {
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 16px; margin-bottom: 16px;
+}
+.slot-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.slot-title { font-size: 14px; font-weight: 600; color: var(--text); }
+.slot-badge {
+  font-size: 11px; padding: 3px 9px; border-radius: 20px;
+  background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border);
+}
+.slot-badge.on { color: var(--green); border-color: var(--green); }
+.slot-role { font-size: 11px; color: var(--text-dim); margin-bottom: 12px; line-height: 1.6; }
+.slot.locked { opacity: .6; }
+.slot .lock-note {
+  font-size: 11px; color: var(--red); margin-bottom: 10px; line-height: 1.6;
+}
+
+.seg { display: flex; gap: 0; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.seg button {
+  flex: 1; background: var(--bg); color: var(--text-dim); border: none;
+  padding: 8px 4px; font-size: 12px; cursor: pointer; border-right: 1px solid var(--border);
+}
+.seg button:last-child { border-right: none; }
+.seg button.active { background: var(--accent); color: #1a1208; font-weight: 600; }
+.seg button:disabled { cursor: not-allowed; }
+
+.presets { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.preset {
+  font-size: 11px; color: var(--gold-soft); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 14px; padding: 4px 10px; cursor: pointer;
+}
+.preset:hover { border-color: var(--accent); }
+
+.field { margin-bottom: 10px; }
+.field label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+.field input {
+  width: 100%; padding: 9px 10px; font-size: 13px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 7px; outline: none;
+}
+.field input:focus { border-color: var(--accent); }
+.field input:disabled { opacity: .55; }
+
+.slot-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+.slot-actions .btn { padding: 8px 14px; font-size: 12px; }
+.slot-result { font-size: 11px; color: var(--text-dim); line-height: 1.5; flex: 1; }
+.slot-result.ok { color: var(--green); }
+.slot-result.err { color: var(--red); }
+
+.settings-msg {
+  font-size: 12px; line-height: 1.6; padding: 10px 12px; border-radius: 8px;
+  background: var(--bg-2); border: 1px solid var(--border); color: var(--text-dim);
+}
+.settings-msg.ok { color: var(--green); border-color: var(--green); }
+.settings-msg.err { color: var(--red); border-color: var(--red); }

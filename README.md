@@ -89,13 +89,21 @@ export RPGBAR_LLM_API_KEY="none"
 
 `scripts/sample_script.json`：《古堡秘宝》，5 个场景、2 个 NPC、多个检定与 flag 分支（说服看守 → 发现暗门 → 找钥匙/破门 → 取圣杯 → 决战守护者）。
 
-## 发布到玩家 PC（规划）
+## 打包发布（发给朋友）
 
-当前运行需要 Python 环境。正式发布时：
+用 PyInstaller 把服务器打成 exe，玩家双击即跑、无需装 Python：
 
-1. 用 **PyInstaller** 把服务器打包成单个 `.exe`，玩家双击即跑，无需安装 Python。
-2. DM 下沉到玩家本地模型（llama.cpp），算力全在玩家自己机器。
-3. Unity 客户端（下载安装），连接「主机玩家」的服务器。
+```bash
+pip install pyinstaller
+pyinstaller --name RPGBarServer --onedir --noconfirm --clean \
+  --add-data "web;web" --add-data "scripts;scripts" \
+  --add-data "config.example.json;." \
+  --collect-all jieba \
+  --exclude-module uvloop --exclude-module watchfiles \
+  run_server.py
+```
+
+产物在 `dist/RPGBarServer/`，压缩成 zip 发送即可。朋友解压双击 `RPGBarServer.exe`，按包内 `使用指南.txt` 操作。详见 [docs/说明书.md](docs/说明书.md) 第十节。
 
 ## 后续路线
 

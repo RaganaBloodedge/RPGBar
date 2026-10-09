@@ -24,7 +24,7 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from .config import BASE_DIR, load_config
+from .config import RESOURCE_DIR, load_config
 from .dice import roll
 from .dm import DM
 from .llm import build_provider
@@ -32,7 +32,7 @@ from .rag import ScriptStore
 from .state_machine import GameState
 
 cfg = load_config()
-store = ScriptStore(BASE_DIR / "scripts" / "sample_script.json")
+store = ScriptStore(RESOURCE_DIR / "scripts" / "sample_script.json")
 provider = build_provider(cfg)
 
 if provider is None:
@@ -139,7 +139,7 @@ async def ws_endpoint(ws: WebSocket):
                 rooms.pop(room.code, None)
 
 
-WEB_DIR = BASE_DIR / "web"
+WEB_DIR = RESOURCE_DIR / "web"
 if WEB_DIR.exists():
     app.mount("/", StaticFiles(directory=str(WEB_DIR), html=True), name="web")
 
@@ -172,7 +172,7 @@ def main():
         lan = _lan_ip()
         if lan:
             print(f"[RPGBar] 局域网访问（发给朋友）: http://{lan}:{port}")
-    uvicorn.run("server.main:app", host=host, port=port, reload=False)
+    uvicorn.run(app, host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

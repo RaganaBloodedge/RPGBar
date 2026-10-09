@@ -1,11 +1,37 @@
-"""配置加载：config.example.json 默认值 + config.json 本地覆盖 + 环境变量。"""
+"""配置加载：config.example.json 默认值 + config.json 本地覆盖 + 环境变量。
+
+路径约定：
+- RESOURCE_DIR：只读资源（web/、scripts/、config.example.json）。
+  源码运行 = 项目根；打包运行 = PyInstaller 解包目录（sys._MEIPASS）。
+- USER_DIR：可写配置（config.json）所在目录。
+  源码运行 = 项目根；打包运行 = exe 所在目录（用户可编辑）。
+"""
 import json
 import os
+import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-CONFIG_PATH = BASE_DIR / "config.json"
-EXAMPLE_PATH = BASE_DIR / "config.example.json"
+
+def _is_frozen() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def resource_dir() -> Path:
+    if _is_frozen():
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent.parent
+
+
+def user_dir() -> Path:
+    if _is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+RESOURCE_DIR = resource_dir()
+USER_DIR = user_dir()
+CONFIG_PATH = USER_DIR / "config.json"
+EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 
 DEFAULTS = {
     "llm": {

@@ -27,3 +27,9 @@ Thumbs.db
 
 # 部署标记文件
 *.genie
+
+# 打包产物
+build/
+dist/
+*.spec
+*.zip

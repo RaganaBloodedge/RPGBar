@@ -18,10 +18,18 @@
     {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
     {"type":"state","state":{...}}   # state.flag_details = [{"id":..,"label":..}]
     {"type":"error","message":"..."}
+
+HTTP 接口：
+    GET  /api/version          版本 / 当前剧本 / 两个 Agent 的接线状态
+    POST /api/models/test      探测一个模型槽位（含工具调用能力）
+    GET  /api/scripts          列出可用的剧本文件
+    POST /api/scripts/inspect  读取某个剧本 → 自动切片 → 返回次级 prompt（只看不改）
+    POST /api/scripts/load     读取并切换「活动剧本」（新开的房间用它）
 """
 import asyncio
 import json
 import os
+import re
 import secrets
 import string
 import time
@@ -32,7 +40,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .agents import AdvisorAgent, AdvisorContext, NarratorAgent, NarratorContext, describe_agents
-from .config import RESOURCE_DIR, load_config
+from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
 from .dm import DM
 from .llm import ToolCallingUnsupported, build_provider
@@ -53,11 +61,95 @@ def _resolve_script(rel: str) -> Path:
     return fallback
 
 
-store = ScriptStore(_resolve_script(cfg.get("script") or "scripts/sample_script.json"))
+def script_dirs() -> list:
+    """可读剧本的目录：只读资源目录 + 可写用户目录（打包后 exe 旁边）。"""
+    out, seen = [], set()
+    for d in (RESOURCE_DIR / "scripts", USER_DIR / "scripts"):
+        key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+SCRIPT_SUFFIX = (".json", ".md", ".txt", ".markdown")
+
+
+def _rel_of(path: Path) -> str:
+    """把绝对路径表示成「相对资源目录」或「相对用户目录」的短形式。"""
+    for d in script_dirs():
+        try:
+            return path.relative_to(d).as_posix()
+        except ValueError:
+            continue
+    return str(path)
+
+
+def _safe_script_path(rel: str):
+    """只允许读取 scripts/ 目录内的文件。
+
+    服务端默认绑 0.0.0.0（同局域网的玩家都能访问），因此**不能**支持任意绝对路径，
+    否则等于给同网段的人开了个任意文件读取接口。想换剧本就把文件放进 scripts/ 目录。
+    """
+    if not isinstance(rel, str) or not rel.strip() or rel != rel.strip():
+        return None
+    parts = re.split(r"[\\/]+", rel)
+    if any(p in ("..", "", ".") for p in parts):
+        return None
+    for d in script_dirs():
+        p = (d / rel).resolve()
+        try:
+            p.relative_to(d.resolve())
+        except ValueError:
+            continue
+        if p.is_file() and p.suffix.lower() in SCRIPT_SUFFIX:
+            return p
+    return None
+
+
+def _script_entry(path: Path) -> dict:
+    """列出一个剧本文件的概要（顺便把它读一遍做自检）。"""
+    rel = _rel_of(path)
+    try:
+        store = ScriptStore(path)
+    except Exception as e:  # noqa: BLE001
+        return {"path": rel, "file": path.name, "title": path.stem, "error": f"{type(e).__name__}: {e}"}
+    return {
+        "path": rel,
+        "file": path.name,
+        "title": store.title,
+        "fmt": store.fmt,
+        "structured": store.doc.structured,
+        "scenes": len(store.scenes),
+        "flags": len(store.flag_ids),
+        "chunks": len(store.chunk_list),
+        "warnings": store.warnings,
+    }
+
+
+def list_scripts() -> list:
+    seen, items = set(), []
+    for d in script_dirs():
+        if not d.exists():
+            continue
+        for p in sorted(d.iterdir()):
+            if p.is_file() and p.suffix.lower() in SCRIPT_SUFFIX and p.name not in seen:
+                seen.add(p.name)
+                items.append(_script_entry(p))
+    return items
+
+
+# ---- 活动剧本（room 创建时取用；切换只影响新开的房间）----
+active = {"path": _resolve_script(cfg.get("script") or "scripts/sample_script.json")}
+active["rel"] = _rel_of(active["path"])
+store = ScriptStore(active["path"], label=active["rel"])
+
 default_dm_slot = dict(cfg["models"]["dm"])
 default_advisor_slot = dict(cfg["models"]["advisor"])
 
-print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag）")
+print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag / {len(store.chunk_list)} 个切片）")
+for w in store.warnings:
+    print(f"[RPGBar] 剧本提示：{w}")
 _agents = describe_agents(default_dm_slot, default_advisor_slot)
 for key in ("dm", "advisor"):
     a = _agents[key]
@@ -107,9 +199,11 @@ def merge_slot(slot: dict, patch: dict) -> dict:
 
 
 class Room:
-    def __init__(self, code):
+    def __init__(self, code, script_store=None):
         self.code = code
-        self.state = GameState(store, store.start_scene)
+        # 房间在创建时「钉住」当时的活动剧本：之后服务端换剧本，进行中的对局不受影响。
+        self.store = script_store or store
+        self.state = GameState(self.store, self.store.start_scene)
         self.clients = []  # list[(name, websocket)]
         self.lock = asyncio.Lock()
         self.owner = None  # 房主（第一个加入的人）才能改 DM 模型
@@ -120,14 +214,14 @@ class Room:
     # ---- Agent 生命周期 ----
     def narrator(self) -> NarratorAgent:
         if self._narrator is None:
-            self._narrator = NarratorAgent(store, build_provider(self.dm_slot))
+            self._narrator = NarratorAgent(self.store, build_provider(self.dm_slot))
         return self._narrator
 
     def advisor(self, name) -> AdvisorAgent:
         info = self.advisors.get(name)
         if info is None or info.get("agent") is None:
             slot = info["slot"] if info else dict(default_advisor_slot)
-            info = {"slot": slot, "agent": AdvisorAgent(store, build_provider(slot))}
+            info = {"slot": slot, "agent": AdvisorAgent(self.store, build_provider(slot))}
             self.advisors[name] = info
         return info["agent"]
 
@@ -173,7 +267,7 @@ class Room:
                     "room": self.code,
                     "you": name,
                     "late": late,
-                    "script": store.title,
+                    "script": self.store.title,
                     "agents": self.agents_status(name),
                 },
             )
@@ -184,7 +278,7 @@ class Room:
                 )
             else:
                 await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
-                intro = await DM(store, self.narrator().provider).introduce(self.state, name, character)
+                intro = await DM(self.store, self.narrator().provider).introduce(self.state, name, character)
                 await self.broadcast({"type": "narration", "author": "DM", "text": intro})
                 # 只发给新玩家：结构化「故事回顾」
                 await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
@@ -270,6 +364,15 @@ async def api_version():
         "name": "RPGBar",
         "version": __version__,
         "script": store.title,
+        "script_path": active["rel"],
+        "script_info": {
+            "fmt": store.fmt,
+            "structured": store.doc.structured,
+            "scenes": len(store.scenes),
+            "flags": len(store.flag_ids),
+            "chunks": len(store.chunk_list),
+            "warnings": store.warnings,
+        },
         "agents": describe_agents(default_dm_slot, default_advisor_slot),
     }
 
@@ -326,6 +429,84 @@ async def api_models_test(payload: dict = Body(...)):
     return out
 
 
+@app.get("/api/scripts")
+async def api_scripts():
+    """列出可用的剧本文件（scripts/ 目录下的 .json/.md/.txt）。"""
+    return {
+        "active": active["rel"],
+        "active_title": store.title,
+        "dirs": [str(d) for d in script_dirs()],
+        "scripts": list_scripts(),
+    }
+
+
+def _read_payload(payload: dict):
+    """把 inspect / load 的请求体变成 (ScriptStore, 显示名, 落盘路径或 None)。
+
+    两种用法：
+    - {"path": "totsk_l1.json"}          读 scripts/ 目录里的文件（仅限该目录，防任意文件读取）
+    - {"content": "...", "name": "x.md"} 直接给内容（界面里粘贴/上传）
+    """
+    rel = payload.get("path")
+    if isinstance(rel, str) and rel.strip():
+        p = _safe_script_path(rel)
+        if p is None:
+            return None, f"找不到剧本文件「{rel}」（只允许 scripts/ 目录下的 .json/.md/.txt）", None
+        try:
+            return ScriptStore(p, label=_rel_of(p)), _rel_of(p), p
+        except Exception as e:  # noqa: BLE001
+            return None, f"读取失败：{type(e).__name__}: {e}", None
+
+    content = payload.get("content")
+    if isinstance(content, str) and content.strip():
+        name = str(payload.get("name") or "粘贴的剧本").strip()
+        try:
+            return ScriptStore.from_content(content, name), name, None
+        except Exception as e:  # noqa: BLE001
+            return None, f"解析失败：{type(e).__name__}: {e}", None
+    return None, "需要提供 path（scripts/ 目录下的文件）或 content（剧本内容）", None
+
+
+@app.post("/api/scripts/inspect")
+async def api_scripts_inspect(payload: dict = Body(...)):
+    """读取剧本 → 自动切片 → 生成次级 prompt。**不改动**当前对局。"""
+    new_store, label, _ = _read_payload(payload)
+    if new_store is None:
+        return {"ok": False, "error": label}
+    info = new_store.inspect()
+    info["ok"] = True
+    info["label"] = label
+    info["active"] = False
+    return info
+
+
+@app.post("/api/scripts/load")
+async def api_scripts_load(payload: dict = Body(...)):
+    """读取剧本 → 切片 → 切换为「活动剧本」。
+
+    只影响**新开的房间**：已经在玩的房间在创建时就钉住了自己的副本，不会被中途换剧本。
+    """
+    global store
+    new_store, label, path = _read_payload(payload)
+    if new_store is None:
+        return {"ok": False, "error": label}
+    if new_store.doc.structured and not new_store.scenes:
+        return {"ok": False, "error": "剧本没有任何场景，无法开局"}
+    store = new_store
+    active["path"] = path or Path(label)
+    active["rel"] = label
+    note = "新开的房间将使用该剧本"
+    if rooms:
+        note += f"；当前有 {len(rooms)} 个房间仍在使用它们各自的旧剧本"
+    return {
+        "ok": True,
+        "label": label,
+        "note": note,
+        **{k: v for k, v in new_store.inspect().items() if k not in ("chunks",)},
+        "chunks": [c.to_dict() for c in new_store.chunk_list],
+    }
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -341,7 +522,7 @@ async def ws_endpoint(ws: WebSocket):
         code = (first.get("room") or "").strip().upper()
         if not code:
             code = gen_code()
-        room = rooms.setdefault(code, Room(code))
+        room = rooms.setdefault(code, Room(code, store))
         await room.on_join(name, character, ws)
 
         while True:

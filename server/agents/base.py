@@ -1,13 +1,19 @@
 """标准 Agent 骨架：工具注册 + 工具调用循环 + 降级路径。
 
-一个 Agent = 系统提示词 + 一组工具 + 循环。循环是标准写法：
+一个 Agent = 提示词 + 一组工具 + 循环。循环是标准写法：
 
-    组装 messages（system + 上下文）
+    组装 messages（System 职责 + 次级 prompt（剧本）+ 本轮上下文）
     ┌─→ 调模型（带 tools 声明）
     │    ├─ 模型返回 tool_calls → 逐个执行 → 结果作为 role="tool" 回灌 ─┐
     │    └─ 模型返回终稿（或调用 finish 工具）→ 结束                     │
     └────────────────────────────────────────────────────────────────┘
     步数用尽 → 明确要求模型收敛为最终结果
+
+提示词分两层，职责与内容解耦：
+
+- **System prompt**（`system_prompt()`）：定义 Agent 自己的职责与边界，稳定不变。
+- **次级 prompt**（`secondary_prompt()`）：排在 System prompt 之后的第二条 system 消息，
+  由 `script_loader` 从剧本文件自动切片生成——换剧本只换这一层，Agent 人格与护栏不动。
 
 两条降级路径（保证"没接模型也能玩"）：
 
@@ -96,7 +102,13 @@ _JSON_HINT = {
 
 
 class Agent:
-    """Agent 基类。子类实现 system_prompt() / build_tools() / build_user_message()。"""
+    """Agent 基类。子类实现 system_prompt() / build_tools() / build_user_message()。
+
+    提示词分两层：
+    - `system_prompt()`：**职责**。我是谁、我能做什么、我的边界。稳定不变。
+    - `secondary_prompt()`：**内容**。剧本世界观/语气/切片索引，随剧本切换而变，
+      作为第二条 system 消息排在职责之后（优先级次于 System prompt，高于对话）。
+    """
 
     name = "agent"
     max_steps = 6
@@ -109,11 +121,24 @@ class Agent:
     def system_prompt(self, ctx) -> str:
         raise NotImplementedError
 
+    def secondary_prompt(self, ctx) -> str:
+        """次级 prompt（剧本相关内容）。默认空。"""
+        return ""
+
     def build_tools(self, ctx) -> list:
         raise NotImplementedError
 
     def build_user_message(self, ctx, user_input: str) -> str:
         raise NotImplementedError
+
+    def init_messages(self, ctx, user_input: str) -> list:
+        """组装起始消息：System（职责）→ System（次级 prompt）→ User（本轮上下文）。"""
+        messages = [{"role": "system", "content": self.system_prompt(ctx)}]
+        secondary = (self.secondary_prompt(ctx) or "").strip()
+        if secondary:
+            messages.append({"role": "system", "content": secondary})
+        messages.append({"role": "user", "content": self.build_user_message(ctx, user_input)})
+        return messages
 
     def fallback_text(self, ctx, user_input: str) -> str:
         """无 provider 时的确定性输出。"""
@@ -138,10 +163,7 @@ class Agent:
             )
 
         by_name = {t.name: t for t in tools}
-        messages = [
-            {"role": "system", "content": self.system_prompt(ctx)},
-            {"role": "user", "content": self.build_user_message(ctx, user_input)},
-        ]
+        messages = self.init_messages(ctx, user_input)
         schemas = [t.schema() for t in tools]
         steps: list[Step] = []
         no_tools = False

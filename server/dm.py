@@ -173,30 +173,30 @@ class DM:
             return self._scripted_narration(state.current(), action)
 
     def _build_messages(self, state, context, action):
+        """确定性流水线里的自由发挥：同样是「System 职责 + 次级 prompt（剧本）」两层。"""
         cur = state.current()
         legal_exits = "；".join(f"{e['to']}({e['label']})" for e in cur.get("exits", []))
         sys_msg = (
-            "你是一场中文文字跑团的 DM。\n"
-            + self.store.system
-            + "\n【硬性规则】\n"
-            "1. 严格遵循剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
-            "2. 给出 2-4 句简短旁白推进剧情，不要替玩家做决定。\n"
-            "3. 若玩家行动对应某个出口，用 move_to 推进；只能推进到下面列出的出口。\n"
-            f"   当前可用出口：{legal_exits or '无'}\n"
-            "4. 骰子由系统投掷，你不得编造骰子结果。\n"
-            "5. 只输出 JSON：{\"narration\":\"旁白\",\"move_to\":\"场景id或null\",\"set_flags\":[\"flag或空数组\"]}。\n"
-            f"   已知 flag：{sorted(self._flag_whitelist())}\n"
+            "你是一场中文文字跑团的主持人（DM）。\n"
+            "你的职责：依据剧本为玩家行动给出 2-4 句简短旁白，命中检定就投骰、命中出口就推进场景，"
+            "其余自由发挥；扮演剧本里的 NPC，但不替玩家做决定。\n"
+            "严格遵循剧本，不得编造剧本之外的走向、NPC、物品或地点；骰子由系统投掷，你不得编造骰子结果。\n"
+            '只输出 JSON：{"narration":"旁白","move_to":"场景id或null","set_flags":["flag或空数组"]}。\n'
         )
+        secondary = getattr(self.store, "script_prompt", "") or self.store.system
         state_info = (
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
+            f"当前可用出口：{legal_exits or '无'}\n"
+            f"已知 flag 全集：{sorted(self._flag_whitelist())}\n"
         )
         players = "；".join(f"{p.name}({p.character.get('cls', '')})" for p in state.players.values())
         user_msg = f"{context}\n\n{state_info}在场玩家：{players}\n玩家行动：{action}"
-        return [
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": user_msg},
-        ]
+        messages = [{"role": "system", "content": sys_msg}]
+        if secondary and secondary.strip():
+            messages.append({"role": "system", "content": secondary})
+        messages.append({"role": "user", "content": user_msg})
+        return messages
 
     def _apply_proposal(self, state, obj):
         move_to = obj.get("move_to")
@@ -230,16 +230,12 @@ class DM:
         try:
             scene = state.current()
             sys_msg = (
-                "你是一场中文文字跑团的 DM。\n"
-                + self.store.system
-                + "\n【任务】有一位新玩家中途加入了本局，请用 2-4 句旁白完成两件事：\n"
+                "你是一场中文文字跑团的主持人（DM）。有一位新玩家中途加入了本局，"
+                "请用 2-4 句旁白完成两件事：\n"
                 "1. 自然地让他/她登场（说明他/她如何出现在当前场景），不要打断剧情节奏；\n"
                 "2. 顺带简要复述此前的关键进展，让新玩家跟得上，语气当作对着所有人讲述。\n"
-                "【硬性规则】\n"
-                "- 不得剧透只有 DM 知道的内幕；\n"
-                "- 不得编造剧本之外的走向、NPC、物品或地点；\n"
-                "- 不要替任何玩家做决定；\n"
-                "- 只输出 JSON：{\"narration\":\"旁白\"}。\n"
+                "不得剧透只有 DM 知道的内幕；不得编造剧本之外的走向、NPC、物品或地点；"
+                "不要替任何玩家做决定；只输出 JSON：{\"narration\":\"旁白\"}。\n"
             )
             user_msg = (
                 f"当前场景：{state.current_scene} {scene.get('title', '')}（{scene.get('location', '')}）\n"
@@ -249,10 +245,12 @@ class DM:
                 f"最近发生的事：\n{state.recent_history_text(8) or '（尚无）'}\n"
                 f"新加入的玩家：{name}（{character.get('cls', '冒险者')}）"
             )
-            raw = await self.provider.chat(
-                [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-                json_mode=True,
-            )
+            messages = [{"role": "system", "content": sys_msg}]
+            secondary = getattr(self.store, "script_prompt", "") or self.store.system
+            if secondary and secondary.strip():
+                messages.append({"role": "system", "content": secondary})
+            messages.append({"role": "user", "content": user_msg})
+            raw = await self.provider.chat(messages, json_mode=True)
             text = (_parse_json(raw).get("narration") or "").strip()
             return text or self._scripted_intro(state, name, character, recap)
         except Exception:
@@ -280,14 +278,17 @@ class DM:
             return opts[:4]
         try:
             sys_msg = (
-                "你是玩家的跑团小助手。根据当前场景，给出 3 个简短、具体、可执行的行动建议。"
+                "你是玩家的跑团小助手（不是主持人）。根据当前场景，给出 3 个简短、具体、可执行的行动建议。"
+                "你只能读不能改剧情，只能建议剧本中真实存在的行动。"
                 "只输出 JSON：{\"options\":[\"...\",\"...\",\"...\"]}，每条不超过 15 字。"
             )
             user_msg = self.store.build_context(state.current_scene, "")
-            raw = await self.provider.chat(
-                [{"role": "system", "content": sys_msg}, {"role": "user", "content": user_msg}],
-                json_mode=True,
-            )
+            messages = [{"role": "system", "content": sys_msg}]
+            secondary = getattr(self.store, "script_prompt_public", "") or ""
+            if secondary.strip():
+                messages.append({"role": "system", "content": secondary})
+            messages.append({"role": "user", "content": user_msg})
+            raw = await self.provider.chat(messages, json_mode=True)
             obj = _parse_json(raw)
             return (obj.get("options") or [])[:4]
         except Exception:

@@ -6,12 +6,15 @@
     {"type":"action","text":"..."}
     {"type":"suggest"}
     {"type":"roll"}
+    {"type":"configure","dm":{...}(可空),"advisor":{...}(可空)}   # 运行期接模型；dm 仅房主可改
+       槽位字段：kind(off|cloud|local) + base_url + model + temperature + api_key(省略=保持原值)
   服务端 → 客户端：
-    {"type":"welcome","room":"...","you":"...","late":bool,"script":"剧本名"}  # late=true 表示中途加入
+    {"type":"welcome","room":"...","you":"...","late":bool,"script":"剧本名","agents":{...}}
+    {"type":"agent_status","agents":{...},"changed":["dm","advisor"]}   # 响应 configure
     {"type":"system","text":"..."}
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
-    {"type":"suggestions","options":[...]}
+    {"type":"suggestions","options":[...],"agent":{"source":"llm|scripted","tools":[...]}}
     {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
     {"type":"state","state":{...}}   # state.flag_details = [{"id":..,"label":..}]
     {"type":"error","message":"..."}
@@ -21,16 +24,18 @@ import json
 import os
 import secrets
 import string
+import time
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
+from .agents import AdvisorAgent, AdvisorContext, NarratorAgent, NarratorContext, describe_agents
 from .config import RESOURCE_DIR, load_config
 from .dice import roll
 from .dm import DM
-from .llm import build_provider
+from .llm import ToolCallingUnsupported, build_provider
 from .rag import ScriptStore
 from .state_machine import GameState
 
@@ -49,22 +54,91 @@ def _resolve_script(rel: str) -> Path:
 
 
 store = ScriptStore(_resolve_script(cfg.get("script") or "scripts/sample_script.json"))
-provider = build_provider(cfg)
+default_dm_slot = dict(cfg["models"]["dm"])
+default_advisor_slot = dict(cfg["models"]["advisor"])
 
 print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag）")
-if provider is None:
-    print("[RPGBar] 未配置 LLM API key，DM 走脚本化兜底（玩法完整可玩）。")
-else:
-    print(f"[RPGBar] LLM provider: {provider.name} ({cfg['llm']['model']})")
+_agents = describe_agents(default_dm_slot, default_advisor_slot)
+for key in ("dm", "advisor"):
+    a = _agents[key]
+    if a["ready"]:
+        print(f"[RPGBar] {a['label']}：{a['kind']} · {a['base_url']} · {a['model']}")
+    else:
+        print(f"[RPGBar] {a['label']}：未接模型（留空），走脚本化兜底")
+print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 API 或本地模型）。")
+
+
+# ---- 模型槽位的清洗与合并 ----
+ALLOWED_KINDS = ("off", "cloud", "local")
+
+
+def clean_slot_patch(patch) -> dict:
+    """只接受白名单字段，防止脏数据进服务端。"""
+    if not isinstance(patch, dict):
+        return {}
+    out = {}
+    kind = patch.get("kind")
+    if isinstance(kind, str) and kind.lower() in ALLOWED_KINDS:
+        out["kind"] = kind.lower()
+    for key in ("base_url", "model"):
+        if isinstance(patch.get(key), str):
+            out[key] = patch[key].strip()
+    if "api_key" in patch and isinstance(patch["api_key"], str):
+        out["api_key"] = patch["api_key"].strip()  # 传空串 = 清除
+    if "temperature" in patch:
+        try:
+            t = float(patch["temperature"])
+            out["temperature"] = max(0.0, min(2.0, t))
+        except (TypeError, ValueError):
+            pass
+    if out.get("base_url") and not out["base_url"].startswith(("http://", "https://")):
+        out.pop("base_url")
+    return out
+
+
+def merge_slot(slot: dict, patch: dict) -> dict:
+    """把补丁合并进槽位；api_key 未出现则保持原值。"""
+    for k, v in patch.items():
+        slot[k] = v
+    if (slot.get("kind") or "off") == "off":
+        # 关闭时不要求 base_url/model 合法
+        return slot
+    return slot
 
 
 class Room:
     def __init__(self, code):
         self.code = code
         self.state = GameState(store, store.start_scene)
-        self.dm = DM(store, provider)
         self.clients = []  # list[(name, websocket)]
         self.lock = asyncio.Lock()
+        self.owner = None  # 房主（第一个加入的人）才能改 DM 模型
+        self.dm_slot = dict(default_dm_slot)
+        self.advisors = {}  # name -> {"slot": dict, "agent": AdvisorAgent}
+        self._narrator = None
+
+    # ---- Agent 生命周期 ----
+    def narrator(self) -> NarratorAgent:
+        if self._narrator is None:
+            self._narrator = NarratorAgent(store, build_provider(self.dm_slot))
+        return self._narrator
+
+    def advisor(self, name) -> AdvisorAgent:
+        info = self.advisors.get(name)
+        if info is None or info.get("agent") is None:
+            slot = info["slot"] if info else dict(default_advisor_slot)
+            info = {"slot": slot, "agent": AdvisorAgent(store, build_provider(slot))}
+            self.advisors[name] = info
+        return info["agent"]
+
+    def agents_status(self, name=None) -> dict:
+        status = describe_agents(self.dm_slot, self.advisor_slot_for(name))
+        status["owner"] = self.owner
+        return status
+
+    def advisor_slot_for(self, name):
+        info = self.advisors.get(name)
+        return info["slot"] if info else dict(default_advisor_slot)
 
     async def broadcast(self, msg):
         for _, ws in list(self.clients):
@@ -89,6 +163,9 @@ class Room:
             late = self.state.is_in_progress()
             self.state.add_player(name, character)
             self.clients.append((name, ws))
+            self.advisors.setdefault(name, {"slot": dict(default_advisor_slot), "agent": None})
+            if self.owner is None:
+                self.owner = name
             await self.send_to(
                 ws,
                 {
@@ -97,6 +174,7 @@ class Room:
                     "you": name,
                     "late": late,
                     "script": store.title,
+                    "agents": self.agents_status(name),
                 },
             )
             if not late:
@@ -106,21 +184,68 @@ class Room:
                 )
             else:
                 await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
-                intro = await self.dm.introduce(self.state, name, character)
+                intro = await DM(store, self.narrator().provider).introduce(self.state, name, character)
                 await self.broadcast({"type": "narration", "author": "DM", "text": intro})
                 # 只发给新玩家：结构化「故事回顾」
                 await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
             await self.send_state()
 
+    async def on_configure(self, name, msg, ws):
+        """运行期接入模型：dm 仅房主可改；advisor 每个玩家管自己的。"""
+        async with self.lock:
+            changed = []
+            dm_patch = clean_slot_patch(msg.get("dm"))
+            if dm_patch:
+                if self.owner == name:
+                    merge_slot(self.dm_slot, dm_patch)
+                    self._narrator = None  # 重建 Agent
+                    changed.append("dm")
+                else:
+                    await self.send_to(
+                        ws,
+                        {"type": "error", "message": f"只有房主（{self.owner}）可以修改主机 DM 模型"},
+                    )
+            adv_patch = clean_slot_patch(msg.get("advisor"))
+            if adv_patch:
+                info = self.advisors.setdefault(
+                    name, {"slot": dict(default_advisor_slot), "agent": None}
+                )
+                merge_slot(info["slot"], adv_patch)
+                info["agent"] = None  # 重建
+                changed.append("advisor")
+            await self.send_to(
+                ws,
+                {"type": "agent_status", "agents": self.agents_status(name), "changed": changed},
+            )
+
     async def on_action(self, name, text):
         async with self.lock:
-            for ev in await self.dm.handle_action(self.state, name, text):
+            ctx = NarratorContext(state=self.state, player_name=name)
+            res = await self.narrator().run(ctx, text)
+            for ev in ctx.events:
                 await self.broadcast(ev)
+            parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]
+            if res.text and res.text.strip():
+                parts.append(res.text.strip())
+            for p in parts:
+                await self.broadcast({"type": "narration", "author": "DM", "text": p})
             await self.send_state()
 
-    async def on_suggest(self, ws):
-        opts = await self.dm.suggest(self.state)
-        await ws.send_text(json.dumps({"type": "suggestions", "options": opts}, ensure_ascii=False))
+    async def on_suggest(self, name, ws):
+        agent = self.advisor(name)
+        res = await agent.suggest(AdvisorContext(state=self.state, player_name=name))
+        await self.send_to(
+            ws,
+            {
+                "type": "suggestions",
+                "options": res.data.get("options", []),
+                "agent": {
+                    "source": res.source,
+                    "stopped": res.stopped,
+                    "tools": res.used_tools,
+                },
+            },
+        )
 
     async def on_roll(self, name):
         await self.broadcast(
@@ -141,7 +266,64 @@ app = FastAPI(title="RPGBar", version=__version__)
 @app.get("/api/version")
 async def api_version():
     """版本信息，供客户端展示（版本号来自 server/__init__.py）。"""
-    return {"name": "RPGBar", "version": __version__, "script": store.title}
+    return {
+        "name": "RPGBar",
+        "version": __version__,
+        "script": store.title,
+        "agents": describe_agents(default_dm_slot, default_advisor_slot),
+    }
+
+
+@app.post("/api/models/test")
+async def api_models_test(payload: dict = Body(...)):
+    """探测一个模型槽位是否可用（供设置界面的「测试连接」按钮调用）。
+
+    只做一次极短的单轮对话，确认 base_url / api_key / model 三件套能通；
+    带 probe_tools=true 时再额外探一次工具调用能力（决定走工具循环还是单轮 JSON）。
+    槽位字段先过 clean_slot_patch 白名单，避免脏数据。
+    """
+    raw = payload.get("slot") if isinstance(payload.get("slot"), dict) else payload
+    slot = dict(clean_slot_patch(raw))
+    slot.setdefault("timeout", 20.0)  # 测试用短超时，避免界面长时间挂着
+    out = {"ok": False, "reply": "", "elapsed_ms": 0, "tool_calling": None}
+    provider = build_provider(slot)
+    if provider is None:
+        out["error"] = "配置不完整：云 API 需要 api_key，本地模型需要 base_url 与 model"
+        return out
+    if slot.get("base_url"):
+        provider.base_url = slot["base_url"].rstrip("/")
+    t0 = time.time()
+    try:
+        reply = await provider.chat([{"role": "user", "content": "只回复两个字：就绪"}])
+        out["reply"] = (reply or "").strip()[:80]
+        out["ok"] = True
+        if payload.get("probe_tools"):
+            try:
+                await provider.chat_with_tools(
+                    [{"role": "user", "content": "请调用 ping 工具。"}],
+                    [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "ping",
+                                "description": "连通性测试",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                        }
+                    ],
+                )
+                out["tool_calling"] = True
+            except ToolCallingUnsupported:
+                out["tool_calling"] = False
+            except Exception as e:  # noqa: BLE001
+                out["tool_calling"] = None
+                out["tool_error"] = f"{type(e).__name__}: {str(e)[:120]}"
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+    finally:
+        await provider.close()
+    out["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return out
 
 
 @app.websocket("/ws")
@@ -169,7 +351,9 @@ async def ws_endpoint(ws: WebSocket):
             if t == "action":
                 await room.on_action(name, (msg.get("text") or "").strip())
             elif t == "suggest":
-                await room.on_suggest(ws)
+                await room.on_suggest(name, ws)
+            elif t == "configure":
+                await room.on_configure(name, msg, ws)
             elif t == "roll":
                 await room.on_roll(name)
     except WebSocketDisconnect:

@@ -74,8 +74,8 @@ export RPGBAR_LLM_API_KEY="none"
 | 骰子 | `server/dice.py` | 服务端投掷，可设种子复现 |
 | DM 编排 | `server/dm.py` | LLM 只提案，服务端校验后应用（护栏）；无 key 走脚本化兜底 |
 | LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider，云 API 与本地 llama.cpp 同一套 |
-| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，多玩家广播 |
-| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议 |
+| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，多玩家广播，中途加入判定与补课推送 |
+| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板 |
 
 ## 关键设计
 
@@ -84,10 +84,21 @@ export RPGBAR_LLM_API_KEY="none"
 - **LLM 只提案、服务端校验**：LLM 返回的 `move_to` / `set_flags` 必须落在剧本已知的出口与 flag 白名单内，防止跑偏。
 - **骰子在服务端**：玩家只发意图，结果由主机统一投掷并广播，防作弊。
 - **小助手 = 玩家的私有 Agent**：demo 里复用同一 LLM 给建议；Unity 版将下沉到玩家本地的小模型（3B/4B）。
+- **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
+- **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
 ## 样例剧本
 
 `scripts/sample_script.json`：《古堡秘宝》，5 个场景、2 个 NPC、多个检定与 flag 分支（说服看守 → 发现暗门 → 找钥匙/破门 → 取圣杯 → 决战守护者）。
+
+## 测试
+
+```bash
+python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入（需先起服务器）
+python scripts/smoke_test.py --unit # 仅进程内
+```
+
+当前 37 项全绿。
 
 ## 打包发布（发给朋友）
 

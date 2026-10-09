@@ -6,6 +6,7 @@
 // 用法：
 //   npm i jsdom                       # 只需一次（或用任意 node 工程里的 jsdom）
 //   node scripts/ui_check.js          # 需 RPGBar 服务器已在 127.0.0.1:8000 运行
+//   RPGBAR_BASE_URL=http://127.0.0.1:8010 node scripts/ui_check.js   # 测打包产物
 //
 // 它会在 127.0.0.1:8123 起一个假的 OpenAI 兼容服务，所以「测试连接」按钮
 // 走的是**真实链路**：jsdom → 页面 fetch → FastAPI /api/models/test → 假 LLM。
@@ -15,7 +16,8 @@ const http = require("http");
 const { JSDOM } = require("jsdom");
 
 const WEB = path.resolve(__dirname, "../web");
-const BASE = "http://127.0.0.1:8000";
+// 默认打本机开发服务器；测打包产物时用 RPGBAR_BASE_URL=http://127.0.0.1:8010
+const BASE = (process.env.RPGBAR_BASE_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
 const FAKE_LLM_PORT = 8123;
 
 let PASS = 0;

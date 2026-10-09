@@ -1,26 +1,37 @@
 # RPGBar
 
-多人联机文字跑团（TRPG）demo。一个 Agent 担任 DM，用 RAG 约束 DM 遵循剧本推进剧情；多名玩家通过浏览器实时联机，各自可召唤小助手草拟行动，骰子由服务端统一投掷。
+多人联机文字跑团（TRPG）。一个 Agent 担任 DM，用 RAG 约束 DM 遵循剧本推进剧情；玩家通过浏览器连接**中央服务器**实时联机，各自可召唤小助手草拟行动，骰子由服务端统一投掷。
 
-> 当前为 **Web 联机 demo** 阶段，用于验证「DM + RAG + 剧情状态机 + 骰子 + 多人联机」的完整玩法。架构与后续 Unity 版一一对应：服务端 = 主机，浏览器标签页 = 玩家客户端。
+- **架构**：中央服务器（FastAPI + WebSocket）承载 DM + RAG + 状态机 + 骰子；客户端是纯网页，连接服务器一起玩。玩家**不自己起服务**，只连服务器。
+- **当前形态**：Web 联机 demo，验证完整玩法；后续移植 Unity（WebSocket → Mirror/Netcode，服务端 = 主机端）。
 
-## 快速开始
+## 在线体验
+
+Demo 服务器已部署：
+
+> **https://rpgbar.app.workbuddy.host/**
+
+打开链接，输入名字与房间码（留空自动建房），开多个标签页、或让朋友打开同一链接并输入同一房间码，即可联机。
+
+> 当前 demo 服务器未配置大模型 API key，DM 走脚本化兜底（玩法完整可玩）。
+
+## 自己部署服务器（自托管）
+
+服务器是独立进程；把它跑在任意一台可被访问的机器上，玩家连它即可。
 
 ```bash
-# 1. 安装依赖（建议用虚拟环境）
 pip install -r requirements.txt
-
-# 2. 启动服务器
-python -m uvicorn server.main:app --host 127.0.0.1 --port 8000
-
-# 3. 浏览器打开
-# http://127.0.0.1:8000
-# 开多个标签页（或让朋友连你的局域网 IP），输入同一个房间码即可多人联机。
+python -m server.main          # 默认 127.0.0.1:8000；设置 PORT 环境变量则绑定 0.0.0.0
 ```
 
-## 启用真实 DM 大模型（云 API）
+让朋友连接：
 
-默认不配置 key 时，DM 走**脚本化兜底**（剧本旁白 + 出口/检定提示），玩法完整可玩。填入 key 后启用真实 LLM 叙事：
+- **同一局域网**：朋友打开 `http://<你的局域网IP>:8000`
+- **公网**：把服务器部署到云主机，或做端口映射 / 内网穿透（如 frp）
+
+## DM 大模型：云 API 与本地 llama.cpp 共用一套
+
+默认不配置 key 时，DM 走脚本化兜底。填入 key 后启用真实 LLM 叙事：
 
 ```bash
 # 方式一：环境变量（以 DeepSeek 为例）
@@ -34,9 +45,9 @@ cp config.example.json config.json
 
 DeepSeek / 智谱 GLM / 通义 Qwen 均为 OpenAI 兼容接口，改 `base_url` + `model` 即可切换。
 
-## 保留本地大模型路径
+### 保留本地大模型路径
 
-llama.cpp 的 `llama-server` 也暴露 OpenAI 兼容的 `/v1/chat/completions` 接口，因此**本地模型只是改一行配置**：
+llama.cpp 的 `llama-server` 同样暴露 OpenAI 兼容的 `/v1/chat/completions` 接口，因此**本地模型只是改一行配置**：
 
 ```bash
 # 1. 本地启动 llama.cpp server（例如 Qwen3-8B 的 GGUF）
@@ -64,6 +75,7 @@ export RPGBAR_LLM_API_KEY="none"
 
 ## 关键设计
 
+- **中央服务器 + 客户端**：玩家只连服务器，不自己起服务；房间按码隔离，服务端权威。
 - **守剧本 = RAG + 状态机双保险**：RAG 给 DM 递当前场景与相关片段，状态机管「剧情走到哪、允许往哪走」。
 - **LLM 只提案、服务端校验**：LLM 返回的 `move_to` / `set_flags` 必须落在剧本已知的出口与 flag 白名单内，防止跑偏。
 - **骰子在服务端**：玩家只发意图，结果由主机统一投掷并广播，防作弊。
@@ -75,6 +87,6 @@ export RPGBAR_LLM_API_KEY="none"
 
 ## 后续路线
 
-1. 跑通 Web demo（当前）。
+1. 跑通 Web 联机 demo（当前）。
 2. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
 3. 玩家端小助手下沉到本地 3B/4B 模型（llama.cpp）。

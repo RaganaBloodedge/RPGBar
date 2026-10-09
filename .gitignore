@@ -24,3 +24,6 @@ Thumbs.db
 
 # 工作区内部材料（记忆等，不入库）
 .workbuddy/
+
+# 部署标记文件
+*.genie

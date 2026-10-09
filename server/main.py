@@ -145,10 +145,16 @@ if WEB_DIR.exists():
 
 
 def main():
+    import os
+
     import uvicorn
 
     s = cfg["server"]
-    uvicorn.run("server.main:app", host=s["host"], port=s["port"], reload=False)
+    port = int(os.environ.get("PORT", s["port"]))
+    # 部署环境（存在 PORT）需绑定 0.0.0.0 以接受外部客户端连接
+    host = "0.0.0.0" if os.environ.get("PORT") else s["host"]
+    print(f"[RPGBar] 服务器监听 {host}:{port}")
+    uvicorn.run("server.main:app", host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

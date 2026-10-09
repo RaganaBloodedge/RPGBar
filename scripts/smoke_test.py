@@ -9,6 +9,7 @@
 """
 import asyncio
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -110,11 +111,12 @@ async def run_live():
         return
 
     room = "TEST1"
+    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
     try:
-        a = await websockets.connect("ws://127.0.0.1:8000/ws", proxy=None)
-        b = await websockets.connect("ws://127.0.0.1:8000/ws", proxy=None)
+        a = await websockets.connect(ws_url, proxy=None)
+        b = await websockets.connect(ws_url, proxy=None)
     except Exception as e:
-        print(f"  [SKIP] 无法连接服务器：{e}")
+        print(f"  [SKIP] 无法连接服务器 {ws_url}：{e}")
         return
 
     try:

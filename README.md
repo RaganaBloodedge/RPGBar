@@ -98,7 +98,15 @@ python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入（
 python scripts/smoke_test.py --unit # 仅进程内
 ```
 
-当前 37 项全绿。
+当前 39 项全绿。
+
+## 版本
+
+当前版本 **v0.5.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
+
+版本号只有一个来源：`server/__init__.py` 的 `__version__`。它会显示在服务器启动横幅、`GET /api/version`，以及网页的加入页与顶栏——所以"跑的是哪一版"一眼可辨。
+
+发版流程见 CHANGELOG 顶部的「版本约定」。
 
 ## 打包发布（发给朋友）
 

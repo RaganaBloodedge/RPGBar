@@ -122,7 +122,14 @@ pyinstaller --name RPGBarServer --onedir --noconfirm --clean \
   run_server.py
 ```
 
-产物在 `dist/RPGBarServer/`，压缩成 zip 发送即可。朋友解压双击 `RPGBarServer.exe`，按包内 `使用指南.txt` 操作。详见 [docs/说明书.md](docs/说明书.md) 第十节。
+产物在 `dist/RPGBarServer/`。**打包后把给玩家的说明拷进去再压缩**（指南源码在仓库里，避免每次重打都要重写）：
+
+```bash
+cp docs/使用指南.txt dist/RPGBarServer/使用指南.txt
+python -c "import shutil; shutil.make_archive('RPGBarServer','zip',root_dir='dist',base_dir='RPGBarServer')"
+```
+
+朋友解压双击 `RPGBarServer.exe`，按包内 `使用指南.txt` 操作。详见 [docs/说明书.md](docs/说明书.md) 第十节。
 
 ## 后续路线
 

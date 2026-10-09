@@ -87,9 +87,26 @@ export RPGBAR_LLM_API_KEY="none"
 - **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
 - **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
-## 样例剧本
+## 剧本
 
-`scripts/sample_script.json`：《古堡秘宝》，5 个场景、2 个 NPC、多个检定与 flag 分支（说服看守 → 发现暗门 → 找钥匙/破门 → 取圣杯 → 决战守护者）。
+剧本是结构化 JSON，放在 `scripts/`，用 `config.json` 的 `script` 字段或环境变量选：
+
+```bash
+# 默认：原创剧本《古堡秘宝》
+python -m server.main
+
+# 换成第二个剧本
+RPGBAR_SCRIPT=scripts/totsk_l1.json python -m server.main
+```
+
+| 剧本 | 文件 | 说明 |
+| --- | --- | --- |
+| **古堡秘宝**（默认） | `scripts/sample_script.json` | 原创。5 场景、2 NPC、多条检定与 flag 分支 |
+| **蛇王墓 · 第一层「假墓」** | `scripts/totsk_l1.json` | 改编自 Skerples 的 *Tomb of the Serpent Kings*。9 场景、12 线索、11 处检定 |
+
+> 《蛇王墓》是**改编作品，以 CC BY-NC-SA 4.0 提供**（不是本仓库的 MIT）：可自由分享/改编/翻译，但**不得商用**，且须署名原作者 Skerples。详见文件内的 `meta` 字段。
+
+剧本名会显示在启动横幅、`/api/version` 与网页上——**一眼看出这局跑的是哪个本**。
 
 ## 测试
 
@@ -98,11 +115,11 @@ python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入（
 python scripts/smoke_test.py --unit # 仅进程内
 ```
 
-当前 39 项全绿。
+当前 **64 项全绿**。实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
 
 ## 版本
 
-当前版本 **v0.5.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
+当前版本 **v0.6.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
 
 版本号只有一个来源：`server/__init__.py` 的 `__version__`。它会显示在服务器启动横幅、`GET /api/version`，以及网页的加入页与顶栏——所以"跑的是哪一版"一眼可辨。
 

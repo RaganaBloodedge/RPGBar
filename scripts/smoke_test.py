@@ -24,6 +24,7 @@ from server.rag import ScriptStore
 from server.state_machine import GameState
 
 SCRIPT = Path(__file__).resolve().parent / "sample_script.json"
+TOTSK = Path(__file__).resolve().parent / "totsk_l1.json"
 PASS = 0
 FAIL = 0
 
@@ -124,6 +125,162 @@ async def run_unit():
     check("引导旁白复述已获线索", "暗门" in intro, intro[:120])
 
 
+async def run_unit_totsk():
+    """第二个剧本《蛇王墓·第一层》：验证真实模组（多场景/门控/机关）也能被引擎驱动。"""
+    print("== 进程内校验：蛇王墓（改编自 Tomb of the Serpent Kings） ==")
+    from server import dice as dice_mod
+
+    store = ScriptStore(TOTSK)
+    check("蛇王墓剧本加载（9 场景）", len(store.scenes) == 9, f"实际 {len(store.scenes)}")
+    check("蛇王墓 flag 全集（12 个）", len(store.flag_ids) == 12, str(sorted(store.flag_ids)))
+
+    # 版权归属必须留在文件里（改编自 CC BY-NC-SA 作品，署名是许可要求）
+    meta = store.data.get("meta", {})
+    check("剧本保留原作署名与许可", "Skerples" in json.dumps(meta, ensure_ascii=False), str(meta)[:80])
+    check("剧本标注 CC BY-NC-SA", "BY-NC-SA" in meta.get("license", ""), meta.get("license", ""))
+
+    # 结构完整性：出口指向存在、门控 flag 都在 flag 表、flag 都能拿到
+    ids = {s["id"] for s in store.data["scenes"]}
+    dangling = [
+        f"{s['id']}->{e['to']}"
+        for s in store.data["scenes"]
+        for e in s.get("exits", [])
+        if e["to"] not in ids
+    ]
+    check("出口无断链", not dangling, str(dangling))
+    unknown_cond = [
+        f"{s['id']}:{e['condition']}"
+        for s in store.data["scenes"]
+        for e in s.get("exits", [])
+        if e.get("condition") and e["condition"] not in store.flag_ids
+    ]
+    check("出口门控 flag 都在 flag 表", not unknown_cond, str(unknown_cond))
+
+    # RAG：搜"银戒指"应命中术士墓
+    related = store.retrieve("entrance_hall", "我想去拿那枚银戒指")
+    check("RAG 检索命中术士墓", "sorcerer_tomb" in related, str(related))
+
+    # 检定 vs 出口 的优先级回归：这句必须判成「出口」，不能被子串命中抢成检定
+    dm = DM(store, None)
+    fk = store.get_scene("false_king_tomb")
+    check(
+        "退出措辞优先判为出口而非检定",
+        dm.detect_check("侧身钻进棺后的窄缝", fk) is None,
+        str(dm.detect_check("侧身钻进棺后的窄缝", fk)),
+    )
+    e_seam = dm.detect_exit("侧身钻进棺后的窄缝", fk)
+    check("窄缝出口被识别", e_seam is not None and e_seam["to"] == "false_temple", str(e_seam))
+
+    # 出口门控：石门未抬闩时进不去假王之墓
+    sd = store.get_scene("stone_door")
+    s_locked = GameState(store, "stone_door")
+    s_locked.add_player("A", {"cls": "战士"})
+    e_door = dm.detect_exit("推开石门进入假王之墓", sd)
+    check("石门出口被识别", e_door is not None and e_door["to"] == "false_king_tomb", str(e_door))
+    check("未抬闩时石门锁着", not DM._exit_ok(e_door, s_locked))
+    s_locked.set_flag("opened_false_king_tomb")
+    check("抬开石闩后石门解锁", DM._exit_ok(e_door, s_locked))
+
+    # 检定关键词匹配：三种对待中空石像的方式各走各的检定
+    gt = store.get_scene("guard_tomb")
+    for action, want in [
+        ("敲一敲石像", "listen_statue"),
+        ("用长杆挑开石像", "probe_statue"),
+        ("砸开石像", "smash_statue"),
+    ]:
+        c = dm.detect_check(action, gt)
+        check(f"「{action}」→ {want}", c is not None and c["id"] == want, str(c and c["id"]))
+
+    # 完整通关：把检定固定为成功，从开场一路走到第二层入口
+    real_roll = dice_mod.roll_check
+    dice_mod.roll_check = lambda skill, dc: {"skill": skill, "dc": dc, "roll": 20, "success": True}
+    try:
+        run = GameState(store, store.start_scene)
+        run.add_player("A", {"cls": "战士"})
+        path = [
+            "询问卡特",
+            "钻进石门，走进甬道",
+            "观察甬道",
+            "进入守卫墓室",
+            "敲一敲石像",
+            "用长杆挑开石像",
+            "返回甬道",
+            "进入学者墓室",
+            "查看卷轴",
+            "返回甬道",
+            "进入术士墓室",
+            "取下戒指",
+            "返回甬道",
+            "走向尽头的石门",
+        ]
+        for act in path:
+            await dm.handle_action(run, "A", act)
+        check("通关前半程到达石门", run.current_scene == "stone_door", run.current_scene)
+
+        # 未抬闩时推门应被拦下，且不改变场景
+        evs = await dm.handle_action(run, "A", "推开石门进入假王之墓")
+        blocked = any(e["type"] == "narration" and "做不到" in e.get("text", "") for e in evs)
+        check("未抬闩时推门被拦下", blocked and run.current_scene == "stone_door", str([e["type"] for e in evs]))
+
+        for act in [
+            "检查石门",
+            "合力抬开石闩",
+            "推开石门进入假王之墓",
+            "贴着棺盖听",
+            "迎战骷髅",
+            "检查北墙",
+            "侧身钻进棺后的窄缝",
+            "查看神像基座",
+            "钻进秘道",
+        ]:
+            await dm.handle_action(run, "A", act)
+        check("通关全程抵达第二层入口", run.current_scene == "upper_tomb", run.current_scene)
+
+        want_flags = set(store.flag_ids)
+        check("通关后集齐全部 12 条线索", run.flags >= want_flags, str(sorted(run.flags)))
+        rec = run.recap()
+        check("回顾行程覆盖 7 站以上", len(rec["scene_path"]) >= 7, str(rec["scene_path"]))
+        check("回顾线索均为中文描述", all(f["label"] != f["id"] for f in rec["flags"]), str(rec["flags"])[:120])
+
+        intro = await dm.introduce(run, "latecomer", {"cls": "法师"})
+        check("蛇王墓的中途加入旁白非空", bool(intro and intro.strip()), intro[:60])
+    finally:
+        dice_mod.roll_check = real_roll
+
+
+def http_base():
+    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+    return ws_url.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
+
+
+def ws_url():
+    return os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+
+
+async def server_script_name():
+    """读取服务器当前加载的剧本名，让实时校验能适配不同剧本。"""
+    try:
+        import httpx
+
+        return httpx.get(http_base() + "/api/version", timeout=8, trust_env=False).json().get("script", "")
+    except Exception:
+        return ""
+
+
+# 每种剧本一套实时校验动作：都用「确定性、不依赖骰子成败」的那几步
+LIVE_SCRIPTS = [
+    ("古堡秘宝", {"move": "推开铁门进入门厅", "scene": "hall", "check": "调查挂毯"}),
+    ("蛇王墓", {"move": "钻进石门，走进甬道", "scene": "entrance_hall", "check": "观察甬道"}),
+]
+
+
+def live_actions(script_name):
+    for key, val in LIVE_SCRIPTS:
+        if key in (script_name or ""):
+            return val
+    return LIVE_SCRIPTS[0][1]
+
+
 async def recv_until(ws, pred, timeout=6.0):
     end = time.time() + timeout
     got = None
@@ -147,12 +304,13 @@ async def run_live():
         return
 
     room = "TEST1"
-    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+    url = ws_url()
+    acts = live_actions(await server_script_name())
     try:
-        a = await websockets.connect(ws_url, proxy=None)
-        b = await websockets.connect(ws_url, proxy=None)
+        a = await websockets.connect(url, proxy=None)
+        b = await websockets.connect(url, proxy=None)
     except Exception as e:
-        print(f"  [SKIP] 无法连接服务器 {ws_url}：{e}")
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
         return
 
     try:
@@ -162,14 +320,15 @@ async def run_live():
         wa = await recv_until(a, lambda m: m["type"] == "welcome")
         wb = await recv_until(b, lambda m: m["type"] == "welcome")
         check("双客户端拿到 welcome", wa and wb, f"{bool(wa)}/{bool(wb)}")
+        check("welcome 带回剧本名", bool(wa) and bool(wa.get("script")), str(wa))
 
-        # 亚瑟进入门厅（出口推进，无骰子，确定性）
-        await a.send(json.dumps({"type": "action", "text": "推开铁门进入门厅"}, ensure_ascii=False))
-        st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == "hall")
-        check("联机：出口推进到门厅", bool(st), "未到达 hall")
+        # 亚瑟推进场景（出口推进，无骰子，确定性）
+        await a.send(json.dumps({"type": "action", "text": acts["move"]}, ensure_ascii=False))
+        st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == acts["scene"])
+        check("联机：出口推进到下一场景", bool(st), f"未到达 {acts['scene']}")
 
-        # 亚瑟调查挂毯（触发检定，必有 dice 事件）
-        await a.send(json.dumps({"type": "action", "text": "调查挂毯"}, ensure_ascii=False))
+        # 亚瑟触发检定（必有 dice 事件）
+        await a.send(json.dumps({"type": "action", "text": acts["check"]}, ensure_ascii=False))
         dice_ev = await recv_until(a, lambda m: m["type"] == "dice")
         check("联机：检定触发骰子事件", bool(dice_ev), "无 dice 事件")
 
@@ -191,12 +350,11 @@ async def run_live_version():
     """校验 /api/version（版本号是发版机制的一环，打包后也必须可用）。"""
     import httpx
 
-    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
-    http_url = ws_url.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
     try:
-        r = httpx.get(http_url + "/api/version", timeout=8, trust_env=False)
+        r = httpx.get(http_base() + "/api/version", timeout=8, trust_env=False)
         data = r.json()
         check("联机：/api/version 返回版本号", r.status_code == 200 and bool(data.get("version")), str(data))
+        check("联机：/api/version 返回剧本名", bool(data.get("script")), str(data))
     except Exception as e:
         print(f"  [SKIP] /api/version 不可用：{e}")
 
@@ -221,13 +379,14 @@ async def run_live_latejoin():
         print("  [SKIP] 未安装 websockets，跳过")
         return
 
-    ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
+    url = ws_url()
+    acts = live_actions(await server_script_name())
     # 独立房间码，保证「先到者」进的是全新房间（否则会误判为中途加入）
     room = "LATE" + str(int(time.time() * 1000) % 100000)
     try:
-        a = await websockets.connect(ws_url, proxy=None)
+        a = await websockets.connect(url, proxy=None)
     except Exception as e:
-        print(f"  [SKIP] 无法连接服务器 {ws_url}：{e}")
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
         return
 
     b = None
@@ -236,15 +395,15 @@ async def run_live_latejoin():
         wa = await recv_until(a, lambda m: m["type"] == "welcome")
         check("联机：首人加入 welcome.late=False", bool(wa) and wa.get("late") is False, str(wa))
 
-        # 先到者推进剧情：进入门厅
-        await a.send(json.dumps({"type": "action", "text": "推开铁门进入门厅"}, ensure_ascii=False))
-        st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == "hall")
-        check("联机：先到者推进到门厅", bool(st), "未到达 hall")
-        await a.send(json.dumps({"type": "action", "text": "调查挂毯"}, ensure_ascii=False))
+        # 先到者推进剧情
+        await a.send(json.dumps({"type": "action", "text": acts["move"]}, ensure_ascii=False))
+        st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == acts["scene"])
+        check("联机：先到者推进场景", bool(st), f"未到达 {acts['scene']}")
+        await a.send(json.dumps({"type": "action", "text": acts["check"]}, ensure_ascii=False))
         await recv_until(a, lambda m: m["type"] == "dice")
 
         # 新玩家中途加入同一房间
-        b = await websockets.connect(ws_url, proxy=None)
+        b = await websockets.connect(url, proxy=None)
         await b.send(json.dumps({"type": "join", "name": "迟到者", "room": room, "character": {"cls": "法师"}}, ensure_ascii=False))
         b_msgs = await collect(b, 6)
         types = [m["type"] for m in b_msgs]
@@ -256,7 +415,18 @@ async def run_live_latejoin():
         cap = next((m for m in b_msgs if m["type"] == "recap"), None)
         check("联机：新玩家收到私有故事回顾", bool(cap), str(types))
         rc = (cap or {}).get("recap", {})
-        check("联机：回顾含已走过的行程", "门厅" in (rc.get("scene_path") or []), str(rc.get("scene_path")))
+        check("联机：回顾含已走过的行程", len(rc.get("scene_path") or []) >= 2, str(rc.get("scene_path")))
+
+        st_msg = next((m for m in b_msgs if m["type"] == "state"), None)
+        st_state = (st_msg or {}).get("state") or {}
+        fd = st_state.get("flag_details", [])
+        check(
+            "联机：状态快照带线索中文描述",
+            isinstance(fd, list)
+            and len(fd) == len(st_state.get("flags", []))
+            and all(d.get("label") for d in fd),
+            f"flags={st_state.get('flags')} details={str(fd)[:80]}",
+        )
 
         intro = next((m for m in b_msgs if m["type"] == "narration"), None)
         check(
@@ -289,6 +459,7 @@ async def run_live_latejoin():
 async def main():
     global PASS, FAIL
     await run_unit()
+    await run_unit_totsk()
     await run_live()
     await run_live_version()
     await run_live_latejoin()

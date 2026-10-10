@@ -8,6 +8,7 @@
   var playersEl = document.getElementById("players");
   var flagsEl = document.getElementById("flags");
   var npcsEl = document.getElementById("npcs");
+  var memoryEl = document.getElementById("memory");
   var suggestionsEl = document.getElementById("suggestions");
   var actionInput = document.getElementById("action-input");
   var sendBtn = document.getElementById("send-btn");
@@ -223,6 +224,20 @@
     });
   }
 
+  // 剧情档案：只记「已发生的事实」，DM 忘事时按需检索（混合检索：BM25 + 向量）。
+  function renderMemory(mem) {
+    if (!memoryEl) return;
+    if (!mem || typeof mem.entries !== "number") {
+      memoryEl.textContent = "（尚未开局）";
+      return;
+    }
+    var bits = ["已记录 " + mem.entries + " 条"];
+    if (mem.actors) bits.push(mem.actors + " 个角色");
+    bits.push(mem.has_summary ? "已有主线摘要" : "暂无摘要");
+    bits.push(mem.embedding ? "语义检索：开" : "语义检索：关（纯关键词）");
+    memoryEl.textContent = bits.join(" · ");
+  }
+
   function renderState(state) {
     if (!state) return;
     sceneTitle.textContent = state.scene_title || "—";
@@ -254,6 +269,7 @@
     }
 
     renderNpcs(state.npcs);
+    renderMemory(state.memory);
   }
 
   function renderRecap(recap) {
@@ -312,6 +328,7 @@
         applyAgents(msg.agents);
         renderRoomSync(msg);
         renderNpcs(msg.npcs);
+        renderMemory(msg.memory);
         addEntry(
           "system",
           "",

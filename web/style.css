@@ -109,6 +109,7 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .npcs li { font-size: 13px; }
 .npcs .npc-name { color: var(--text); }
 .npcs .npc-role { color: var(--text-dim); font-size: 12px; }
+.memory { color: var(--text-dim); font-size: 12px; line-height: 1.6; margin: 0; }
 
 /* ---- 消息条目 ---- */
 .entry { margin-bottom: 14px; line-height: 1.7; font-size: 15px; }

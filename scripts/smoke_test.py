@@ -24,13 +24,16 @@ from server.agents import (
     AssistantAgent,
     NarratorAgent,
     NarratorContext,
+    SummaryCtx,
     Task,
     ToolAgent,
     describe_agents,
 )
 from server import dice
+from server.chronicle import Chronicle
 from server.dice import seed as dice_seed
 from server.dm import DM
+from server.embedding import Embedder
 from server.llm import ToolCallingUnsupported, build_provider
 from server.npc import ARCHETYPES, NpcService, PersonaCard, infer_archetype
 from server.rag import ScriptStore
@@ -796,6 +799,115 @@ async def run_unit_npc():
     check("NPC：模型给空选项 → 回落原型 stance", bool(r5["options"]) and r5["source"] == "fallback", str(r5)[:100])
 
 
+async def run_unit_chronicle():
+    """剧情档案：只增落盘、幂等、BM25/向量混合检索、滚动摘要、DM 只读工具。"""
+    print("== 进程内校验：剧情档案与混合检索（P3） ==")
+    store = ScriptStore(SCRIPT)
+    tmp = Path(__file__).resolve().parent / "_chronicle_test"
+    tmp.mkdir(exist_ok=True)
+    jsonl = tmp / "c.jsonl"
+
+    # --- 1. 只增落盘 + 幂等 ---
+    if jsonl.exists():
+        jsonl.unlink()
+    (tmp / "c.meta.json").unlink(missing_ok=True)
+    ch = Chronicle(jsonl)
+    ch.add("老周是古堡的看守，成天打瞌睡。", turn=1, kind="narration", scene="gate", actors=["老周"])
+    again = ch.add("老周是古堡的看守，成天打瞌睡。", turn=1, kind="narration", scene="gate", actors=["老周"])
+    ch.add("亚瑟 尝试：推开铁门", turn=2, kind="action", scene="gate", actors=["亚瑟"])
+    ch.add("亚瑟 的 力量 检定 DC12 掷出 15，成功", turn=2, kind="dice", actors=["亚瑟"])
+    check("档案：同内容重复写入被幂等跳过", again is None and len(ch) == 3, str(len(ch)))
+    check("档案：JSONL 真的落盘", jsonl.exists() and len(jsonl.read_text(encoding="utf-8").strip().splitlines()) == 3,
+          str(jsonl.stat().st_size) if jsonl.exists() else "无文件")
+
+    # --- 2. 载入重建 ---
+    ch2 = Chronicle(jsonl)
+    check("档案：可从 JSONL 重建", len(ch2) == 3 and ch2.entries[0]["actors"] == ["老周"], str(len(ch2)))
+    check("档案：条目字段完整", set(ch2.entries[0]) >= {"id", "turn", "kind", "scene", "actors", "text"},
+          str(sorted(ch2.entries[0])))
+
+    # --- 3. BM25 字面召回 ---
+    hits = ch2.search("老周", k=3)
+    check("档案：BM25 能按名字召回", bool(hits) and "老周" in hits[0]["text"], str(hits[:1])[:120])
+    check("档案：kind=action 的玩家行动也被记录", any(e["kind"] == "action" for e in ch2.entries), "")
+
+    # --- 4. 向量语义召回（有模型时才验；没下模型就退化成纯 BM25，不算失败） ---
+    emb = Embedder()
+    check("嵌入：bge-small-zh 已就绪或有明确降级原因", emb.available or bool(emb.reason), emb.reason)
+    if emb.available:
+        ch3 = Chronicle(tmp / "v.jsonl", embedder=emb)
+        if (tmp / "v.jsonl").exists():
+            (tmp / "v.jsonl").unlink()
+        ch3 = Chronicle(tmp / "v.jsonl", embedder=emb)
+        ch3.add("老周是古堡的看守，成天打瞌睡。", turn=1, kind="narration", actors=["老周"])
+        ch3.add("亚瑟买了一把新的长剑。", turn=2, kind="action", actors=["亚瑟"])
+        v = emb.encode(["古堡大门前的守卫"])
+        check("嵌入：向量维度为 512", len(v[0]) == 512, str(len(v[0]) if v else 0))
+        check("嵌入：已做 L2 归一化", abs(sum(x * x for x in v[0]) - 1.0) < 1e-3, "")
+        # 用「守卫」问「看守」（近义），字面不一致，靠向量召回
+        semantic = ch3.search("那个看大门的守卫是谁", k=1)
+        check("档案：语义检索能召回近义表述", bool(semantic) and "老周" in semantic[0]["text"], str(semantic[:1])[:120])
+
+    # --- 5. actor 过滤 ---
+    only_a = ch2.search("铁门", k=3, actor="亚瑟")
+    check("档案：actor 过滤只返回与该角色相关的记录", all("亚瑟" in (h["actors"] or []) or "亚瑟" in h["text"] for h in only_a),
+          str(only_a)[:120])
+
+    # --- 6. 热层 digest 与滚动摘要 ---
+    ch2.set_summary("队伍已进入古堡大门，正在找暗门。", upto_turn=3)
+    d = ch2.digest(4)
+    check("档案：digest 含滚动摘要", "此前剧情概要" in d and "暗门" in d, d[:80])
+    check("档案：digest 含最近发生", "最近发生" in d and "老周" in d, d[:120])
+    ch4 = Chronicle(jsonl)
+    check("档案：摘要随元数据持久化", ch4.summary.startswith("队伍已进入") and ch4.summary_upto == 3, ch4.summary)
+
+    # --- 7. summarize 任务：无模型走确定性兜底，有模型用模型输出 ---
+    a_np = AssistantAgent(store, None)
+    check("摘要任务：已注册", a_np.has_task("summarize"), "")
+    res_np = await a_np.run_task("summarize", SummaryCtx(previous="旧概要。", items=["甲打了乙", "乙跑掉了"]))
+    check("摘要任务：无模型仍产出摘要", bool((res_np.data or {}).get("summary")), str(res_np.data)[:120])
+    check("摘要任务：无模型走脚本化兜底", res_np.source == "scripted", res_np.source)
+
+    good = json.dumps({"summary": "队伍打了乙一顿，乙逃走了。", "key_characters": ["乙"], "open_threads": ["乙的去向"]},
+                      ensure_ascii=False)
+    a_m = AssistantAgent(store, FakeProvider([good]))
+    res_m = await a_m.run_task("summarize", SummaryCtx(previous="", items=["甲打了乙"]))
+    check("摘要任务：模型输出被采纳", (res_m.data or {}).get("summary", "").startswith("队伍打了乙"), str(res_m.data)[:120])
+    bad = AssistantAgent(store, FakeProvider(["{}"]))
+    res_bad = await bad.run_task("summarize", SummaryCtx(previous="旧", items=["新"]))
+    check("摘要任务：空摘要被校验拦下 → 回落兜底", res_bad.source == "degraded" and bool(res_bad.data.get("summary")),
+          res_bad.source)
+    longsum = json.dumps({"summary": "啊" * 2000}, ensure_ascii=False)
+    a_long = AssistantAgent(store, FakeProvider([longsum]))
+    res_long = await a_long.run_task("summarize", SummaryCtx(items=["x"]))
+    check("摘要任务：超长摘要被截断", len(res_long.data.get("summary", "")) <= 1200, str(len(res_long.data.get("summary", ""))))
+
+    # --- 8. DM 的 recall_history：有档案才有工具，且只读 ---
+    state = GameState(store, store.start_scene)
+    state.add_player("亚瑟", {"cls": "战士"})
+    n_with = NarratorAgent(store, None, chronicle=ch2)
+    tools_with = {t.name: t for t in n_with.build_tools(NarratorContext(state=state))}
+    check("DM：有档案时挂上 recall_history", "recall_history" in tools_with, str(sorted(tools_with)))
+    check("DM：recall_history 是只读工具", tools_with["recall_history"].read_only is True, "")
+    hits2 = n_with._t_recall_history(NarratorContext(state=state), query="老周", k=3)
+    check("DM：recall_history 返回档案摘录", bool(hits2.get("hits")) and "老周" in hits2["hits"][0]["text"], str(hits2)[:120])
+    n_without = NarratorAgent(store, None)
+    check("DM：无档案时不挂 recall_history", "recall_history" not in {t.name for t in n_without.build_tools(NarratorContext(state=state))}, "")
+
+    # --- 9. 热层注入 user 消息（只给结论，不灌全文） ---
+    msg = n_with.build_user_message(NarratorContext(state=state), "看看周围")
+    check("DM：user 消息带剧情档案热层", "剧情档案（热层）" in msg, "")
+
+    # 清理
+    for f in (jsonl, tmp / "c.meta.json", tmp / "v.jsonl", tmp / "v.meta.json"):
+        if f.exists():
+            f.unlink()
+    try:
+        tmp.rmdir()
+    except OSError:
+        pass
+
+
 def http_base():
     ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
     return ws_url.replace("ws://", "http://").replace("wss://", "https://").rsplit("/ws", 1)[0]
@@ -1301,6 +1413,54 @@ async def run_live_npc():
             pass
 
 
+async def run_live_chronicle():
+    """实时：剧情档案在房间里真的在记（welcome.state 带 memory、行动后条目数增长）。"""
+    print("== 实时校验：剧情档案（welcome 状态 / 行动后落盘） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过实时校验")
+        return
+    room = "CHR" + str(int(time.time()))[-4:]
+    url = ws_url()
+    try:
+        a = await websockets.connect(url, proxy=None)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
+        return
+    try:
+        await a.send(json.dumps({"type": "join", "name": "甲", "room": room, "character": {"cls": "游侠"}}, ensure_ascii=False))
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        mem = (wa or {}).get("memory") or {}
+        check("档案实时：version/欢迎包带档案状态", isinstance(mem, dict) and "entries" in mem, str(mem)[:140])
+
+        await a.send(json.dumps({"type": "action", "text": "我打量四周并记下来"}, ensure_ascii=False))
+        got, deadline = [], time.time() + 10
+        while time.time() < deadline:
+            try:
+                m = json.loads(await asyncio.wait_for(a.recv(), timeout=max(0.1, deadline - time.time())))
+            except asyncio.TimeoutError:
+                break
+            got.append(m)
+            if m.get("type") == "state":
+                break
+        check("档案实时：行动过程无 error", not any(m.get("type") == "error" for m in got), str(got)[:160])
+        st = got[-1].get("state", {}) if got and got[-1].get("type") == "state" else {}
+        mem2 = st.get("memory") or {}
+        check("档案实时：state 携带档案状态", isinstance(mem2, dict) and "entries" in mem2, str(mem2)[:140])
+        base = int(mem.get("entries") or 0)
+        now = int(mem2.get("entries") or 0)
+        check("档案实时：行动后档案条目数增长", now > base, f"{base} -> {now}")
+        check("档案实时：状态标出是否启用嵌入模型", "embedding" in mem2, str(mem2)[:140])
+    except Exception as e:  # noqa: BLE001
+        print(f"  [ERROR] {type(e).__name__}: {e}")
+    finally:
+        try:
+            await a.close()
+        except Exception:
+            pass
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
@@ -1308,6 +1468,7 @@ async def main():
     await run_unit_totsk()
     await run_unit_agents()
     await run_unit_npc()
+    await run_unit_chronicle()
     await run_unit_scripts()
     if not unit_only:
         await run_live()
@@ -1318,6 +1479,7 @@ async def main():
         await run_live_scripts()
         await run_live_room_script()
         await run_live_npc()
+        await run_live_chronicle()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)
 

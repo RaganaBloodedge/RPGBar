@@ -174,6 +174,7 @@ function startFakeLLM() {
     npcs: [
       { id: "npc01", name: "老周", role: "古堡看守", aliases: ["周老头"], from_script: true },
     ],
+    memory: { entries: 7, actors: 2, has_summary: true, embedding: true },
     prompt: { advisor: "（小助手公开版 prompt）", dm: "（DM 完整版 prompt）" },
     agents: {
       owner: "亚瑟",
@@ -202,6 +203,12 @@ function startFakeLLM() {
     npcItems.length ? npcItems[0].textContent : "无");
   check("NPC 条目以 tooltip 收别名（外号）", npcItems.length > 0 && (npcItems[0].title || "").indexOf("周老头") >= 0,
     npcItems.length ? npcItems[0].title : "无");
+
+  // ---- 剧情档案：welcome 里的 memory 应渲染到侧栏 ----
+  const memText = ($("memory") || {}).textContent || "";
+  check("侧栏渲染剧情档案状态", memText.indexOf("已记录 7 条") >= 0, memText);
+  check("档案状态标出语义检索可用", memText.indexOf("语义检索：开") >= 0, memText);
+  check("档案状态标出已有主线摘要", memText.indexOf("已有主线摘要") >= 0, memText);
 
   // ---- 打开设置 ----
   $("settings-btn").click();

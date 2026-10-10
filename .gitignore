@@ -43,3 +43,44 @@ build/
 dist/
 *.spec
 *.zip
+
+# ---------------------------------------------------------------- Unity
+# 缓存与临时目录（体积大、可重新生成）
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]serSettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+CRASH_REPORT.txt
+sysinfo.txt
+crashlytics-build.properties
+
+# IDE / 生成的项目文件
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+.vs/
+.vsconfig
+
+# 构建产物
+[Bb]uilds/
+/[Ee]xported[Oo]bj/
+*.apk
+*.aab
+*.unitypackage
+*.app
+
+# Unity 崩溃日志
+[Uu]nity/crashlytics-build.properties

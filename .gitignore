@@ -84,3 +84,7 @@ crashlytics-build.properties
 
 # Unity 崩溃日志
 [Uu]nity/crashlytics-build.properties
+
+# Unity Hub 新建的工程如果落在这个仓库里，不要让它 2GB 的 Library/ 混进来
+# （正确做法是把模板工程的 Assets/Packages/ProjectSettings 搬进根目录，见 docs/UNITY.md 六·五）
+My project/

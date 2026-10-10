@@ -10,3 +10,34 @@
 *.txt  text eol=lf
 *.yaml text eol=lf
 *.yml  text eol=lf
+
+# ---------------------------------------------------------------- Unity
+# 全是文本格式（YAML / JSON），但 Unity 自己写盘时用 LF，统一成 LF 才能让 diff 干净。
+# 本机 core.autocrlf=true，不加这几条的话 git 会把工作区的 .cs 换成 CRLF，
+# 和仓库里的 LF 比出满屏假 diff。
+*.cs           text eol=lf
+*.meta         text eol=lf
+*.unity        text eol=lf
+*.asset        text eol=lf
+*.prefab       text eol=lf
+*.mat          text eol=lf
+*.controller   text eol=lf
+*.anim         text eol=lf
+*.inputactions text eol=lf
+*.scenetemplate text eol=lf
+
+# 二进制资源：别让 git 当成文本去猜
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.tga  binary
+*.psd  binary
+*.dds  binary
+*.exr  binary
+*.fbx  binary
+*.wav  binary
+*.mp3  binary
+*.ogg  binary
+*.ttf  binary
+*.otf  binary
+*.onnx binary

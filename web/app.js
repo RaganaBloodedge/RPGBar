@@ -7,6 +7,7 @@
   var logEl = document.getElementById("log");
   var playersEl = document.getElementById("players");
   var flagsEl = document.getElementById("flags");
+  var npcsEl = document.getElementById("npcs");
   var suggestionsEl = document.getElementById("suggestions");
   var actionInput = document.getElementById("action-input");
   var sendBtn = document.getElementById("send-btn");
@@ -49,6 +50,136 @@
   }
   loadVersion();
 
+  function copyText(text, btn, restore) {
+    if (!navigator.clipboard) return;
+    navigator.clipboard.writeText(text).then(function () {
+      btn.textContent = "已复制";
+      setTimeout(function () { btn.textContent = restore; }, 1500);
+    });
+  }
+
+  function fillShareList(el, addresses) {
+    if (!el) return;
+    el.innerHTML = "";
+    addresses.forEach(function (a) {
+      var li = document.createElement("li");
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "share-addr" + (a.primary ? " primary" : "");
+      btn.textContent = a.url;
+      btn.title = "点击复制（" + (a.name || "") + "）";
+      btn.addEventListener("click", function () { copyText(a.url, btn, a.url); });
+      var tag = document.createElement("span");
+      tag.className = "share-tag";
+      tag.textContent = a.name || "";
+      li.appendChild(btn);
+      li.appendChild(tag);
+      el.appendChild(li);
+    });
+  }
+
+  // 本机所有可被访问的地址（含虚拟网卡）——主机发给朋友用，省得自己翻 ipconfig。
+  function loadNet() {
+    fetch("/api/net")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.addresses || !d.addresses.length) return;
+        fillShareList(document.getElementById("share-list"), d.addresses);
+        fillShareList(document.getElementById("share-list-drawer"), d.addresses);
+        var box = document.getElementById("share-box");
+        if (box) box.classList.remove("hidden");
+      })
+      .catch(function () {});
+  }
+  loadNet();
+
+  // 加入页的「开局剧本」下拉：建房时可选，加入别人的房间时由房主决定（自动置灰）。
+  function loadJoinScripts() {
+    var sel = document.getElementById("join-script");
+    if (!sel) return;
+    fetch("/api/scripts")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var list = (d && d.scripts) || [];
+        sel.innerHTML = "";
+        list.forEach(function (s) {
+          if (s.error) return;
+          var opt = document.createElement("option");
+          opt.value = s.path;
+          opt.textContent =
+            (s.title || s.file) + "（" + (s.scenes || 0) + " 场景 / " + (s.chunks || 0) + " 切片）";
+          if (d.active && s.path === d.active) opt.selected = true;
+          sel.appendChild(opt);
+        });
+      })
+      .catch(function () {});
+  }
+
+  function syncJoinScriptLock() {
+    var sel = document.getElementById("join-script");
+    var room = document.getElementById("join-room");
+    if (!sel) return;
+    var joining = !!(room && room.value.trim());
+    sel.disabled = joining;
+    var lbl = document.getElementById("join-script-label");
+    if (lbl) {
+      lbl.textContent = joining
+        ? "开局剧本（加入别人的房间，由房主决定）"
+        : "开局剧本（新建房间时生效）";
+    }
+  }
+
+  if (document.getElementById("join-room")) {
+    document.getElementById("join-room").addEventListener("input", syncJoinScriptLock);
+  }
+  loadJoinScripts();
+  syncJoinScriptLock();
+
+  // 「本房间」同步块：主机建房时选定的剧本 + 下发到本机的 Agent 次级 prompt。
+  function renderRoomSync(msg) {
+    var host = document.getElementById("room-sync");
+    if (!host) return;
+    host.innerHTML = "";
+    var info = msg && msg.script_info;
+    if (!info) {
+      host.textContent = "（尚未连入房间）";
+      return;
+    }
+    var line = el("div", "room-sync-line");
+    line.appendChild(el("b", "", info.title || "未命名剧本"));
+    line.appendChild(document.createTextNode(
+      " · " + (info.path || "") + " · " + (info.scenes || 0) + " 场景 / " +
+      (info.chunks || 0) + " 切片" + (info.structured ? "" : "（纯文本，降级为线性场景链）")
+    ));
+    host.appendChild(line);
+
+    var chunks = msg.chunks || [];
+    if (chunks.length) {
+      var wrap = el("div", "room-sync-chunks");
+      chunks.forEach(function (c) {
+        var span = el("span", "script-slot");
+        span.appendChild(el("b", "", c.id));
+        span.appendChild(document.createTextNode(" " + (c.title || "") + " · " + c.chars + "字"));
+        wrap.appendChild(span);
+      });
+      host.appendChild(wrap);
+    }
+
+    var prompt = msg.prompt || {};
+    [["advisor", "小助手 prompt（已同步给你）"], ["dm", "DM prompt（仅房主可见）"]].forEach(function (pair) {
+      var text = prompt[pair[0]];
+      if (!text) return;
+      var box = el("div", "prompt-block");
+      box.appendChild(el("div", "prompt-label", pair[1]));
+      box.appendChild(el("pre", "script-prompt", text));
+      host.appendChild(box);
+    });
+
+    (info.warnings || []).forEach(function (w) {
+      host.appendChild(el("div", "slot-result warn", "剧本提示：" + w));
+    });
+  }
+
   function addEntry(kind, author, text) {
     var div = document.createElement("div");
     div.className = "entry " + kind;
@@ -62,6 +193,34 @@
     div.appendChild(body);
     logEl.appendChild(div);
     logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // 在场人物：人物卡由 NPC 子系统（主机端小模型）生成，连入即同步。
+  function renderNpcs(npcs) {
+    if (!npcsEl) return;
+    npcsEl.innerHTML = "";
+    var list = npcs || [];
+    if (!list.length) {
+      var empty = document.createElement("li");
+      empty.textContent = "（尚未遇到）";
+      npcsEl.appendChild(empty);
+      return;
+    }
+    list.forEach(function (n) {
+      var li = document.createElement("li");
+      var name = document.createElement("span");
+      name.className = "npc-name";
+      name.textContent = n.name || "?";
+      li.appendChild(name);
+      if (n.role) {
+        var role = document.createElement("span");
+        role.className = "npc-role";
+        role.textContent = " · " + n.role;
+        li.appendChild(role);
+      }
+      if (n.aliases && n.aliases.length) li.title = "别称：" + n.aliases.join("、");
+      npcsEl.appendChild(li);
+    });
   }
 
   function renderState(state) {
@@ -93,6 +252,8 @@
         flagsEl.appendChild(li);
       });
     }
+
+    renderNpcs(state.npcs);
   }
 
   function renderRecap(recap) {
@@ -149,6 +310,8 @@
         if (msg.script) setScript(msg.script);
         isOwner = !!(msg.agents && msg.agents.owner === you);
         applyAgents(msg.agents);
+        renderRoomSync(msg);
+        renderNpcs(msg.npcs);
         addEntry(
           "system",
           "",
@@ -162,7 +325,7 @@
         applyAgents(msg.agents);
         if (msg.changed && msg.changed.length) {
           var names = msg.changed.map(function (k) {
-            return k === "dm" ? "主机 DM" : "玩家小助手";
+            return k === "dm" ? "主机 DM" : (k === "assistant" ? "主机小助手" : "玩家小助手");
           });
           addEntry("system", "", "模型设置已更新：" + names.join("、"));
         }
@@ -237,10 +400,13 @@
   };
   var SLOT_META = {
     dm: { title: "主机 DM · 大模型", role: "推进剧情、投骰判定、扮演 NPC。由房主配置，全房间共用。" },
+    assistant: { title: "主机小助手 · 小模型", role: "为剧本外的 NPC 生成人物小传、算反应权重、滚动摘要。由房主配置，全房间共用。" },
     advisor: { title: "玩家小助手 · 小模型", role: "只读场景，给你 2-4 条行动建议。每位玩家配自己的，可指向本地模型。" }
   };
+  var SLOT_KEYS = ["dm", "assistant", "advisor"];
   var slotState = {
     dm: { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 },
+    assistant: { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.6 },
     advisor: { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 }
   };
   var serverAgents = null; // 服务端回传的接线状态（永远不含 api_key）
@@ -252,7 +418,7 @@
       var raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return;
       var obj = JSON.parse(raw);
-      ["dm", "advisor"].forEach(function (k) {
+      SLOT_KEYS.forEach(function (k) {
         if (obj && obj[k]) {
           var s = obj[k];
           slotState[k] = {
@@ -271,6 +437,7 @@
     try {
       localStorage.setItem(SETTINGS_KEY, JSON.stringify({
         dm: slotState.dm,
+        assistant: slotState.assistant,
         advisor: slotState.advisor
       }));
     } catch (e) {}
@@ -299,11 +466,13 @@
     card.appendChild(head);
     card.appendChild(el("p", "slot-role", meta.role));
 
-    var locked = key === "dm" && !isOwner;
+    var locked = (key === "dm" || key === "assistant") && !isOwner;
     if (locked) {
       card.classList.add("locked");
-      card.appendChild(el("p", "lock-note",
-        "只有房主（" + (ownerName || "首位加入者") + "）可以修改主机 DM 模型。你可以照常配置自己的小助手。"));
+      var note = key === "dm"
+        ? "只有房主（" + (ownerName || "首位加入者") + "）可以修改主机 DM 模型。你可以照常配置自己的小助手。"
+        : "只有房主（" + (ownerName || "首位加入者") + "）可以修改主机小助手模型。你可以照常配置自己的小助手。";
+      card.appendChild(el("p", "lock-note", note));
     }
 
     // 模式切换
@@ -396,8 +565,7 @@
   }
 
   function renderSlots() {
-    renderSlot("dm");
-    renderSlot("advisor");
+    SLOT_KEYS.forEach(function (k) { renderSlot(k); });
   }
 
   function badgeInfo(key) {
@@ -438,13 +606,12 @@
     serverAgents = agents;
     if (typeof agents.owner === "string") ownerName = agents.owner;
     isOwner = typeof agents.owner === "string" && agents.owner === you;
-    ["dm", "advisor"].forEach(function (k) {
+    SLOT_KEYS.forEach(function (k) {
       var info = agents[k];
       if (info && info.base_url && !slotState[k].base_url) slotState[k].base_url = info.base_url;
       if (info && info.model && !slotState[k].model) slotState[k].model = info.model;
     });
-    refreshBadge("dm");
-    refreshBadge("advisor");
+    SLOT_KEYS.forEach(refreshBadge);
     updateModelPill();
     // 房主身份变化（例如服务端换人/重连）时，DM 卡片的可编辑性跟着变
     if (wasOwner !== isOwner) rerenderSlotsIfOpen();
@@ -473,7 +640,10 @@
 
   function sendConfigure() {
     var payload = { type: "configure" };
-    if (isOwner) payload.dm = slotPayload("dm"); // 主机 DM 仅房主可改
+    if (isOwner) {
+      payload.dm = slotPayload("dm");            // 主机 DM 仅房主可改
+      payload.assistant = slotPayload("assistant"); // 主机小助手（NPC/摘要）同样仅房主可改
+    }
     payload.advisor = slotPayload("advisor");
     send(payload);
   }
@@ -490,6 +660,10 @@
     var has = false;
     if (isOwner && slotState.dm.kind !== "off") {
       payload.dm = slotPayload("dm");
+      has = true;
+    }
+    if (isOwner && slotState.assistant.kind !== "off") {
+      payload.assistant = slotPayload("assistant");
       has = true;
     }
     if (slotState.advisor.kind !== "off") {
@@ -834,6 +1008,7 @@
     if (clearBtn) clearBtn.onclick = function () {
       try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
       slotState.dm = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 };
+      slotState.assistant = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.6 };
       slotState.advisor = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 };
       sendConfigure(); // 通知服务端回到脚本化，但不再写回本机
       renderSlots();
@@ -855,6 +1030,8 @@
     var name = document.getElementById("join-name").value.trim();
     var cls = document.getElementById("join-class").value;
     var room = document.getElementById("join-room").value.trim();
+    var scriptSel = document.getElementById("join-script");
+    var scriptRel = !room && scriptSel ? scriptSel.value : ""; // 只有建房时才带上剧本
 
     var proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(proto + "://" + location.host + "/ws");
@@ -864,6 +1041,7 @@
         type: "join",
         name: name,
         room: room,
+        script: scriptRel,
         character: { name: name, cls: cls, hp: 10, skills: {} }
       });
     };

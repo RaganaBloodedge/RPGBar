@@ -31,10 +31,18 @@
       <label>房间码（留空自动建房，也可输入朋友的房间码加入）</label>
       <input id="join-room" type="text" placeholder="留空新建，或输入如 ABC12" autocomplete="off">
 
+      <label id="join-script-label">开局剧本（新建房间时生效）</label>
+      <select id="join-script"></select>
+
       <button type="submit" class="btn primary">进入游戏</button>
     </form>
-    <p class="hint">开多个标签页、或让朋友连你的局域网 IP，输入同一房间码即可联机。</p>
+    <p class="hint">开多个标签页、或让朋友用同一局域网 / 虚拟局域网地址打开，输入同一房间码即可联机。</p>
     <p class="hint small">中途加入也没问题：填上朋友的房间码，DM 会为你补上之前的剧情。</p>
+    <details id="share-box" class="share-box hidden">
+      <summary>联机地址（发给朋友）</summary>
+      <ul id="share-list" class="share-list"></ul>
+      <p class="hint small">异地也能玩：双方装一个虚拟局域网工具（如 EasyTier / Tailscale）连进同一网络，用上面对应的地址打开即可。</p>
+    </details>
     <p class="hint small">RPGBar <span id="app-version">—</span></p>
   </div>
 </section>
@@ -69,6 +77,9 @@
       <h2>已获得线索</h2>
       <ul id="flags" class="flags"></ul>
 
+      <h2>在场人物</h2>
+      <ul id="npcs" class="npcs"></ul>
+
       <h2>掷骰</h2>
       <button id="roll-d20" class="btn dice-btn">掷 d20</button>
       <p class="hint small">检定的骰子会由 DM 在触发时自动投掷</p>
@@ -97,21 +108,36 @@
   </header>
 
   <div class="drawer-body">
+    <h3 class="section-title">本房间</h3>
+    <p class="drawer-hint">
+      剧本与 Agent 的次级 prompt 由<b>主机建房时选定</b>，你连进来会自动与主机同步
+      —— 全房间用的是同一份剧本、同一套提示词，不需要自己再选。
+    </p>
+    <div id="room-sync" class="room-sync">（尚未连入房间）</div>
+
     <h3 class="section-title">剧本</h3>
     <p class="drawer-hint">
       服务端读取剧本文件后<b>自动切片</b>，并生成排在 System prompt 之后的
-      <b>次级 prompt</b>（世界观、语气、切片索引）。System prompt 只管两个 Agent 各自的职责。
+      <b>次级 prompt</b>（世界观、语气、切片索引）。System prompt 只管三个 Agent 各自的职责。
     </p>
     <div id="script-card" class="slot"></div>
 
     <h3 class="section-title">模型</h3>
     <p class="drawer-hint">
-      两个 Agent 都走标准 <b>OpenAI 兼容接口</b>，填 <b>云 API</b> 的 Key，或指向 <b>本地模型</b>
-      （llama.cpp / Ollama / LM Studio）。连接后 DM 会依次调用工具推进剧情，小助手只读场景给建议。
+      三个 Agent 都走标准 <b>OpenAI 兼容接口</b>，填 <b>云 API</b> 的 Key，或指向 <b>本地模型</b>
+      （llama.cpp / Ollama / LM Studio）。DM（大模型）推进剧情；两个小助手跑小模型即可。
     </p>
 
     <div id="slot-dm"></div>
+    <div id="slot-assistant"></div>
     <div id="slot-advisor"></div>
+
+    <h3 class="section-title">联机地址</h3>
+    <p class="drawer-hint">
+      这是本机所有可被朋友访问的地址（含 EasyTier / Tailscale 等<b>虚拟网卡</b>）。
+      点一下即复制，发给朋友就能连进来。
+    </p>
+    <ul id="share-list-drawer" class="share-list"></ul>
 
     <div id="settings-msg" class="settings-msg hidden"></div>
   </div>

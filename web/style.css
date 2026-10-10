@@ -51,6 +51,33 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .hint { color: var(--text-dim); font-size: 12px; margin-top: 16px; line-height: 1.6; }
 .hint.small { margin-top: 10px; font-size: 11px; }
 
+/* ---- 可分享的联机地址（加入页 + 设置抽屉共用）---- */
+.share-box {
+  margin-top: 16px; padding: 10px 12px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.share-box summary { cursor: pointer; color: var(--gold-soft); font-size: 12px; }
+.share-box[open] summary { margin-bottom: 8px; }
+.share-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.share-list li { display: flex; align-items: center; gap: 8px; }
+.share-addr {
+  flex: 1; text-align: left; cursor: pointer; padding: 6px 10px;
+  font-family: ui-monospace, "Consolas", monospace; font-size: 12px;
+  color: var(--text); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.share-addr:hover { border-color: var(--accent); }
+.share-addr.primary { color: var(--gold-soft); }
+.share-tag { flex-shrink: 0; font-size: 11px; color: var(--text-dim); }
+
+/* ---- 设置抽屉：本房间（剧本 + prompt 同步）---- */
+.room-sync { font-size: 12px; color: var(--text-dim); line-height: 1.7; }
+.room-sync-line { color: var(--text); }
+.room-sync-line b { color: var(--gold-soft); }
+.room-sync-chunks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.prompt-block { margin-top: 10px; }
+.prompt-label { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
+
 /* ---- 顶栏 ---- */
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
@@ -75,10 +102,13 @@ form input:focus, form select:focus { border-color: var(--accent); }
 }
 .sidebar h2 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin: 20px 0 10px; }
 .sidebar h2:first-child { margin-top: 0; }
-.players, .flags { list-style: none; }
-.players li, .flags li { font-size: 14px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.players, .flags, .npcs { list-style: none; }
+.players li, .flags li, .npcs li { font-size: 14px; padding: 6px 0; border-bottom: 1px solid var(--border); }
 .flags li { color: var(--gold-soft); font-size: 13px; }
 .players .cls { color: var(--text-dim); font-size: 12px; margin-left: 6px; }
+.npcs li { font-size: 13px; }
+.npcs .npc-name { color: var(--text); }
+.npcs .npc-role { color: var(--text-dim); font-size: 12px; }
 
 /* ---- 消息条目 ---- */
 .entry { margin-bottom: 14px; line-height: 1.7; font-size: 15px; }

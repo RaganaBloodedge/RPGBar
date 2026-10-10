@@ -1,6 +1,6 @@
 # RPGBar
 
-多人联机文字跑团（TRPG）。一个 Agent 担任 DM，用 RAG 约束 DM 遵循剧本推进剧情；玩家通过浏览器连接**服务器**实时联机，各自可召唤小助手草拟行动，骰子由服务端统一投掷。
+多人联机文字跑团（TRPG）。一个 Agent 担任 DM，用 RAG 约束 DM 遵循剧本推进剧情；玩家通过浏览器连接**服务器**实时联机，各自可召唤小助手草拟行动，骰子由服务端统一投掷。剧本外的路人 NPC 由主机小助手现场生成人物小传，不再是「空角色」。
 
 > 完整使用说明、剧本格式、技术细节见 **[docs/说明书.md](docs/说明书.md)**。
 
@@ -33,18 +33,21 @@ python -m server.main
 - **同一局域网**：直接连上面的局域网地址。
 - **跨网络**：给服务器电脑做公网映射 / 内网穿透（如 frp、cpolar），或把服务器部署到云主机。
 
-## 两个 Agent 与两条模型通道
+## 三个 Agent 与两条模型通道
 
-游戏里有**两个 Agent**，都按标准写法实现（模型自己决定调哪个工具 → 服务端执行 → 结果回灌 → 循环到收尾）：
+游戏里有**三个 Agent**，都按标准写法实现（模型自己决定调哪个工具 → 服务端执行 → 结果回灌 → 循环到收尾）：
 
 | Agent | 模型量级 | 能用的工具 | 干什么 |
 | --- | --- | --- | --- |
-| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script`（只读）+ `move_to` `set_flag` `roll_check`（改状态） | 推进剧情、投骰判定、扮 NPC |
+| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script` `npc_card`（只读）+ `move_to` `set_flag` `roll_check` `npc_introduce`（改状态） | 推进剧情、投骰判定、扮 NPC |
+| **主机小助手**（`AssistantAgent`） | 小模型 | 无（固定流程单轮 JSON） | 给剧本外 NPC 生成人物小传、算反应权重、后续做剧情摘要 |
 | **玩家小助手**（`AdvisorAgent`） | 小模型 | `read_scene` `list_valid_actions` `lookup_script`（**全是只读**） | 给你 2-4 条行动建议 |
 
 小助手改不了剧情，不是靠提示词求它别改，而是**它的工具集里根本没有写工具**。
+两台小助手其实是**同一个任务引擎（`ToolAgent`）上的两条固定流程**——`persona` / `react_weights` / `action_advice`
+各自是一条独立的 COT（职责 system + 输出 schema + 校验兜底），共用同一个 `server/agents/tool_agent.py`。
 
-**默认两个槽位都是「留空」**——不接任何模型也能完整游玩（DM 走 `dm.py` 的确定性流水线，玩法与 v0.6.0 一致）。
+**默认三个槽位都是「留空」**——不接任何模型也能完整游玩（DM 走 `dm.py` 的确定性流水线，NPC 走内置原型兜底，玩法完整）。
 
 ### 在游戏里接入（推荐，不用改配置文件）
 
@@ -54,7 +57,7 @@ python -m server.main
 - **本地模型**：选 llama.cpp / Ollama / LM Studio 预设，指向本机地址，**不需要 key**。
 - 点 **「测试连接」** 会真的发一次请求，并额外探测该模型**是否支持工具调用**（不支持会自动降级，见下）。
 - **API Key 只存在你自己浏览器里**，服务端从不回传；设置下次进房自动生效。
-- **主机 DM 只有房主能改**；小助手人人各配各的——正好对应「玩家机器跑本地小模型、主机额外接一个大模型」。
+- **主机 DM 与主机小助手只有房主能改**；玩家小助手人人各配各的——正好对应「玩家机器跑本地小模型、主机额外接一个大模型 + 一个小模型」。
 
 顶栏胶囊会显示当前状态：`脚本化` / `仅 DM` / `仅助手` / `DM + 助手`。
 
@@ -71,7 +74,12 @@ export RPGBAR_ADVISOR_MODEL_BASE_URL="http://127.0.0.1:8080/v1"
 export RPGBAR_ADVISOR_MODEL_MODEL="qwen3-4b"
 export RPGBAR_ADVISOR_MODEL_KIND="local"
 
-# 方式二：复制 config.example.json 为 config.json 填 models.dm / models.advisor
+# 主机小助手（NPC 人设 / 反应权重 / 剧情摘要，可指向本机 llama.cpp）
+export RPGBAR_ASSISTANT_MODEL_BASE_URL="http://127.0.0.1:8081/v1"
+export RPGBAR_ASSISTANT_MODEL_MODEL="qwen2.5-3b-instruct"
+export RPGBAR_ASSISTANT_MODEL_KIND="local"
+
+# 方式二：复制 config.example.json 为 config.json 填 models.dm / models.assistant / models.advisor
 cp config.example.json config.json
 ```
 
@@ -100,28 +108,34 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 | 剧情状态机 | `server/state_machine.py` | 场景/flag/出口/检定，服务端权威状态 |
 | 骰子 | `server/dice.py` | 服务端投掷，可设种子复现 |
 | Agent 骨架 | `server/agents/base.py` | 两层提示词 + 工具注册 + 工具调用循环 + 两条降级路径 |
+| 任务引擎（小模型） | `server/agents/tool_agent.py` | 一条任务 = 一条固定 COT；单轮 JSON / 带工具两条路，含 JSON 容错与校验兜底 |
 | 主机 DM Agent | `server/agents/narrator.py` | 大模型；System prompt 写职责，次级 prompt 给剧本 |
-| 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；**只有只读工具**，次级 prompt 为公开版 |
+| 主机小助手 Agent | `server/agents/persona.py` | 小模型；`persona`（生成人物小传）/ `react_weights`（算反应权重）两条任务 |
+| 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；`action_advice` 任务，**只有只读工具**，次级 prompt 为公开版 |
+| NPC 子系统 | `server/npc.py` | 人物卡 / 别名索引 / 原型兜底表 / NPC 私有记忆（好感度）；反应落点交给骰子 |
 | 无模型的 DM 流水线 | `server/dm.py` | 确定性剧本编排（留空 API 时的兜底），与 Agent 共用同一套状态机 |
 | LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider：云 API 与本地模型同一套；含工具调用与降级判定 |
-| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，模型槽位运行期配置，剧本读取/切换接口，中途加入推送 |
-| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾面板、**设置抽屉（模型 + 剧本）** |
+| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，三个模型槽位运行期配置，剧本读取/切换接口，NPC 同步，中途加入推送 |
+| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾、**在场人物**、设置抽屉（模型 + 剧本） |
 
 ## 关键设计
 
 - **服务器权威 + 客户端连接**：玩家只连服务器，不自己起服务；房间按码隔离。
+- **一个引擎、多条固定 COT**：两台小助手共用 `ToolAgent`；建议、生成人物小传、算反应权重各是一条独立流程（职责 system + 输出 schema + 校验兜底），互不污染。
 - **职责与内容分层**：System prompt 只写 Agent 职责；剧本内容由 `script_loader` 自动切片后生成次级 prompt，换剧本不动人格。
 - **守剧本 = RAG + 状态机双保险**：RAG 给 DM 递当前场景与相关片段，状态机管「剧情走到哪、允许往哪走」。
-- **护栏做在工具里，不靠提示词**：DM 的 `move_to` 只接受当前场景**已解锁**的出口、`set_flag` 只接受剧本声明过的 flag、
+- **护栏做在工具与校验器里，不靠提示词**：DM 的 `move_to` 只接受当前场景**已解锁**的出口、`set_flag` 只接受剧本声明过的 flag、
   骰子只能由 `roll_check` 在服务端投——模型拿不到骰子，也就编不出结果。小助手则连写工具都没有。
+  NPC 的反应权重由校验器裁剪归一化，**模型只给区间、给不出骰点**。
+- **NPC 记忆与 DM 隔离**：NPC 的交往记录与好感度留在 `NpcMemory`；DM 只收到「人物卡 + 当前状态快照」的提炼结论，不掺流水账，剧情上下文保持干净。
 - **骰子在服务端**：玩家只发意图，结果由主机统一投掷并广播，防作弊。
-- **留空也能玩**：两个模型槽位默认 `off`，DM 退回确定性流水线；接了模型才启用 Agent 工具循环，两者共用同一套状态机。
+- **留空也能玩**：三个模型槽位默认 `off`，DM 退回确定性流水线、NPC 退回内置原型兜底；接了模型才启用 Agent 工具循环，两者共用同一套状态机。
 - **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
 - **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
 ## 提示词分层：System 管职责，次级 prompt 管剧本
 
-两个 Agent 的提示词都分两层：
+各 Agent 的提示词都分两层：
 
 | 层 | 内容 | 随什么变 |
 | --- | --- | --- |
@@ -186,14 +200,14 @@ curl -X POST http://127.0.0.1:8000/api/scripts/inspect \
 ## 测试
 
 ```bash
-python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入 + 模型设置 + 剧本接口（需先起服务器）
+python scripts/smoke_test.py        # 进程内 + 实时联机 + 中途加入 + 模型设置 + 剧本接口 + NPC 子系统（需先起服务器）
 python scripts/smoke_test.py --unit # 仅进程内
 
-# 可选：前端 DOM 校验（需 Node + jsdom，验证设置抽屉的交互）
+# 可选：前端 DOM 校验（需 Node + jsdom，验证设置抽屉与在场人物面板的交互）
 npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **181 项全绿**（Python）+ **47 项全绿**（前端 DOM，可选）。
+当前 **236 项全绿**（Python）+ **71 项全绿**（前端 DOM，可选）。
 实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
 Agent 层的测试不需要真实模型——用一个按脚本吐回复的假 Provider 就能验完整工具循环。
 
@@ -230,7 +244,9 @@ python -c "import shutil; shutil.make_archive('RPGBarServer','zip',root_dir='dis
 
 ## 后续路线
 
-1. 跑通 Web 联机 demo：双 Agent + 双模型通道 + 剧本读取/切片（当前）。
-2. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
-3. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接一个大模型——通道已就位，等接默认值。
-4. 有模型时用模型给切片做摘要（现在切片索引是按场景/标题生成的，摘要可交给小模型离线生成后缓存）。
+1. 跑通 Web 联机 demo：三 Agent + 双模型通道 + 剧本读取/切片 + NPC 自动人设（当前）。
+2. **剧情档案与混合检索**：把已输出的主线全文落到本地只增 JSONL 并向量化，内置 `bge-small-zh` + BM25 混合检索；
+   DM 新增 `recall_history` 只读工具，超出上下文时按需回捞关键角色行为，防止模型「忘事」。
+3. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
+4. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接大模型 + 主机小助手——通道已就位，等接默认值。
+5. 有模型时用模型给切片做摘要（现在切片索引是按场景/标题生成的，摘要可交给小模型离线生成后缓存）。

@@ -21,13 +21,18 @@ from server import __version__
 from server.agents import (
     AdvisorAgent,
     AdvisorContext,
+    AssistantAgent,
     NarratorAgent,
     NarratorContext,
+    Task,
+    ToolAgent,
     describe_agents,
 )
+from server import dice
 from server.dice import seed as dice_seed
 from server.dm import DM
 from server.llm import ToolCallingUnsupported, build_provider
+from server.npc import ARCHETYPES, NpcService, PersonaCard, infer_archetype
 from server.rag import ScriptStore
 from server.script_loader import build_script_prompt, parse_script
 from server.state_machine import GameState
@@ -132,6 +137,20 @@ async def run_unit():
     check("引导旁白含新玩家名字与职业", "梅林" in intro and "法师" in intro, intro[:60])
     check("引导旁白复述此前行程", "门厅" in intro, intro[:80])
     check("引导旁白复述已获线索", "暗门" in intro, intro[:120])
+
+    # ---- 房间级剧本同步：连入即拿到「剧本 + 两份 Agent 次级 prompt」----
+    from server.main import Room
+
+    room = Room("TEST1", store2)
+    room.owner = "阿甲"
+    host_ctx = room.room_context("阿甲")
+    other_ctx = room.room_context("阿乙")
+    check("房间：同步包带剧本信息", host_ctx["script_info"]["title"] == store2.title, str(host_ctx["script_info"]))
+    check("房间：同步包带切片清单", len(host_ctx["chunks"]) == len(store2.chunk_list), str(len(host_ctx["chunks"])))
+    check("房间：房主拿到 DM prompt", bool(host_ctx["prompt"]["dm"]))
+    check("房间：非房主拿不到 DM prompt", other_ctx["prompt"]["dm"] is None, str(other_ctx["prompt"]["dm"])[:40])
+    check("房间：所有人都拿到小助手 prompt", bool(other_ctx["prompt"]["advisor"]))
+    check("房间：DM 与小助手 prompt 不相同", host_ctx["prompt"]["dm"] != host_ctx["prompt"]["advisor"])
 
 
 async def run_unit_totsk():
@@ -623,6 +642,159 @@ async def run_unit_agents():
     check("对外状态：云 API 齐活即 ready", pub["dm"].get("ready") is True and pub["dm"].get("mode") == "model", str(pub["dm"]))
     check("对外状态：留空即 scripted", pub["advisor"].get("ready") is False and pub["advisor"].get("mode") == "scripted", str(pub["advisor"]))
 
+    # --- 12. 通用任务引擎：单轮 JSON 任务（无工具）走「校验 → 兜底」 ---
+    class _DummyTaskAgent(ToolAgent):
+        def __init__(self, provider=None):
+            super().__init__(store=None, provider=provider)
+            self.default_task = "dummy"
+            self.register(
+                Task(
+                    name="dummy",
+                    system=lambda a, c: "你是测试任务。",
+                    user=lambda a, c: "给点东西",
+                    json_hint='只输出 JSON：{"items":["..."]}',
+                    fallback=lambda a, c: {"items": ["兜底"]},
+                    validate=lambda a, d, c: {"items": [str(x) for x in (d.get("items") or [])][:3]},
+                )
+            )
+
+    r_none = await _DummyTaskAgent(None).run_task("dummy", None)
+    check(
+        "引擎：无模型的任务 → 兜底数据 + scripted",
+        r_none.data.get("items") == ["兜底"] and r_none.source == "scripted",
+        f"{r_none.data}/{r_none.source}",
+    )
+    fake_single = FakeProvider([json.dumps({"items": ["甲", "乙"], "extra": 1}, ensure_ascii=False)])
+    r_ok = await _DummyTaskAgent(fake_single).run_task("dummy", None)
+    check("引擎：单轮 JSON 任务取回结构化数据", r_ok.data.get("items") == ["甲", "乙"] and r_ok.source == "llm", str(r_ok.data))
+    check("引擎：校验器裁剪生效（白名单外的字段被丢）", "extra" not in r_ok.data, str(r_ok.data))
+    check(
+        "引擎：无工具任务只发一次 chat（不进工具循环）",
+        len([s for s in fake_single.seen if s[0] == "chat"]) == 1 and not any(s[0] == "tools" for s in fake_single.seen),
+        str([s[0] for s in fake_single.seen]),
+    )
+    r_bad = await _DummyTaskAgent(FakeProvider(["这不是 JSON"])).run_task("dummy", None)
+    check(
+        "引擎：模型输出不合规 → 回落兜底并标 degraded",
+        r_bad.data.get("items") == ["兜底"] and r_bad.source == "degraded",
+        f"{r_bad.data}/{r_bad.source}",
+    )
+    check(
+        "引擎：未知任务名 → 明确报错而非静默",
+        (await _DummyTaskAgent(None).run_task("no_such", None)).stopped == "error",
+        "",
+    )
+
+
+async def run_unit_npc():
+    """NPC 子系统校验：人物卡、别名、反应采样、记忆隔离、DM 只见卡不见流水账。"""
+    print("== 进程内校验：NPC 子系统（人物卡 / 反应权重 / 记忆隔离） ==")
+    store = ScriptStore(SCRIPT)
+    start = store.start_scene
+
+    # --- 1. 剧本原生 NPC 被播种（它们本来就有身份/风格，不消耗模型调用）---
+    svc = NpcService(store, agent=None)
+    zhou = svc.registry.resolve("老周")
+    check("NPC：剧本原生 NPC 被播种", zhou is not None and zhou.role == "古堡看守", str(svc.index()))
+    check("NPC：原生卡带原型与特质", bool(zhou.traits) and zhou.from_script, str(zhou.to_dict())[:80])
+
+    # --- 2. 无模型：为剧本外 NPC 建档 → 原型兜底 ---
+    check("NPC：原型推断（摊贩→平民）", infer_archetype("摊贩") in ("平民", "商人"), infer_archetype("摊贩"))
+    card = await svc.ensure_card("王二", role="沿街摊贩")
+    check("NPC：无模型也能建档（原型兜底）", card is not None and not card.generated, str(card.to_dict())[:80])
+    check("NPC：兜底卡带完整特质轴", all(k in card.traits for k in ARCHETYPES[card.archetype]["traits"]), str(card.traits))
+
+    # --- 3. 有模型：persona 任务生成卡片（特质 clamp、别名入库）---
+    persona_json = json.dumps(
+        {
+            "name": "阿福",
+            "role": "客栈跑堂",
+            "summary": "机灵但胆小，见谁都陪笑。",
+            "traits": {"胆量": 1.7, "攻击性": -0.5, "守序": 0.6, "记仇": 0.2, "贪财": 0.7, "好说话": 0.8},
+            "voice": "点头哈腰，句尾常带「客官」。",
+            "goals": ["攒钱盘下客栈"],
+            "fears": ["挨打", "丢差事"],
+            "knows": "后院住着一位不肯露面的客人",
+            "aliases": ["小福子"],
+        },
+        ensure_ascii=False,
+    )
+    svc2 = NpcService(store, agent=AssistantAgent(store, FakeProvider([persona_json])))
+    afu = await svc2.ensure_card("阿福", role="客栈跑堂")
+    check("NPC：模型生成人物卡", afu is not None and afu.generated, str(afu.to_dict())[:80])
+    check("NPC：超范围特质被夹到 [0,1]", afu.traits["胆量"] == 1.0 and afu.traits["攻击性"] == 0.0, str(afu.traits))
+    check("NPC：模型给的别称入索引（外号可命中）", svc2.registry.resolve("小福子") is afu, str(afu.aliases))
+
+    # --- 4. 别名：玩家给外号 → 归并 + 文本识别 ---
+    check("NPC：新增外号可解析", svc2.registry.add_alias(afu.id, "小跑堂") and svc2.registry.resolve("小跑堂") is afu, "")
+    hits = svc2.registry.detect("我拍了下小跑堂的肩膀")
+    check("NPC：从行动文本里认出 NPC（含外号）", any(c.id == afu.id for c in hits), str([c.name for c in hits]))
+
+    # --- 5. react：权重的来源与「骰点不出自模型」---
+    dice.seed(20261010)
+    r1 = await svc2.react(zhou, "亚瑟 对 老周：「我一拳打在老周脸上」")
+    check("NPC：反应采样给出候选与落点", bool(r1["options"]) and r1["chosen"] in [o["label"] for o in r1["options"]], str(r1))
+    dice.seed(20261010)
+    r2 = await svc2.react(zhou, "亚瑟 对 老周：「我一拳打在老周脸上」")
+    check("NPC：同一骰子种子可复现同一次采样", r1["chosen"] == r2["chosen"] and r1["roll"] == r2["roll"], f"{r1}/{r2}")
+    # 模型只给权重、不出骰点：权重被原样采纳，落点由 dice 决定
+    react_json = json.dumps({"options": [{"label": "忍气吞声", "weight": 0.9}, {"label": "呼救报官", "weight": 0.1}]}, ensure_ascii=False)
+    # 第一个回复留给 ensure_card 的 persona（给空对象 → 原型兜底），第二个给 react
+    svc3 = NpcService(store, agent=AssistantAgent(store, FakeProvider(["{}", react_json])))
+    c3 = await svc3.ensure_card("李四", role="平民")
+    dice.seed(7)
+    r3 = await svc3.react(c3, "有人推了李四一把")
+    check("NPC：模型给出的权重被采纳", [o["label"] for o in r3["options"]] == ["忍气吞声", "呼救报官"], str(r3["options"]))
+    dice.seed(7)
+    check("NPC：落点由服务端骰子决定（可复现）", dice.weighted_pick([0.9, 0.1])[0] == dice.weighted_pick([0.9, 0.1])[0], "")
+    check("NPC：模型输出里没有骰点字段", "roll" not in react_json and "dice" not in react_json, "")
+
+    # --- 6. 骰子采样边界 ---
+    check("骰子：空权重表 → (-1,0,0)", dice.weighted_pick([]) == (-1, 0.0, 0.0), str(dice.weighted_pick([])))
+    dice.seed(3)
+    idx0 = dice.weighted_pick([0, 0, 0])[0]
+    check("骰子：权重全 0 → 退化为等概率（落在合法范围）", 0 <= idx0 <= 2, str(idx0))
+
+    # --- 7. 记忆隔离：DM 只见「人物卡 + 快照」，不见流水账 ---
+    svc.remember(zhou.id, "亚瑟", "亚瑟一拳打在老周脸上（秘密流水账）", turn=3, polarity=-0.25)
+    pub = svc.card_public(zhou)
+    check("NPC：对外快照带好感度（提炼结论）", "status" in pub, str(pub.get("status")))
+    brief = svc.briefs_for([zhou])
+    check("NPC：给 DM 的素材不含记忆流水账", "秘密流水账" not in brief, brief[:80])
+    check("NPC：给 DM 的素材含人物卡要点", zhou.name in brief and (zhou.summary[:6] in brief), brief[:80])
+    # 放进 DM 的实际请求里也不该出现流水账
+    state = GameState(store, start)
+    state.add_player("亚瑟", {"cls": "战士"})
+    ctx = NarratorContext(state=state, player_name="亚瑟", npc_brief=brief)
+    fake = FakeProvider([_reply(tool_call("finish", {"narration": "老周缩了缩脖子。"}))])
+    await NarratorAgent(store, fake, npc=svc).run(ctx, "我打了老周")
+    sent_blob = json.dumps(fake.seen[0][1], ensure_ascii=False)
+    check("NPC：DM 请求里含人物卡", "老周" in sent_blob, "")
+    check("NPC：DM 请求里不含记忆流水账", "秘密流水账" not in sent_blob, "")
+
+    # --- 8. 工具：接了 NPC 子系统才有 npc_card / npc_introduce ---
+    n_with = NarratorAgent(store, None, npc=svc)
+    names_with = [t.name for t in n_with.build_tools(ctx)]
+    n_without = NarratorAgent(store, None)
+    names_without = [t.name for t in n_without.build_tools(ctx)]
+    check("NPC：接子系统的 DM 有 npc_card / npc_introduce 工具",
+          "npc_card" in names_with and "npc_introduce" in names_with, str(names_with))
+    check("NPC：没接子系统的 DM 没有 NPC 工具",
+          "npc_card" not in names_without and "npc_introduce" not in names_without, str(names_without))
+    check("NPC：npc_card 不下发记忆流水账",
+          "秘密流水账" not in json.dumps(n_with._t_npc_card(ctx, "老周"), ensure_ascii=False), "")
+
+    # --- 9. 反应选项数封顶 + 空选项走兜底 ---
+    many = json.dumps({"options": [{"label": f"选项{i}", "weight": 0.1} for i in range(9)]}, ensure_ascii=False)
+    svc4 = NpcService(store, agent=AssistantAgent(store, FakeProvider(["{}", many])))
+    c4 = await svc4.ensure_card("赵五", role="卫兵")
+    r4 = await svc4.react(c4, "有人骂了赵五")
+    check("NPC：反应选项数被截到 5 以内", len(r4["options"]) <= 5, str(len(r4["options"])))
+    svc5 = NpcService(store, agent=AssistantAgent(store, FakeProvider(["{}", json.dumps({"options": []})])))
+    c5 = await svc5.ensure_card("钱六", role="商人")
+    r5 = await svc5.react(c5, "有人抢了钱六的钱袋")
+    check("NPC：模型给空选项 → 回落原型 stance", bool(r5["options"]) and r5["source"] == "fallback", str(r5)[:100])
+
 
 def http_base():
     ws_url = os.environ.get("RPGBAR_WS_URL", "ws://127.0.0.1:8000/ws")
@@ -722,7 +894,7 @@ async def run_live():
 
 
 async def run_live_version():
-    """校验 /api/version（版本号是发版机制的一环，打包后也必须可用）。"""
+    """校验 /api/version 与 /api/net（版本号与联机地址是发版机制/联机的一环）。"""
     import httpx
 
     try:
@@ -732,6 +904,20 @@ async def run_live_version():
         check("联机：/api/version 返回剧本名", bool(data.get("script")), str(data))
     except Exception as e:
         print(f"  [SKIP] /api/version 不可用：{e}")
+
+    try:
+        r = httpx.get(http_base() + "/api/net", timeout=8, trust_env=False)
+        data = r.json()
+        addrs = data.get("addresses") or []
+        check("联机：/api/net 返回地址列表", r.status_code == 200 and len(addrs) >= 1, str(data))
+        check(
+            "联机：/api/net 每项都带可分享 URL",
+            all(a.get("url", "").startswith("http://") and a.get("ip") for a in addrs),
+            str(addrs),
+        )
+        check("联机：/api/net 不含回环地址", all(not a["ip"].startswith("127.") for a in addrs), str(addrs))
+    except Exception as e:
+        print(f"  [SKIP] /api/net 不可用：{e}")
 
 
 async def collect(ws, count, timeout=8.0):
@@ -998,12 +1184,130 @@ async def run_live_scripts():
         print(f"  [SKIP] 剧本接口不可用：{e}")
 
 
+async def run_live_room_script():
+    """建房时选剧本 → 朋友连入自动同步剧本与两份 Agent prompt。"""
+    print("== 实时房间剧本同步校验（需服务器已启动） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过")
+        return
+
+    import httpx
+
+    try:
+        listing = httpx.get(http_base() + "/api/scripts", timeout=8, trust_env=False).json()
+    except Exception as e:
+        print(f"  [SKIP] /api/scripts 不可用：{e}")
+        return
+    items = [s for s in listing.get("scripts", []) if not s.get("error")]
+    if len(items) < 2:
+        print("  [SKIP] 需要至少两个剧本才能验证「建房选剧本」")
+        return
+    active = listing.get("active")
+    pick = next((s for s in items if s["path"] != active), items[0])
+
+    url = ws_url()
+    room = "SCR" + str(int(time.time() * 1000) % 100000)
+    try:
+        a = await websockets.connect(url, proxy=None)
+    except Exception as e:
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
+        return
+
+    b = None
+    try:
+        await a.send(
+            json.dumps(
+                {"type": "join", "name": "房主", "room": room, "script": pick["path"], "character": {"cls": "战士"}},
+                ensure_ascii=False,
+            )
+        )
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        si = (wa or {}).get("script_info") or {}
+        check("联机：建房时选中的剧本生效", si.get("path") == pick["path"], f"{si.get('path')} != {pick['path']}")
+        chunks = (wa or {}).get("chunks") or []
+        check("联机：welcome 同步切片清单", len(chunks) == si.get("chunks"), f"{len(chunks)} vs {si.get('chunks')}")
+        prompt = (wa or {}).get("prompt") or {}
+        check("联机：房主收到 DM prompt", bool(prompt.get("dm")))
+        check("联机：所有人收到小助手 prompt", bool(prompt.get("advisor")))
+        check("联机：DM 与小助手 prompt 不相同", prompt.get("dm") != prompt.get("advisor"))
+
+        # 朋友用同一个房间码加入（不带剧本）→ 应自动同步到房主选的剧本
+        b = await websockets.connect(url, proxy=None)
+        await b.send(
+            json.dumps({"type": "join", "name": "朋友", "room": room, "character": {"cls": "法师"}}, ensure_ascii=False)
+        )
+        b_msgs = await collect(b, 4)
+        wb = next((m for m in b_msgs if m["type"] == "welcome"), None)
+        sb = (wb or {}).get("script_info") or {}
+        check("联机：朋友加入后同步到房主选的剧本", sb.get("path") == pick["path"], str(sb.get("path")))
+        pb = (wb or {}).get("prompt") or {}
+        check("联机：非房主拿不到 DM prompt", pb.get("dm") in (None, ""), str(pb.get("dm"))[:40])
+        check("联机：非房主仍拿到小助手 prompt", bool(pb.get("advisor")))
+    except Exception as e:  # noqa: BLE001
+        print(f"  [ERROR] {type(e).__name__}: {e}")
+    finally:
+        for conn in (b, a):
+            try:
+                if conn is not None:
+                    await conn.close()
+            except Exception:
+                pass
+
+
+async def run_live_npc():
+    """实时：NPC 子系统在房间里的接线（无模型也跑得通：原型兜底 + 骰子采样）。"""
+    print("== 实时校验：NPC 子系统（人物卡同步 / 与 NPC 互动不崩） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过实时校验")
+        return
+    room = "NPC" + str(int(time.time()))[-4:]
+    url = ws_url()
+    try:
+        a = await websockets.connect(url, proxy=None)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [SKIP] 无法连接服务器 {url}：{e}")
+        return
+    try:
+        await a.send(json.dumps({"type": "join", "name": "甲", "room": room, "character": {"cls": "战士"}}, ensure_ascii=False))
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        npcs = (wa or {}).get("npcs") or []
+        check("NPC 实时：welcome 同步本房间 NPC 列表", any(n.get("name") == "老周" for n in npcs), str(npcs)[:140])
+        check("NPC 实时：NPC 卡带身份", any(n.get("role") for n in npcs), str(npcs)[:140])
+
+        await a.send(json.dumps({"type": "action", "text": "我打了老周一拳"}, ensure_ascii=False))
+        got, deadline = [], time.time() + 10
+        while time.time() < deadline:
+            try:
+                m = json.loads(await asyncio.wait_for(a.recv(), timeout=max(0.1, deadline - time.time())))
+            except asyncio.TimeoutError:
+                break
+            got.append(m)
+            if m.get("type") == "state":
+                break
+        check("NPC 实时：与 NPC 互动过程无 error", not any(m.get("type") == "error" for m in got), str(got)[:160])
+        check("NPC 实时：互动产出了旁白/骰子", any(m.get("type") in ("narration", "dice") for m in got), str([m.get("type") for m in got]))
+        st_npcs = (got[-1].get("state", {}).get("npcs") if got and got[-1].get("type") == "state" else None)
+        check("NPC 实时：state 持续携带 NPC 列表", isinstance(st_npcs, list) and len(st_npcs) >= 1, str(st_npcs)[:140])
+    except Exception as e:  # noqa: BLE001
+        print(f"  [ERROR] {type(e).__name__}: {e}")
+    finally:
+        try:
+            await a.close()
+        except Exception:
+            pass
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
     await run_unit()
     await run_unit_totsk()
     await run_unit_agents()
+    await run_unit_npc()
     await run_unit_scripts()
     if not unit_only:
         await run_live()
@@ -1012,6 +1316,8 @@ async def main():
         await run_live_configure()
         await run_live_model_test()
         await run_live_scripts()
+        await run_live_room_script()
+        await run_live_npc()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")
     sys.exit(1 if FAIL else 0)
 

@@ -103,6 +103,41 @@ function startFakeLLM() {
 
   check("app.js 执行无异常", jsErrors.length === 0, jsErrors.join(" | "));
 
+  // ---- 联机地址（/api/net）：加入页与设置抽屉都该列出可分享地址 ----
+  // 轮询等待 loadNet 的 fetch 回来（Node 首次 fetch 有连接池预热，固定 sleep 不可靠）
+  for (let i = 0; i < 40 && w.document.querySelectorAll("#share-list .share-addr").length === 0; i++) {
+    await sleep(50);
+  }
+  const shareBox = $("share-box");
+  check("加入页出现「联机地址」折叠块", !!shareBox && !shareBox.classList.contains("hidden"));
+  const shareItems = w.document.querySelectorAll("#share-list .share-addr");
+  check("联机地址列表已填充", shareItems.length >= 1, String(shareItems.length));
+  check(
+    "地址条以 http:// 开头且带网卡名标签",
+    shareItems.length > 0 && shareItems[0].textContent.indexOf("http://") === 0,
+    shareItems.length ? shareItems[0].textContent : ""
+  );
+  check(
+    "设置抽屉里也能看到联机地址",
+    w.document.querySelectorAll("#share-list-drawer .share-addr").length >= 1,
+    String(w.document.querySelectorAll("#share-list-drawer .share-addr").length)
+  );
+
+  // ---- 建房选剧本：加入页下拉由 /api/scripts 填充；填了房号则由房主决定（置灰）----
+  for (let i = 0; i < 40 && (!$("join-script") || $("join-script").options.length === 0); i++) {
+    await sleep(50);
+  }
+  const joinScript = $("join-script");
+  check("加入页有「开局剧本」下拉", !!joinScript);
+  check("下拉已被剧本列表填充", !!joinScript && joinScript.options.length >= 1, joinScript ? String(joinScript.options.length) : "无");
+  const pickedScript = joinScript ? joinScript.value : "";
+  $("join-room").value = "ABC12";
+  $("join-room").dispatchEvent(new w.Event("input", { bubbles: true }));
+  check("填了房号后剧本下拉置灰（由房主决定）", !!joinScript && joinScript.disabled === true);
+  $("join-room").value = "";
+  $("join-room").dispatchEvent(new w.Event("input", { bubbles: true }));
+  check("清空房号后剧本下拉恢复可选", !!joinScript && joinScript.disabled === false);
+
   // ---- 模拟进入房间 ----
   $("join-name").value = "亚瑟";
   $("join-form").dispatchEvent(new w.Event("submit", { bubbles: true, cancelable: true }));
@@ -110,6 +145,11 @@ function startFakeLLM() {
   const ws = FakeWS.last;
   check("提交加入后建立了 WebSocket", !!ws, "无 ws");
   check("onopen 后发出 join 消息", sent.some((m) => m.type === "join" && m.name === "亚瑟"), JSON.stringify(sent));
+  check(
+    "建房时 join 消息带上所选剧本",
+    !!pickedScript && sent.some((m) => m.type === "join" && m.script === pickedScript),
+    JSON.stringify(sent)
+  );
 
   ws.deliver({
     type: "welcome",
@@ -117,22 +157,59 @@ function startFakeLLM() {
     you: "亚瑟",
     late: false,
     script: "古堡秘宝",
+    script_info: {
+      title: "古堡秘宝",
+      path: "sample_script.json",
+      fmt: "json",
+      structured: true,
+      scenes: 5,
+      flags: 5,
+      chunks: 6,
+      warnings: [],
+    },
+    chunks: [
+      { id: "meta", title: "剧本设定", kind: "meta", chars: 120 },
+      { id: "gate", title: "古堡大门", kind: "scene", chars: 220 },
+    ],
+    npcs: [
+      { id: "npc01", name: "老周", role: "古堡看守", aliases: ["周老头"], from_script: true },
+    ],
+    prompt: { advisor: "（小助手公开版 prompt）", dm: "（DM 完整版 prompt）" },
     agents: {
       owner: "亚瑟",
       dm: { kind: "off", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: false, ready: false, mode: "scripted" },
+      assistant: { kind: "off", base_url: "http://127.0.0.1:8081/v1", model: "qwen2.5-3b-instruct", has_api_key: false, ready: false, mode: "scripted" },
       advisor: { kind: "off", base_url: "http://127.0.0.1:8080/v1", model: "local-model", has_api_key: false, ready: false, mode: "scripted" },
     },
   });
   check("welcome 后顶栏显示房间码", $("room-code").textContent === "ABC12", $("room-code").textContent);
   check("welcome 后品牌名跟随剧本", (q(".brand-name") || {}).textContent === "RPGBar · 古堡秘宝", (q(".brand-name") || {}).textContent);
   check("模型状态胶囊显示脚本化", $("model-pill").textContent === "模型：脚本化", $("model-pill").textContent);
+  // 「本房间」同步块：剧本 + 切片 + 两份 prompt（房主能看到 DM 那份）
+  const syncEl = $("room-sync");
+  check("welcome 后同步块显示剧本名", !!syncEl && (syncEl.textContent || "").indexOf("古堡秘宝") >= 0, syncEl ? syncEl.textContent : "无");
+  check("同步块列出切片", w.document.querySelectorAll("#room-sync .room-sync-chunks .script-slot").length === 2,
+    String(w.document.querySelectorAll("#room-sync .room-sync-chunks .script-slot").length));
+  check("房主能看到两份 prompt", w.document.querySelectorAll("#room-sync .prompt-block").length === 2,
+    String(w.document.querySelectorAll("#room-sync .prompt-block").length));
+
+  // ---- 在场人物：welcome 里的 npcs 应渲染到侧栏（人物卡由主机小助手生成，连入即同步）----
+  const npcItems = w.document.querySelectorAll("#npcs li");
+  check("侧栏渲染出在场人物", npcItems.length === 1, String(npcItems.length));
+  check("NPC 条目显示名字", npcItems.length > 0 && npcItems[0].querySelector(".npc-name").textContent === "老周",
+    npcItems.length ? npcItems[0].textContent : "无");
+  check("NPC 条目带身份标签", npcItems.length > 0 && npcItems[0].querySelector(".npc-role").textContent.indexOf("古堡看守") >= 0,
+    npcItems.length ? npcItems[0].textContent : "无");
+  check("NPC 条目以 tooltip 收别名（外号）", npcItems.length > 0 && (npcItems[0].title || "").indexOf("周老头") >= 0,
+    npcItems.length ? npcItems[0].title : "无");
 
   // ---- 打开设置 ----
   $("settings-btn").click();
   check("点击「模型」后抽屉打开", !$("settings-drawer").classList.contains("hidden"));
   check("遮罩同时出现", !$("settings-overlay").classList.contains("hidden"));
-  check("渲染出两个槽位卡片", !!$("card-dm") && !!$("card-advisor"));
+  check("渲染出三个槽位卡片", !!$("card-dm") && !!$("card-assistant") && !!$("card-advisor"));
   check("DM 卡片未被锁（我是房主）", !$("card-dm").classList.contains("locked"));
+  check("主机小助手卡片未被锁（我是房主）", !$("card-assistant").classList.contains("locked"));
   check("初始徽标为「未接入（脚化）」", $("badge-dm").textContent.indexOf("未接入") === 0, $("badge-dm").textContent);
 
   // ---- 切到本地模型 ----
@@ -162,6 +239,17 @@ function startFakeLLM() {
   aInputs[1].dispatchEvent(new w.Event("input", { bubbles: true }));
   aInputs[2].value = "deepseek-chat";
   aInputs[2].dispatchEvent(new w.Event("input", { bubbles: true }));
+
+  // ---- 主机小助手槽位切到本地模型并填地址（房主可配）----
+  $("card-assistant").querySelectorAll(".seg button")[2].click();
+  const asst = $("card-assistant");
+  const asstInputs = asst.querySelectorAll(".field input");
+  check("小助手切本地模型后出现地址框", asstInputs.length === 2, String(asstInputs.length));
+  check("小助手默认填入 8081 地址", asstInputs[0].value.indexOf("127.0.0.1:8081") > 0, asstInputs[0].value);
+  asstInputs[0].value = "http://127.0.0.1:" + FAKE_LLM_PORT + "/v1";
+  asstInputs[0].dispatchEvent(new w.Event("input", { bubbles: true }));
+  asstInputs[1].value = "assistant-model";
+  asstInputs[1].dispatchEvent(new w.Event("input", { bubbles: true }));
 
   // ---- 测试连接（走真实链路：浏览器 → 服务端 /api/models/test → 假 LLM） ----
   const testBtn = $("card-dm").querySelector(".slot-actions .btn");
@@ -222,19 +310,22 @@ function startFakeLLM() {
   check("保存后发出 configure 消息", !!cfg, JSON.stringify(sent));
   check("configure 带上 DM 槽位（房主）", !!cfg && cfg.dm && cfg.dm.kind === "local", JSON.stringify(cfg && cfg.dm));
   check("configure 带上助手槽位与 key", !!cfg && cfg.advisor && cfg.advisor.kind === "cloud" && cfg.advisor.api_key === "sk-ui-check", JSON.stringify(cfg && cfg.advisor));
+  check("configure 带上主机小助手槽位（房主）", !!cfg && cfg.assistant && cfg.assistant.kind === "local" && cfg.assistant.model === "assistant-model", JSON.stringify(cfg && cfg.assistant));
   check("本机保存了设置（localStorage）", !!w.localStorage.getItem("rpgbar.models"), String(w.localStorage.getItem("rpgbar.models")).slice(0, 60));
 
   // ---- 服务端回执后徽标/胶囊刷新 ----
   ws.deliver({
     type: "agent_status",
-    changed: ["dm", "advisor"],
+    changed: ["dm", "assistant", "advisor"],
     agents: {
       owner: "亚瑟",
       dm: { kind: "local", base_url: "http://127.0.0.1:8123/v1", model: "fake-model", has_api_key: false, ready: true, mode: "model" },
+      assistant: { kind: "local", base_url: "http://127.0.0.1:8123/v1", model: "assistant-model", has_api_key: false, ready: true, mode: "model" },
       advisor: { kind: "cloud", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: true, ready: true, mode: "model" },
     },
   });
   check("DM 徽标变为已连接", $("badge-dm").className.indexOf("on") >= 0 && $("badge-dm").textContent.indexOf("已连接") === 0, $("badge-dm").textContent);
+  check("主机小助手徽标变为已连接", $("badge-assistant").className.indexOf("on") >= 0 && $("badge-assistant").textContent.indexOf("已连接") === 0, $("badge-assistant").textContent);
   check("顶栏胶囊显示 DM+助手", $("model-pill").textContent === "模型：DM + 助手", $("model-pill").textContent);
 
   // ---- 非房主：DM 锁死 ----
@@ -244,6 +335,7 @@ function startFakeLLM() {
     agents: {
       owner: "别人",
       dm: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "scripted" },
+      assistant: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "scripted" },
       advisor: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "scripted" },
     },
   });
@@ -253,6 +345,9 @@ function startFakeLLM() {
   check("非房主时 DM 卡片被锁", $("card-dm").classList.contains("locked"), $("card-dm").className);
   check("非房主时 DM 无法切换模式", $("card-dm").querySelectorAll(".seg button")[0].disabled === true);
   check("非房主时给出说明文案", $("card-dm").querySelector(".lock-note").textContent.indexOf("房主") >= 0, $("card-dm").querySelector(".lock-note").textContent);
+  check("非房主时主机小助手卡片被锁", $("card-assistant").classList.contains("locked"), $("card-assistant").className);
+  check("非房主时主机小助手无法切换模式", $("card-assistant").querySelectorAll(".seg button")[0].disabled === true);
+  check("非房主时玩家小助手仍可编辑", !$("card-advisor").classList.contains("locked"), $("card-advisor").className);
   const scriptBtns = $("script-card").querySelectorAll(".slot-actions .btn");
   check("非房主时剧本卡片也被锁", $("script-card").querySelector(".lock-note").textContent.indexOf("房主") >= 0, "");
   check("非房主不能「设为活动剧本」", scriptBtns[1].disabled === true, "disabled=" + scriptBtns[1].disabled);

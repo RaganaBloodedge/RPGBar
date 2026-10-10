@@ -1,0 +1,96 @@
+name: CI
+
+# 项目自带两级校验：scripts/smoke_test.py（进程内 + 实时联机）与 scripts/ui_check.js（前端 DOM）。
+# 此前只能手动跑，这里把它们接到 push / PR 上，每次改动都能自动拿到结论。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支连续推送时，取消上一轮还没跑完的任务，省 runner 时间
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 进程内校验：不起服务器，验 DM 流水线 / RAG / 状态机 / 骰子 / 剧本切片 / Agent 提示词分层。
+  # 顺手覆盖「版本号与 CHANGELOG 一致」这条约定。
+  unit:
+    name: 进程内校验（${{ matrix.os }} · py${{ matrix.python-version }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 进程内冒烟测试
+        run: python scripts/smoke_test.py --unit
+
+  # 实时联机校验：真起服务器，跑全量冒烟（WebSocket 建房 / 行动 / 骰子 / 中途加入 / 剧本接口），
+  # 再用 jsdom 真跑一遍 web/app.js，验模型设置抽屉的 DOM 与事件绑定。
+  integration:
+    name: 实时联机 + 前端 DOM 校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          npm install jsdom --no-save --no-fund --no-audit
+
+      # smoke_test.py 与 ui_check.js 都要求服务器已在本机 8000 端口跑起来
+      - name: 启动服务器并等待就绪
+        run: |
+          python -m server.main > server.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:8000/api/version > /dev/null; then
+              echo "服务器已就绪"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "服务器 60 秒内未就绪"
+          cat server.log
+          exit 1
+
+      - name: 全量冒烟测试（含实时联机）
+        run: python scripts/smoke_test.py
+
+      - name: 前端 DOM 校验
+        run: node scripts/ui_check.js
+
+      - name: 失败时打印服务器日志
+        if: failure()
+        run: cat server.log

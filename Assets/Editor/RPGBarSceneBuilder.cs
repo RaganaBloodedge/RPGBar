@@ -38,18 +38,37 @@ namespace RPGBar.EditorTools
             root.AddComponent<GameBootstrap>();
 
             bool saved = EditorSceneManager.SaveScene(scene, ScenePath);
+
+            // 注意顺序：先改 EditorBuildSettings，再 SaveAssets()。
+            // 反过来的话这次改动只留在内存里，编辑器一退出就丢了（磁盘上仍是旧场景）。
+            EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene(ScenePath, true) };
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
-
-            EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene(ScenePath, true) };
 
             if (saved) Debug.Log($"[RPGBar] 主场景已生成：{ScenePath}");
             else Debug.LogError($"[RPGBar] 主场景保存失败：{ScenePath}");
         }
+
+        /// <summary>保证 Build Settings 里只有主场景（第一个即启动场景）。</summary>
+        public static void EnsureBuildSettings()
+        {
+            var scenes = EditorBuildSettings.scenes;
+            bool ok = scenes.Length == 1 && scenes[0].path == ScenePath && scenes[0].enabled;
+
+            if (!ok)
+            {
+                EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene(ScenePath, true) };
+                Debug.Log($"[RPGBar] Build Settings 已指向 {ScenePath}");
+            }
+
+            // 无论改没改都落盘：EditorBuildSettings.scenes 赋值只改内存，
+            // 不 SaveAssets() 的话编辑器一关就回滚成磁盘上的旧值。
+            AssetDatabase.SaveAssets();
+        }
     }
 
     /// <summary>
-    /// 打开工程时自动补上主场景（若尚未生成），并写进 Build Settings。
+    /// 打开工程时自动补上主场景（若尚未生成），并把 Build Settings 校正到主场景。
     /// 有了它，第一次打开工程就会自动建好场景，不需要手动点菜单。
     /// </summary>
     [InitializeOnLoad]
@@ -59,8 +78,12 @@ namespace RPGBar.EditorTools
         {
             EditorApplication.delayCall += () =>
             {
-                if (File.Exists(RPGBarSceneBuilder.ScenePath)) return;
-                RPGBarSceneBuilder.BuildMainScene();
+                if (!File.Exists(RPGBarSceneBuilder.ScenePath))
+                {
+                    RPGBarSceneBuilder.BuildMainScene();
+                    return;
+                }
+                RPGBarSceneBuilder.EnsureBuildSettings();
             };
         }
     }

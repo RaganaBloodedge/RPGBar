@@ -2,6 +2,7 @@
 //
 // 场景里只需要一个挂着本组件的空物体，其余对象（Canvas、EventSystem、UI 层级）都在运行时创建。
 using System.Text;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace RPGBar
@@ -22,7 +23,7 @@ namespace RPGBar
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void AutoBoot()
         {
-            if (FindFirstObjectByType<GameBootstrap>() != null) return;
+            if (FindAnyObjectByType<GameBootstrap>() != null) return;
             var go = new GameObject("RPGBar");
             go.AddComponent<GameBootstrap>();
         }
@@ -95,11 +96,11 @@ namespace RPGBar
             if (!_joined) _ui.ShowJoinPanel(true);
         }
 
-        void HandleWelcome(JsonValue m)
+        void HandleWelcome(JObject m)
         {
             _joined = true;
-            _roomCode = m["room"].AsString();
-            _scriptName = m["script"].AsString();
+            _roomCode = m["room"].Str();
+            _scriptName = m["script"].Str();
 
             _ui.ShowJoinPanel(false);
             _ui.ClearLog();
@@ -108,47 +109,47 @@ namespace RPGBar
             _ui.FocusActionInput();
 
             _ui.AppendLog("", $"已加入房间 {_roomCode}（剧本：《{_scriptName}》）", GameUI.LogKind.System);
-            if (m["late"].AsBool()) _ui.AppendLog("", "你是中途加入的，下面会把已发生的剧情告诉你。", GameUI.LogKind.System);
+            if (m["late"].Bool()) _ui.AppendLog("", "你是中途加入的，下面会把已发生的剧情告诉你。", GameUI.LogKind.System);
 
             var agents = m["agents"];
-            if (agents != null && !agents.IsNull)
+            if (agents.Has())
             {
                 var sb = new StringBuilder("模型槽位：");
                 sb.Append($"DM={SlotBrief(agents["dm"])}");
-                if (agents["assistant"] != null && !agents["assistant"].IsNull)
+                if (agents["assistant"].Has())
                     sb.Append($"｜主机小助手={SlotBrief(agents["assistant"])}");
                 sb.Append($"｜小助手={SlotBrief(agents["advisor"])}");
                 _ui.AppendLog("", sb.ToString(), GameUI.LogKind.System);
             }
         }
 
-        static string SlotBrief(JsonValue slot)
+        static string SlotBrief(JToken slot)
         {
-            string mode = slot["mode"].AsString("scripted");
+            string mode = slot["mode"].Str("scripted");
             if (mode == "scripted") return "未接入（脚本化）";
-            string model = slot["model"].AsString();
+            string model = slot["model"].Str();
             return string.IsNullOrEmpty(model) ? mode : model;
         }
 
-        void HandleState(JsonValue state)
+        void HandleState(JToken state)
         {
             _ui.SetSidebar(_roomCode, _scriptName, state);
         }
 
-        void HandleNarration(JsonValue m)
+        void HandleNarration(JObject m)
         {
-            string author = m["author"].AsString("DM");
-            string text = m["text"].AsString();
+            string author = m["author"].Str("DM");
+            string text = m["text"].Str();
             if (string.IsNullOrEmpty(text)) return;
             _ui.AppendLog(author, text, author == "DM" ? GameUI.LogKind.Dm : GameUI.LogKind.Player);
         }
 
-        void HandleDice(JsonValue m)
+        void HandleDice(JObject m)
         {
-            string player = m["player"].AsString();
-            string skill = m["skill"].AsString();
-            int dc = m["dc"].AsInt();
-            int roll = m["roll"].AsInt();
+            string player = m["player"].Str();
+            string skill = m["skill"].Str();
+            int dc = m["dc"].Int();
+            int roll = m["roll"].Int();
             var success = m["success"];
 
             string line;
@@ -158,17 +159,17 @@ namespace RPGBar
             }
             else
             {
-                string verdict = success.IsNull ? "" : (success.AsBool() ? "  成功" : "  失败");
+                string verdict = success.Has() ? (success.Bool() ? "  成功" : "  失败") : "";
                 line = $"{player} 的「{skill}」检定：d20 = {roll}，DC {dc}{verdict}";
             }
-            if (!string.IsNullOrEmpty(m["flag"].AsString())) line += "（线索到手）";
+            if (!string.IsNullOrEmpty(m["flag"].Str())) line += "（线索到手）";
 
             _ui.AppendLog("", line, GameUI.LogKind.Dice);
         }
 
-        void HandleSuggestions(JsonValue m)
+        void HandleSuggestions(JObject m)
         {
-            var options = m["options"].AsList();
+            var options = JsonUtil.Arr(m["options"]);
             if (options.Count == 0)
             {
                 _ui.AppendLog("", "小助手这次没给出建议。", GameUI.LogKind.System);
@@ -177,53 +178,53 @@ namespace RPGBar
 
             var sb = new StringBuilder("小助手建议：");
             for (int i = 0; i < options.Count; i++)
-                sb.Append($"\n{i + 1}. {options[i].AsString()}");
+                sb.Append($"\n{i + 1}. {options[i].Str()}");
             _ui.AppendLog("", sb.ToString(), GameUI.LogKind.System);
         }
 
-        void HandleRecap(JsonValue m)
+        void HandleRecap(JObject m)
         {
             var recap = m["recap"];
-            if (recap == null || recap.IsNull) return;
+            if (!recap.Has()) return;
 
             var sb = new StringBuilder("【故事回顾】");
-            var path = recap["scene_path"].AsList();
+            var path = JsonUtil.Arr(recap["scene_path"]);
             if (path.Count > 0)
             {
                 sb.Append("\n走过的场景：");
                 for (int i = 0; i < path.Count; i++)
                 {
                     if (i > 0) sb.Append(" → ");
-                    sb.Append(path[i].AsString());
+                    sb.Append(path[i].Str());
                 }
             }
 
-            var flags = recap["flags"].AsList();
+            var flags = JsonUtil.Arr(recap["flags"]);
             if (flags.Count > 0)
             {
                 sb.Append($"\n已获得线索 {flags.Count} 条");
             }
 
-            var recent = recap["recent"].AsList();
+            var recent = JsonUtil.Arr(recap["recent"]);
             foreach (var r in recent)
             {
-                string text = r.IsObject ? r["text"].AsString() : r.AsString();
+                string text = r.Type == JTokenType.Object ? r["text"].Str() : r.Str();
                 if (!string.IsNullOrEmpty(text)) sb.Append($"\n· {text}");
             }
 
             _ui.AppendLog("", sb.ToString(), GameUI.LogKind.System);
         }
 
-        void HandleAgentStatus(JsonValue m)
+        void HandleAgentStatus(JObject m)
         {
-            var changed = m["changed"].AsList();
+            var changed = JsonUtil.Arr(m["changed"]);
             if (changed.Count == 0) return;
 
             var sb = new StringBuilder("模型槽位已更新：");
             for (int i = 0; i < changed.Count; i++)
             {
                 if (i > 0) sb.Append("、");
-                sb.Append(SlotName(changed[i].AsString()));
+                sb.Append(SlotName(changed[i].Str()));
             }
             _ui.AppendLog("", sb.ToString(), GameUI.LogKind.System);
         }

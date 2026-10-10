@@ -1,7 +1,7 @@
 // 与 Python 服务端（server/main.py 的 /ws）通信的 WebSocket 客户端。
 //
 // 设计要点：
-// 1) 用 .NET 内置的 ClientWebSocket（Unity 的 .NET Standard 2.1 自带），不引入第三方库。
+// 1) 用 .NET 内置的 ClientWebSocket（Unity 的 .NET Standard 2.1 自带），不引入第三方网络库。
 // 2) 收包在后台线程，收到的消息只入队；真正的分发在 Update() 主线程做 —— 避免在后台线程碰 Unity API。
 // 3) 发送用信号量串行化，防止多个 async 发送交织导致 WebSocket 帧错乱。
 //
@@ -12,6 +12,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 
 namespace RPGBar
@@ -19,21 +20,21 @@ namespace RPGBar
     public class GameClient : MonoBehaviour
     {
         // —— 服务端 → 客户端 ——
-        public event Action<JsonValue> OnWelcome;
-        public event Action<JsonValue> OnState;
+        public event Action<JObject> OnWelcome;
+        public event Action<JToken> OnState;
         public event Action<string> OnSystemMessage;
-        public event Action<JsonValue> OnNarration;
-        public event Action<JsonValue> OnDice;
-        public event Action<JsonValue> OnSuggestions;
-        public event Action<JsonValue> OnRecap;
-        public event Action<JsonValue> OnAgentStatus;
+        public event Action<JObject> OnNarration;
+        public event Action<JObject> OnDice;
+        public event Action<JObject> OnSuggestions;
+        public event Action<JObject> OnRecap;
+        public event Action<JObject> OnAgentStatus;
         public event Action<string> OnErrorMessage;
         /// <summary>(是否已连上, 说明文本)</summary>
         public event Action<bool, string> OnConnection;
 
         ClientWebSocket _ws;
         CancellationTokenSource _cts;
-        readonly Queue<JsonValue> _inbox = new Queue<JsonValue>();
+        readonly Queue<JObject> _inbox = new Queue<JObject>();
         readonly SemaphoreSlim _sendGate = new SemaphoreSlim(1, 1);
         volatile string _pendingNotice;
 
@@ -58,12 +59,14 @@ namespace RPGBar
             {
                 await _ws.ConnectAsync(new Uri(Endpoint), _cts.Token);
 
-                var join = JsonValue.NewObject()
-                    .Set("type", "join")
-                    .Set("name", PlayerName)
-                    .Set("character", JsonValue.NewObject());
-                if (!string.IsNullOrEmpty(RoomCode)) join.Set("room", RoomCode);
-                if (!string.IsNullOrEmpty(script)) join.Set("script", script);
+                var join = new JObject
+                {
+                    ["type"] = "join",
+                    ["name"] = PlayerName,
+                    ["character"] = new JObject(),
+                };
+                if (!string.IsNullOrEmpty(RoomCode)) join["room"] = RoomCode;
+                if (!string.IsNullOrEmpty(script)) join["script"] = script;
                 await SendRawAsync(join);
 
                 OnConnection?.Invoke(true, "已连接 " + Endpoint);
@@ -104,23 +107,22 @@ namespace RPGBar
         public void SendAction(string text)
         {
             if (string.IsNullOrEmpty(text)) return;
-            _ = SendRawAsync(JsonValue.NewObject().Set("type", "action").Set("text", text.Trim()));
+            _ = SendRawAsync(new JObject { ["type"] = "action", ["text"] = text.Trim() });
         }
 
-        public void SendSuggest() => _ = SendRawAsync(JsonValue.NewObject().Set("type", "suggest"));
+        public void SendSuggest() => _ = SendRawAsync(new JObject { ["type"] = "suggest" });
 
-        public void SendRoll() => _ = SendRawAsync(JsonValue.NewObject().Set("type", "roll"));
+        public void SendRoll() => _ = SendRawAsync(new JObject { ["type"] = "roll" });
 
         /// <summary>运行期改模型槽位。patch 的字段会被平铺到消息顶层（dm / advisor / assistant）。</summary>
-        public void SendConfigure(JsonValue patch)
+        public void SendConfigure(JToken patch)
         {
-            var msg = JsonValue.NewObject().Set("type", "configure");
-            if (patch != null)
-                foreach (var kv in patch.AsPairs()) msg.Set(kv.Key, kv.Value);
+            var msg = new JObject { ["type"] = "configure" };
+            foreach (var kv in JsonUtil.Pairs(patch)) msg[kv.Key] = kv.Value;
             _ = SendRawAsync(msg);
         }
 
-        async Task SendRawAsync(JsonValue payload)
+        async Task SendRawAsync(JToken payload)
         {
             var ws = _ws;
             if (ws == null || ws.State != WebSocketState.Open) return;
@@ -129,7 +131,7 @@ namespace RPGBar
             try
             {
                 if (ws.State != WebSocketState.Open) return;
-                var bytes = Encoding.UTF8.GetBytes(payload.ToJson());
+                var bytes = Encoding.UTF8.GetBytes(JsonUtil.Write(payload));
                 await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
             }
             catch (Exception e)
@@ -171,8 +173,8 @@ namespace RPGBar
 
                     if (sb.Length == 0) continue;
 
-                    var msg = MiniJson.TryParse(sb.ToString());
-                    if (msg == null)
+                    var parsed = JsonUtil.TryParse(sb.ToString());
+                    if (!(parsed is JObject msg))
                     {
                         Debug.LogWarning("[RPGBar] 收到无法解析的消息：" + sb);
                         continue;
@@ -193,7 +195,7 @@ namespace RPGBar
         {
             while (true)
             {
-                JsonValue msg;
+                JObject msg;
                 lock (_inbox)
                 {
                     if (_inbox.Count == 0) break;
@@ -210,22 +212,22 @@ namespace RPGBar
             }
         }
 
-        void Dispatch(JsonValue msg)
+        void Dispatch(JObject msg)
         {
-            switch (msg["type"].AsString())
+            switch (msg["type"].Str())
             {
                 case "welcome": OnWelcome?.Invoke(msg); break;
                 case "state": OnState?.Invoke(msg["state"]); break;
-                case "system": OnSystemMessage?.Invoke(msg["text"].AsString()); break;
+                case "system": OnSystemMessage?.Invoke(msg["text"].Str()); break;
                 case "narration": OnNarration?.Invoke(msg); break;
                 case "dice": OnDice?.Invoke(msg); break;
                 case "suggestions": OnSuggestions?.Invoke(msg); break;
                 case "recap": OnRecap?.Invoke(msg); break;
                 case "agent_status": OnAgentStatus?.Invoke(msg); break;
-                case "error": OnErrorMessage?.Invoke(msg["message"].AsString("未知错误")); break;
+                case "error": OnErrorMessage?.Invoke(msg["message"].Str("未知错误")); break;
                 default:
                     {
-                        string unknown = msg["type"].AsString();
+                        string unknown = msg["type"].Str();
                         Debug.Log("[RPGBar] 未知消息类型：" + unknown);
                         break;
                     }

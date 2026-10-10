@@ -1,4 +1,4 @@
-// 运行时用代码搭出来的 UGUI 界面 —— 不依赖任何 prefab / 美术资源 / 第三方包。
+// 运行时用代码搭出来的 UGUI 界面 —— 不依赖 prefab / 美术资源，只用 Unity 官方包（UGUI + Input System）。
 //
 // 布局：
 //   ┌──────────────────────────┬──────────┐
@@ -9,12 +9,14 @@
 //   └──────────────────────────┴──────────┘
 //   连接面板（覆盖层）：地址 / 名字 / 房间号 / 剧本
 //
-// 之所以全部用代码建：Unity 的 .unity 场景是 YAML，手写易错；而 batchmode 下用
-// Editor 脚本生成场景时，能引用的只有脚本组件，建 UI 交给运行时最稳。
+// 之所以全部用代码建：Unity 的 .unity 场景是 YAML，手写易错；场景文件里只留一个挂
+// GameBootstrap 的根对象，UI 层级交给运行时搭，改布局不用碰场景文件。
 using System;
 using System.Collections.Generic;
+using Newtonsoft.Json.Linq;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem.UI;
 using UnityEngine.UI;
 
 namespace RPGBar
@@ -76,10 +78,12 @@ namespace RPGBar
 
         static void EnsureEventSystem()
         {
-            if (FindFirstObjectByType<EventSystem>() != null) return;
+            if (FindAnyObjectByType<EventSystem>() != null) return;
             var go = new GameObject("EventSystem");
             go.AddComponent<EventSystem>();
-            go.AddComponent<StandaloneInputModule>();
+            // 工程用的是新输入系统（Player Settings → Active Input Handling = Input System Package），
+            // 旧的 StandaloneInputModule 在运行时会报错，必须用 Input System 自己的 UI 模块。
+            go.AddComponent<InputSystemUIInputModule>();
         }
 
         // ---------------------------------------------------------------- 搭建
@@ -322,45 +326,45 @@ namespace RPGBar
         public void SetRoomLabel(string text) => _roomLabel.text = text ?? "";
 
         /// <summary>刷新右侧信息栏。</summary>
-        public void SetSidebar(string roomCode, string script, JsonValue state)
+        public void SetSidebar(string roomCode, string script, JToken state)
         {
             var sb = new System.Text.StringBuilder();
 
-            var players = state?["players"].AsList();
+            var players = JsonUtil.Arr(state?["players"]);
             sb.AppendLine("玩家");
-            if (players == null || players.Count == 0) sb.AppendLine("· （无）");
-            else foreach (var p in players) sb.AppendLine("· " + p.AsString());
+            if (players.Count == 0) sb.AppendLine("· （无）");
+            else foreach (var p in players) sb.AppendLine("· " + p.Str());
 
             sb.AppendLine();
             sb.AppendLine("线索");
-            var flags = state?["flag_details"].AsList();
-            if (flags == null || flags.Count == 0) sb.AppendLine("· （尚未发现）");
+            var flags = JsonUtil.Arr(state?["flag_details"]);
+            if (flags.Count == 0) sb.AppendLine("· （尚未发现）");
             else
                 foreach (var f in flags)
                 {
-                    string label = f["label"].AsString();
-                    sb.AppendLine("· " + (string.IsNullOrEmpty(label) ? f["id"].AsString() : label));
+                    string label = f["label"].Str();
+                    sb.AppendLine("· " + (string.IsNullOrEmpty(label) ? f["id"].Str() : label));
                 }
 
             sb.AppendLine();
             sb.AppendLine("在场人物");
-            var npcs = state?["npcs"].AsList();
-            if (npcs == null || npcs.Count == 0) sb.AppendLine("· （尚未遇到）");
+            var npcs = JsonUtil.Arr(state?["npcs"]);
+            if (npcs.Count == 0) sb.AppendLine("· （尚未遇到）");
             else
                 foreach (var n in npcs)
                 {
-                    string role = n["role"].AsString();
-                    sb.AppendLine("· " + n["name"].AsString() + (string.IsNullOrEmpty(role) ? "" : $"（{role}）"));
+                    string role = n["role"].Str();
+                    sb.AppendLine("· " + n["name"].Str() + (string.IsNullOrEmpty(role) ? "" : $"（{role}）"));
                 }
 
             var memory = state?["memory"];
-            if (memory != null && !memory.IsNull)
+            if (memory.Has())
             {
                 sb.AppendLine();
                 sb.AppendLine("剧情档案");
-                sb.AppendLine($"· 记录 {memory["entries"].AsInt()} 条");
-                if (memory["summary"].AsBool()) sb.AppendLine("· 已有主线摘要");
-                if (memory["semantic"].AsBool()) sb.AppendLine("· 语义检索可用");
+                sb.AppendLine($"· 记录 {memory["entries"].Int()} 条");
+                if (memory["summary"].Bool()) sb.AppendLine("· 已有主线摘要");
+                if (memory["semantic"].Bool()) sb.AppendLine("· 语义检索可用");
             }
 
             _sidebar.text = sb.ToString();

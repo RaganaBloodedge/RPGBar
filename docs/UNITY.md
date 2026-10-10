@@ -30,7 +30,7 @@ Python 侧 266 项测试 + 前端 74 项测试全绿。
 │  GameBootstrap  装配        │ ◄─────► │  FastAPI + WebSocket 房间         │
 │  GameClient     WebSocket   │  join   │  ├─ NarratorAgent（主机 DM）      │
 │  GameUI         运行时 UGUI │  action │  ├─ AssistantAgent（主机小助手）  │
-│  MiniJson       零依赖解析   │  suggest│  ├─ AdvisorAgent（玩家小助手）    │
+│  JsonUtil       JSON 取值封装│  suggest│  ├─ AdvisorAgent（玩家小助手）    │
 │                            │  roll   │  ├─ NPC 子系统 + 剧情档案         │
 │  （同一套协议，服务端不区分  │         │  ├─ RAG 检索 + 状态机 + 骰子      │
 │    浏览器还是 Unity）        │         │  └─ 三个模型槽位                  │
@@ -54,14 +54,14 @@ Unity 工程与 Python 服务端**并排**放在项目根目录：
 RPGBar-Unity/
 ├── Assets/                     ← Unity 资源（脚本 / 场景）
 │   ├── Editor/
-│   │   └── RPGBarSceneBuilder.cs   Editor 脚本：用菜单或命令行生成主场景
+│   │   └── RPGBarSceneBuilder.cs   Editor 脚本：生成主场景 + 校正 Build Settings
 │   ├── Scripts/
 │   │   ├── GameBootstrap.cs        入口：装配网络层与界面层
 │   │   ├── GameClient.cs           WebSocket 客户端
 │   │   ├── GameUI.cs               运行时构建的 UGUI 界面
-│   │   └── MiniJson.cs             极简 JSON 解析/序列化（零依赖）
-│   └── Scenes/                 ← 主场景（由 Editor 脚本生成）
-├── Packages/                   ← Unity 包清单
+│   │   └── JsonUtil.cs             Newtonsoft 取值封装（缺字段给默认值）
+│   └── Scenes/                 ← 主场景 Main.unity（由 Editor 脚本生成）
+├── Packages/                   ← Unity 包清单（含 Newtonsoft.Json 官方包）
 ├── ProjectSettings/            ← Unity 项目设置
 ├── server/                     ← Python 服务端（原样继承）
 ├── web/                        ← Web 客户端（保留作参考与降级）
@@ -75,29 +75,58 @@ RPGBar-Unity/
    ```bash
    python -m server.main          # 或双击 start.bat
    ```
-2. 用 Unity Hub 打开 `E:\Workspace\RPGBar-Unity`（Unity 6000.4.2f1）。
-3. 打开场景 `Assets/Scenes/Main.unity`。
+2. 用 Unity Hub 打开 `E:\Workspace\RPGBar-Unity`（Unity 6000.4.2f1，模板工程来自 Universal 2D）。
+   第一次打开会拉一次 UPM 包（`com.unity.nuget.newtonsoft-json` 等），需要能访问 `packages.unity.com`。
+3. 打开场景 `Assets/Scenes/Main.unity`（它已经是 Build Settings 里的启动场景）。
    - 若场景还没生成，用菜单 **RPGBar → 生成主场景**；
    - **即使没有场景也能跑**：`GameBootstrap` 带自动引导，任意场景按 Play 都会自建根对象。
 4. 点 Play，在连接面板填服务器地址 `ws://127.0.0.1:8000/ws` 和名字；
    房间号留空 = 新建房间，填房号 = 加入别人的房间。
 
+> 只开一个编辑器实例。同时开两个打开同一工程会把 `Library/` 锁死。
+
 ## 五、脚本分工
 
 | 文件 | 职责 |
 | --- | --- |
-| `MiniJson.cs` | JSON 的解析与序列化。**为什么不用 Newtonsoft**：本机 `packages.unity.com` 不可达，装不上 UPM 包；**为什么不用 JsonUtility**：服务端消息是动态字段结构，强类型 DTO 会随服务端演进不断返工。 |
-| `GameClient.cs` | WebSocket 连接、收发、消息派发。收包在后台线程只入队，**分发统一在 `Update()` 主线程做**，避免后台线程碰 Unity API。发送用信号量串行化。 |
-| `GameUI.cs` | 全部界面用代码搭（UGUI），不依赖任何 prefab / 美术资源。中文字体走 `Font.CreateDynamicFontFromOSFont`（Unity 内置字体不含中文字形）。 |
+| `JsonUtil.cs` | JSON **取值**的语法糖（缺字段 / null 一律落默认值）。解析与序列化用 Unity 官方包 `com.unity.nuget.newtonsoft-json`。**为什么不用 JsonUtility**：服务端消息是动态字段结构，强类型 DTO 会随服务端演进不断返工。 |
+| `GameClient.cs` | WebSocket 连接、收发、消息派发。收包在后台线程只入队，**分发统一在 `Update()` 主线程做**，避免后台线程碰 Unity API。发送用信号量串行化。用 .NET 内置 `ClientWebSocket`（Unity 无官方 WebSocket 包）。 |
+| `GameUI.cs` | 全部界面用代码搭（**官方 UGUI**），不依赖 prefab / 美术资源。EventSystem 挂 **`InputSystemUIInputModule`**，因为工程用的是官方 Input System 包（见下方「踩坑」）。中文字体走 `Font.CreateDynamicFontFromOSFont`。 |
 | `GameBootstrap.cs` | 把两者接起来：界面事件 → 发消息，网络消息 → 刷界面。含 `RuntimeInitializeOnLoadMethod` 自动引导。 |
-| `Editor/RPGBarSceneBuilder.cs` | 用 Editor API 生成主场景，免手写易错的 `.unity`（YAML）。 |
+| `Editor/RPGBarSceneBuilder.cs` | 用 Editor API 生成主场景，免手写易错的 `.unity`（YAML）；顺带把 Build Settings 校正到主场景。 |
 
 ## 六、与 Web 版的一致性约定
 
 - **协议零改动**：Unity 与浏览器走同一套 WebSocket 消息（`join` / `action` / `suggest` / `roll` / `configure`），
   服务端不需要知道对面是什么客户端。
 - **服务端仍是唯一权威**：骰子、状态机、剧本门控都在服务端，客户端只负责呈现与输入。
-- **零第三方依赖**：不引入任何需要联网下载的包，保证离线也能构建。
+- **只用 Unity 官方能力**：序列化用官方 Newtonsoft 包、界面用官方 UGUI、输入用官方 Input System。
+  不引入需要额外构建体系的第三方库（如自编译的 SIMD 网络库），保证换台机器 clone 下来就能编译。
+
+## 六·五、工程初始化：别用 `-createProject` 拼工程
+
+第一次搭这个工程时踩了个大坑，记在这里免得重犯：
+
+**现象**：`Unity.exe -batchmode -quit -createProject <dir>` 生成的工程，首次导入会**永久卡在
+`[Package Manager] Done registering packages` 之后**。`Assets/*.meta` 不生成、`Library/ScriptAssemblies`
+为空、`Library` 涨到某个体积后不再变化；`-batchmode`、`-nographics`、GUI 三种方式都一样；
+空白工程也一样卡 —— 说明不是脚本的问题，是**工程本身残缺**。
+
+**根因**：`-createProject` 只是把模板文件拷过去、并写一份 `ProjectSettings/ProjectVersion.txt`
+（版本号还可能是 `UnknownUnityVersion`，要手工补）。这样拼出来的工程缺少 Hub 建工程时写入的
+初始状态，编辑器初始化到包注册之后就走不下去了。
+
+**正确做法**：让 **Unity Hub 新建一个工程**（模板随便选，本文用的是 Universal 2D），
+再把这个**能正常导入**的工程的 `Assets/`、`Packages/`、`ProjectSettings/`、`UserSettings/`
+搬进仓库根目录，然后把自己的脚本放进去。Hub 建的工程首次导入是正常的，
+`Library/ScriptAssemblies/Assembly-CSharp.dll` 会正常产出。
+
+**顺带记两条同源坑**：
+
+- **别同时开两个编辑器**开同一个工程：`Library/` 会互相锁死，两边都卡住。
+  卡死后要么清 `Library/` + `Temp/` 重来，要么把编辑器全关掉只留一个。
+- **`EditorBuildSettings.scenes` 的赋值只改内存**，不跟着 `AssetDatabase.SaveAssets()` 一起落盘
+  （顺序反了就是白改）。要写进 `ProjectSettings/EditorBuildSettings.asset`，得先赋值再 `SaveAssets()`。
 
 ## 七、后续路线
 

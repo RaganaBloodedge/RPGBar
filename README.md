@@ -39,8 +39,8 @@ python -m server.main
 
 | Agent | 模型量级 | 能用的工具 | 干什么 |
 | --- | --- | --- | --- |
-| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script` `npc_card`（只读）+ `move_to` `set_flag` `roll_check` `npc_introduce`（改状态） | 推进剧情、投骰判定、扮 NPC |
-| **主机小助手**（`AssistantAgent`） | 小模型 | 无（固定流程单轮 JSON） | 给剧本外 NPC 生成人物小传、算反应权重、后续做剧情摘要 |
+| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script` `npc_card` `recall_history`（只读）+ `move_to` `set_flag` `roll_check` `npc_introduce`（改状态） | 推进剧情、投骰判定、扮 NPC、回忆前情 |
+| **主机小助手**（`AssistantAgent`） | 小模型 | 无（固定流程单轮 JSON） | 给剧本外 NPC 生成人物小传、算反应权重、滚动剧情摘要 |
 | **玩家小助手**（`AdvisorAgent`） | 小模型 | `read_scene` `list_valid_actions` `lookup_script`（**全是只读**） | 给你 2-4 条行动建议 |
 
 小助手改不了剧情，不是靠提示词求它别改，而是**它的工具集里根本没有写工具**。
@@ -99,6 +99,23 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 把同样的意图写成 `{"narration": "...", "move_to": "...", "set_flags": [...]}`，
 功能不减，只是少了多轮工具往复。「测试连接」会直接把结果告诉你。
 
+## 剧情档案与内置嵌入模型
+
+DM 的上下文装不下一整局对话。所以本局已经输出的旁白、玩家行动、骰点结论会**逐条落进本地存档**
+（`data/chronicle-<房间码>.jsonl`，只增不改），DM 用只读工具 `recall_history` 按需回捞——
+上下文不膨胀，也不会「忘事」。
+
+检索是**混合**的：关键词（BM25）+ 语义向量，用 RRF 融合。语义侧用内置的
+**bge-small-zh-v1.5**（ONNX，本地推理、离线可用）：
+
+```bash
+python scripts/fetch_embedding.py        # 下载模型到 models/（约 24MB，量化版）
+python scripts/fetch_embedding.py --fp32 # 想要更准就下完整 fp32 版（约 95MB）
+```
+
+**不下也能玩**：服务器探测不到模型就自动退化成纯 BM25，其余功能一律不受影响
+（启动横幅与 `/api/version` 会写明当前用的是哪种）。
+
 ## 架构总览
 
 | 模块 | 文件 | 职责 |
@@ -113,10 +130,12 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 | 主机小助手 Agent | `server/agents/persona.py` | 小模型；`persona`（生成人物小传）/ `react_weights`（算反应权重）两条任务 |
 | 玩家小助手 Agent | `server/agents/advisor.py` | 小模型；`action_advice` 任务，**只有只读工具**，次级 prompt 为公开版 |
 | NPC 子系统 | `server/npc.py` | 人物卡 / 别名索引 / 原型兜底表 / NPC 私有记忆（好感度）；反应落点交给骰子 |
+| 剧情档案（长期记忆） | `server/chronicle.py` | 只增 JSONL + BM25/向量混合检索（RRF）；滚动主线摘要；DM 用 `recall_history` 只读取用 |
+| 内置嵌入模型 | `server/embedding.py` | bge-small-zh-v1.5 的本地 ONNX 封装，缺失时静默降级为纯 BM25 |
 | 无模型的 DM 流水线 | `server/dm.py` | 确定性剧本编排（留空 API 时的兜底），与 Agent 共用同一套状态机 |
 | LLM 抽象 | `server/llm.py` | OpenAI 兼容 Provider：云 API 与本地模型同一套；含工具调用与降级判定 |
-| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，三个模型槽位运行期配置，剧本读取/切换接口，NPC 同步，中途加入推送 |
-| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾、**在场人物**、设置抽屉（模型 + 剧本） |
+| 多人服务 | `server/main.py` | FastAPI + WebSocket 房间，三个模型槽位运行期配置，剧本读取/切换接口，NPC 同步，剧情档案落盘，中途加入推送 |
+| 客户端 | `web/` | 加入/建房、旁白流、掷骰、小助手建议、故事回顾、**在场人物**、**剧情档案状态**、设置抽屉（模型 + 剧本） |
 
 ## 关键设计
 
@@ -128,8 +147,9 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
   骰子只能由 `roll_check` 在服务端投——模型拿不到骰子，也就编不出结果。小助手则连写工具都没有。
   NPC 的反应权重由校验器裁剪归一化，**模型只给区间、给不出骰点**。
 - **NPC 记忆与 DM 隔离**：NPC 的交往记录与好感度留在 `NpcMemory`；DM 只收到「人物卡 + 当前状态快照」的提炼结论，不掺流水账，剧情上下文保持干净。
+- **DM 的分层记忆**：热点层 = 滚动主线摘要 + 最近若干轮原文（直接进上下文）；冷层 = 全部主线原文的只增档案，靠 `recall_history` 按需检索（内置 bge-small-zh 向量 + BM25 混合召回）。上下文不膨胀，也不会「忘事」；档案由服务端落盘，模型只读。
 - **骰子在服务端**：玩家只发意图，结果由主机统一投掷并广播，防作弊。
-- **留空也能玩**：三个模型槽位默认 `off`，DM 退回确定性流水线、NPC 退回内置原型兜底；接了模型才启用 Agent 工具循环，两者共用同一套状态机。
+- **留空也能玩**：三个模型槽位默认 `off`，DM 退回确定性流水线、NPC 退回内置原型兜底、档案退回纯 BM25；接了模型才启用 Agent 工具循环，两者共用同一套状态机。
 - **可中途加入**：对局进行中也能凭房间码加入。DM 会为新玩家生成一段带入旁白（全员可见，剧情上就是「他推门进来了」），并把「行程 / 线索 / 最近动态」的私有回顾面板单独推给新玩家。
 - **flag 由剧本驱动**：合法 flag 从剧本自动收集（不再硬编码），flag 的中文描述也写在剧本里，用于侧栏与新人回顾。
 
@@ -207,13 +227,13 @@ python scripts/smoke_test.py --unit # 仅进程内
 npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **236 项全绿**（Python）+ **71 项全绿**（前端 DOM，可选）。
+当前 **266 项全绿**（Python）+ **74 项全绿**（前端 DOM，可选）。
 实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。
 Agent 层的测试不需要真实模型——用一个按脚本吐回复的假 Provider 就能验完整工具循环。
 
 ## 版本
 
-当前版本 **v0.8.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
+当前版本 **v0.9.0**。每个版本的变更记录在 [CHANGELOG.md](CHANGELOG.md)，对应的 tag 与 Release 可在仓库的 Tags / Releases 页查看。
 
 版本号只有一个来源：`server/__init__.py` 的 `__version__`。它会显示在服务器启动横幅、`GET /api/version`，以及网页的加入页与顶栏——所以"跑的是哪一版"一眼可辨。
 
@@ -225,13 +245,18 @@ Agent 层的测试不需要真实模型——用一个按脚本吐回复的假 P
 
 ```bash
 pip install pyinstaller
+python scripts/fetch_embedding.py          # 可选：带上内置嵌入模型（约 24MB）
 pyinstaller --name RPGBarServer --onedir --noconfirm --clean \
   --add-data "web;web" --add-data "scripts;scripts" \
   --add-data "config.example.json;." \
+  --add-data "models;models" \
   --collect-all jieba \
   --exclude-module uvloop --exclude-module watchfiles \
   run_server.py
 ```
+
+> `--add-data "models;models"` 只在确实下载了嵌入模型时加；没有 `models/` 目录就删掉这一行
+> （不带模型也能玩，剧情档案会自动退化成纯关键词检索）。
 
 产物在 `dist/RPGBarServer/`。**打包后把给玩家的说明拷进去再压缩**（指南源码在仓库里，避免每次重打都要重写）：
 
@@ -244,9 +269,8 @@ python -c "import shutil; shutil.make_archive('RPGBarServer','zip',root_dir='dis
 
 ## 后续路线
 
-1. 跑通 Web 联机 demo：三 Agent + 双模型通道 + 剧本读取/切片 + NPC 自动人设（当前）。
-2. **剧情档案与混合检索**：把已输出的主线全文落到本地只增 JSONL 并向量化，内置 `bge-small-zh` + BM25 混合检索；
-   DM 新增 `recall_history` 只读工具，超出上下文时按需回捞关键角色行为，防止模型「忘事」。
-3. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
-4. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接大模型 + 主机小助手——通道已就位，等接默认值。
-5. 有模型时用模型给切片做摘要（现在切片索引是按场景/标题生成的，摘要可交给小模型离线生成后缓存）。
+1. 跑通 Web 联机 demo：三 Agent + 双模型通道 + 剧本读取/切片 + NPC 自动人设 + 剧情档案混合检索（当前）。
+2. 把 `server/` 逻辑移植进 Unity（DM 服务端 = 主机端，WebSocket → Mirror/Netcode）。
+3. 玩家端小助手**默认**下沉到本地 3B/4B 模型（llama.cpp），主机玩家额外接大模型 + 主机小助手——通道已就位，等接默认值。
+4. 有模型时用模型给切片做摘要（现在切片索引是按场景/标题生成的，摘要可交给小模型离线生成后缓存）。
+5. 房间状态持久化（存档）：目前剧情档案已落盘，房间与人物状态仍在内存里。

@@ -28,6 +28,7 @@ class NarratorContext:
     player_name: str = "冒险者"
     events: list = field(default_factory=list)          # 待广播的事件（dice/system）
     narration_parts: list = field(default_factory=list)  # 系统自己产出的权威旁白
+    npc_brief: str = ""  # 本轮涉及 NPC 的「人物卡 + 状态快照 + 反应采样结论」（不含记忆流水账）
 
 
 NARRATOR_JSON_HINT = {
@@ -45,10 +46,11 @@ class NarratorAgent(Agent):
     max_steps = 6
     json_hint = NARRATOR_JSON_HINT
 
-    def __init__(self, store, provider=None):
+    def __init__(self, store, provider=None, npc=None):
         super().__init__(provider)
         self.store = store
         self.dm = DM(store, provider)
+        self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
 
     # ---- 提示词 ----
     # 第一层：System prompt —— 只写「我是谁、我能做什么、我的边界」，与具体剧本无关。
@@ -62,6 +64,7 @@ class NarratorAgent(Agent):
             "【工作方式】\n"
             "- 先用只读工具了解现状（read_scene / list_exits / list_checks / lookup_script），再决定动作。\n"
             "- 要推进场景就调 move_to；要投骰就调 roll_check；剧情明确产生新线索才调 set_flag。\n"
+            "- 需要某个 NPC 的设定时用 npc_card；出场了剧本里没有的新 NPC 时用 npc_introduce 建档。\n"
             "- 收尾时调 finish(narration) 给出最终旁白；若无需推进任何东西，直接给旁白也可以。\n"
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
@@ -80,17 +83,19 @@ class NarratorAgent(Agent):
         players = "；".join(
             f"{p.name}({p.character.get('cls', '')})" for p in state.players.values()
         )
+        npc_block = f"\n【在场 NPC（人物卡）】\n{ctx.npc_brief}" if getattr(ctx, "npc_brief", "") else ""
         return (
             f"{self.store.build_context(state.current_scene, user_input)}\n\n"
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
-            f"在场玩家：{players}\n"
+            f"在场玩家：{players}"
+            f"{npc_block}\n"
             f"玩家行动：{user_input}"
         )
 
     # ---- 工具 ----
     def build_tools(self, ctx) -> list:
-        return [
+        tools = [
             Tool(
                 "read_scene",
                 "读取某个场景的完整内容（含 DM 内幕）。省略 scene_id 则读当前场景。只读。",
@@ -115,34 +120,76 @@ class NarratorAgent(Agent):
                 _obj({"query": str_prop("检索关键词"), "k": int_prop("返回条数", 3)}),
                 self._t_lookup_script,
             ),
-            Tool(
-                "roll_check",
-                "让服务端投掷某个检定并应用结果（可能获得线索）。这是唯一产生骰子结果的途径。",
-                _obj({"check_id": str_prop("检定 id，见 list_checks")}, ["check_id"]),
-                self._t_roll_check,
-                read_only=False,
-            ),
-            Tool(
-                "move_to",
-                "把队伍推进到某个出口指向的场景。仅当该出口存在且条件已满足时生效。",
-                _obj({"scene_id": str_prop("目标场景 id，见 list_exits")}, ["scene_id"]),
-                self._t_move_to,
-                read_only=False,
-            ),
-            Tool(
-                "set_flag",
-                "记录一条剧情线索（只允许剧本声明过的 flag）。",
-                _obj({"flag": str_prop("flag 名")}, ["flag"]),
-                self._t_set_flag,
-                read_only=False,
-            ),
-            Tool(
-                "finish",
-                "给出最终旁白并结束本轮。",
-                _obj({"narration": str_prop("2-4 句最终旁白")}, ["narration"]),
-                self._t_finish,
-            ),
         ]
+        if self.npc is not None:
+            tools.extend(
+                [
+                    Tool(
+                        "npc_card",
+                        "查看某个 NPC 的人物卡与当前状态（不含他的历史流水账）。只读。",
+                        _obj({"name": str_prop("NPC 名字或别称")}),
+                        self._t_npc_card,
+                    ),
+                    Tool(
+                        "npc_introduce",
+                        "为剧本里没有的新 NPC 建档（会生成人物小传），让他后续行为保持一致。",
+                        _obj(
+                            {"name": str_prop("NPC 名字"), "role": str_prop("身份，可选")},
+                            ["name"],
+                        ),
+                        self._t_npc_introduce,
+                        read_only=False,
+                    ),
+                ]
+            )
+        tools.extend(
+            [
+                Tool(
+                    "roll_check",
+                    "让服务端投掷某个检定并应用结果（可能获得线索）。这是唯一产生骰子结果的途径。",
+                    _obj({"check_id": str_prop("检定 id，见 list_checks")}, ["check_id"]),
+                    self._t_roll_check,
+                    read_only=False,
+                ),
+                Tool(
+                    "move_to",
+                    "把队伍推进到某个出口指向的场景。仅当该出口存在且条件已满足时生效。",
+                    _obj({"scene_id": str_prop("目标场景 id，见 list_exits")}, ["scene_id"]),
+                    self._t_move_to,
+                    read_only=False,
+                ),
+                Tool(
+                    "set_flag",
+                    "记录一条剧情线索（只允许剧本声明过的 flag）。",
+                    _obj({"flag": str_prop("flag 名")}, ["flag"]),
+                    self._t_set_flag,
+                    read_only=False,
+                ),
+                Tool(
+                    "finish",
+                    "给出最终旁白并结束本轮。",
+                    _obj({"narration": str_prop("2-4 句最终旁白")}, ["narration"]),
+                    self._t_finish,
+                ),
+            ]
+        )
+        return tools
+
+    def _t_npc_card(self, ctx, name=""):
+        if self.npc is None:
+            return {"error": "本局未启用 NPC 子系统"}
+        card = self.npc.registry.resolve((name or "").strip())
+        if not card:
+            return {"error": f"没有名为「{name}」的 NPC", "known": [c["name"] for c in self.npc.index()]}
+        return self.npc.card_public(card)
+
+    async def _t_npc_introduce(self, ctx, name="", role=""):
+        if self.npc is None:
+            return {"error": "本局未启用 NPC 子系统"}
+        card = await self.npc.ensure_card((name or "").strip(), role=(role or "").strip())
+        if not card:
+            return {"error": "无法为该 NPC 建档", "name": name}
+        return {"ok": True, "id": card.id, "name": card.name, "role": card.role, "known": card.summary[:80]}
 
     def _t_read_scene(self, ctx, scene_id=""):
         sid = (scene_id or "").strip() or ctx.state.current_scene

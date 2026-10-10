@@ -34,8 +34,12 @@ CONFIG_PATH = USER_DIR / "config.json"
 EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 
 DEFAULTS = {
-    # 两个模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/ local（本地模型）
+    # 模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/ local（本地模型）
     # 默认全部留空 —— 游戏照常可玩，配好任意一个即自动启用对应 Agent。
+    # - dm：主机端 DM 大模型（推进剧情）。
+    # - advisor：玩家端小助手小模型（只读，给行动建议）。
+    # - assistant：主机端小助手小模型（生成 NPC 人物卡、算反应权重、滚动摘要）——
+    #   与 advisor 是同一个引擎，只是跑在主机、承担房间级任务。3B 量级足够。
     "models": {
         "dm": {
             "kind": "off",
@@ -51,7 +55,16 @@ DEFAULTS = {
             "model": "local-model",
             "temperature": 0.7,
         },
+        "assistant": {
+            "kind": "off",
+            "base_url": "http://127.0.0.1:8081/v1",
+            "api_key": "",
+            "model": "qwen2.5-3b-instruct",
+            "temperature": 0.6,
+        },
     },
+    # NPC 子系统：是否允许用模型为次要 NPC 生成人物小传（关掉则走原型兜底表）
+    "npc": {"auto_persona": True},
     "server": {"host": "0.0.0.0", "port": 8000},
     # 剧本文件（相对 RESOURCE_DIR；也可写绝对路径）
     "script": "scripts/sample_script.json",
@@ -105,6 +118,7 @@ def load_config() -> dict:
     _apply_env_slot(cfg["models"]["dm"], "RPGBAR_LLM")  # 兼容旧变量名
     _apply_env_slot(cfg["models"]["dm"], "RPGBAR_DM_MODEL")
     _apply_env_slot(cfg["models"]["advisor"], "RPGBAR_ADVISOR_MODEL")
+    _apply_env_slot(cfg["models"]["assistant"], "RPGBAR_ASSISTANT_MODEL")
     if os.environ.get("RPGBAR_SCRIPT"):
         cfg["script"] = os.environ["RPGBAR_SCRIPT"]
     return cfg

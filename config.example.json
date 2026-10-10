@@ -2,9 +2,10 @@
   "_说明": [
     "把本文件复制为 config.json 即可覆盖默认值（config.json 不进版本库）。",
     "models.dm       = 主机端 DM（大模型）：推进剧情、投骰判定。由房主配置，全房间共用。",
+    "models.assistant= 主机端小助手（小模型）：给剧本外 NPC 生成人物小传、算反应权重、滚动摘要。由房主配置，全房间共用。",
     "models.advisor  = 玩家私有小助手（小模型）：只读场景给行动建议。每位玩家可在游戏内各配各的。",
     "kind: off=留空(走脚本化兜底，游戏照常可玩) / cloud=云 API(需 api_key) / local=本地模型(不需 key)。",
-    "两个槽位默认都是 off —— 也就是说，什么都不配也能正常玩，配一个就自动启用一个 Agent。",
+    "三个槽位默认都是 off —— 也就是说，什么都不配也能正常玩，配一个就自动启用一个 Agent。",
     "也可以完全不改这个文件，直接在游戏里点顶栏的「⚙ 设置」接入（模型只存在浏览器本机）。",
     "script = 起始剧本（相对 scripts/ 目录，也可写绝对路径）。",
     "运行期也能换剧本：游戏内「⚙ 设置 → 剧本」读取并切换，或用 HTTP 接口 /api/scripts/load（只影响新开的房间）。"
@@ -16,6 +17,13 @@
       "api_key": "",
       "model": "deepseek-chat",
       "temperature": 0.8
+    },
+    "assistant": {
+      "kind": "off",
+      "base_url": "http://127.0.0.1:8081/v1",
+      "api_key": "",
+      "model": "qwen2.5-3b-instruct",
+      "temperature": 0.6
     },
     "advisor": {
       "kind": "off",

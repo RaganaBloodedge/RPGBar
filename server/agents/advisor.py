@@ -1,26 +1,19 @@
-"""玩家私有小助手（小模型）：AdvisorAgent。
+"""玩家私有小助手（小模型）——ToolAgent 上的 `action_advice` 任务。
 
-职责边界很清楚——**只读**。它的工具集里没有任何能改游戏状态的东西，
-所以「小助手不会替玩家改剧情」不是靠提示词祈求，而是靠它拿不到写工具。
+它是「小模型工具代理」的第一条任务模板（见 `tool_agent.py`）。职责边界很清楚——**只读**：
+工具集里没有任何能改游戏状态的东西，所以「小助手不会替玩家改剧情」不是靠提示词祈求，
+而是靠它拿不到写工具。
 
 - 只读工具：read_scene / list_valid_actions / lookup_script
 - finish(options)：输出 2-4 条建议
 
-这条通道是给「玩家自己机器上的 3B/4B 模型」准备的：把小助手指向
-`http://127.0.0.1:8080/v1` 之类的本地地址即可，算力花在玩家自己身上。
+这条通道是给「玩家自己机器上的 3B/4B 模型」准备的（也可以是主机端小模型）：
+把小助手指向 `http://127.0.0.1:8080/v1` 之类的本地地址即可，算力花在玩家自己身上。
 """
 from dataclasses import dataclass
 
-from .base import Agent, AgentResult, Tool, _obj, int_prop, str_prop
-
-ADVISOR_JSON_HINT = {
-    "role": "user",
-    "content": (
-        "该模型无法使用工具。请只输出一个 JSON 对象，不要任何解释文字：\n"
-        '{"options":["建议1","建议2","建议3"]}\n'
-        "每条建议不超过 15 字，必须是玩家当下可以做的具体行动。"
-    ),
-}
+from .base import AgentResult, Tool, _obj, int_prop, str_prop
+from .tool_agent import Task, ToolAgent, parse_json
 
 
 @dataclass
@@ -29,47 +22,68 @@ class AdvisorContext:
     player_name: str = "冒险者"
 
 
-class AdvisorAgent(Agent):
+ADVISOR_JSON_HINT = (
+    "请只输出一个 JSON 对象，不要任何解释文字：\n"
+    '{"options":["建议1","建议2","建议3"]}\n'
+    "每条建议不超过 15 字，必须是玩家当下可以做的具体行动。"
+)
+
+ADVISOR_SYSTEM = (
+    "你是玩家在文字跑团里的私人小助手，不是主持人（DM）。\n"
+    "【你的职责】\n"
+    "1. 看着当前场景，给出 3 条玩家**当下就能做**的具体行动建议。\n"
+    "2. 建议要短、要以动词开头（例如「检查石门」「合力抬开石闩」）。\n"
+    "【工作方式】\n"
+    "- 先调用 list_valid_actions 看有哪些合法选项，必要时用 read_scene / lookup_script 弄清场景。\n"
+    "- 最后调用 finish(options) 输出建议列表。\n"
+    "【硬性边界】\n"
+    "- 你只能读，不能改剧情；不替玩家做决定，只给选项。\n"
+    "- 每条建议不超过 15 字，且必须是当前场景真实可做的行动。\n"
+)
+
+
+def _advise_user(agent, ctx) -> str:
+    state = ctx.state
+    cur = state.current()
+    return (
+        f"当前场景：{cur.get('title', '')}（{cur.get('location', '')}）\n"
+        f"地点描述：{cur.get('public_text', '')}\n"
+        f"队伍已获线索：{'；'.join(agent.store.flag_label(f) for f in sorted(state.flags)) or '无'}\n"
+        f"玩家：{ctx.player_name}\n"
+        "请给出 3 条行动建议。"
+    )
+
+
+def _advise_validate(agent, data, ctx) -> dict:
+    opts = [str(o).strip() for o in (data.get("options") or []) if str(o).strip()]
+    return {"options": opts[:4]}
+
+
+ADVISE_TASK = Task(
+    name="action_advice",
+    label="行动建议",
+    system=ADVISOR_SYSTEM,
+    secondary=lambda agent, ctx: agent.store.script_prompt_public,
+    user=_advise_user,
+    tools=lambda agent, ctx: agent._advisor_tools(ctx),
+    json_hint=ADVISOR_JSON_HINT,
+    fallback=lambda agent, ctx: {"options": agent.fallback_options(ctx)},
+    validate=_advise_validate,
+    parse_final=lambda agent, text, ctx: _advise_validate(agent, parse_json(text), ctx),
+    max_steps=4,
+)
+
+
+class AdvisorAgent(ToolAgent):
     name = "advisor"
-    max_steps = 4
-    json_hint = ADVISOR_JSON_HINT
+    default_task = "action_advice"
 
     def __init__(self, store, provider=None):
-        super().__init__(provider)
-        self.store = store
+        super().__init__(store, provider)
+        self.register(ADVISE_TASK)
 
-    # 第一层：System prompt —— 只写小助手自己的职责（与具体剧本无关）。
-    def system_prompt(self, ctx) -> str:
-        return (
-            "你是玩家在文字跑团里的私人小助手，不是主持人（DM）。\n"
-            "【你的职责】\n"
-            "1. 看着当前场景，给出 3 条玩家**当下就能做**的具体行动建议。\n"
-            "2. 建议要短、要以动词开头（例如「检查石门」「合力抬开石闩」）。\n"
-            "【工作方式】\n"
-            "- 先调用 list_valid_actions 看有哪些合法选项，必要时用 read_scene / lookup_script 弄清场景。\n"
-            "- 最后调用 finish(options) 输出建议列表。\n"
-            "【硬性边界】\n"
-            "- 你只能读，不能改剧情；不替玩家做决定，只给选项。\n"
-            "- 每条建议不超过 15 字，且必须是当前场景真实可做的行动。\n"
-        )
-
-    # 第二层：次级 prompt —— 剧本背景与约束（公开版，不含内幕与场景索引，防剧透）。
-    def secondary_prompt(self, ctx) -> str:
-        return self.store.script_prompt_public
-
-    def build_user_message(self, ctx, user_input: str) -> str:
-        state = ctx.state
-        cur = state.current()
-        return (
-            f"当前场景：{cur.get('title', '')}（{cur.get('location', '')}）\n"
-            f"地点描述：{cur.get('public_text', '')}\n"
-            f"队伍已获线索：{'；'.join(self.store.flag_label(f) for f in sorted(state.flags)) or '无'}\n"
-            f"玩家：{ctx.player_name}\n"
-            "请给出 3 条行动建议。"
-        )
-
-    # ---- 只读工具 ----
-    def build_tools(self, ctx) -> list:
+    # ---- 只读工具（结构上拿不到写工具）----
+    def _advisor_tools(self, ctx) -> list:
         return [
             Tool(
                 "read_scene",
@@ -105,6 +119,10 @@ class AdvisorAgent(Agent):
                 self._t_finish,
             ),
         ]
+
+    # 兼容旧调用：冒烟测试直接调 build_tools(ctx)
+    def build_tools(self, ctx) -> list:
+        return self._advisor_tools(ctx)
 
     def _t_read_scene(self, ctx, scene_id=""):
         sid = (scene_id or "").strip() or ctx.state.current_scene
@@ -142,13 +160,6 @@ class AdvisorAgent(Agent):
         return {"options": opts[:4]}
 
     # ---- 降级 ----
-    def parse_final(self, text, ctx):
-        obj = _parse_json(text)
-        return obj or None
-
-    def fallback_text(self, ctx, user_input: str) -> str:
-        return ""
-
     def fallback_options(self, ctx) -> list:
         """无模型时的建议：直接取剧本里的出口与检定关键词。"""
         scene = ctx.state.current()
@@ -158,13 +169,7 @@ class AdvisorAgent(Agent):
 
     async def suggest(self, ctx) -> AgentResult:
         """对外入口：返回 AgentResult，建议列表在 data['options']。"""
-        if self.provider is None:
-            return AgentResult(
-                data={"options": self.fallback_options(ctx)},
-                source="scripted",
-                stopped="no_provider",
-            )
-        res = await self.run(ctx, "给出行动建议")
+        res = await self.run_task("action_advice", ctx)
         opts = list(res.data.get("options") or [])
         if not opts:
             # 模型没按协议给列表 → 兜底，但保留 trace
@@ -173,25 +178,3 @@ class AdvisorAgent(Agent):
                 res.source = "degraded"
         res.data = {"options": opts[:4]}
         return res
-
-
-def _parse_json(raw):
-    import json
-    import re
-
-    raw = (raw or "").strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-    try:
-        val = json.loads(raw)
-        return val if isinstance(val, dict) else {}
-    except Exception:  # noqa: BLE001
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return {}
-        try:
-            val = json.loads(m.group(0))
-            return val if isinstance(val, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}

@@ -8,6 +8,8 @@
     "三个槽位默认都是 off —— 也就是说，什么都不配也能正常玩，配一个就自动启用一个 Agent。",
     "也可以完全不改这个文件，直接在游戏里点顶栏的「⚙ 设置」接入（模型只存在浏览器本机）。",
     "script = 起始剧本（相对 scripts/ 目录，也可写绝对路径）。",
+    "memory.chronicle   = 是否启用剧情档案（把已输出的主线落到 data/ 下的只增 JSONL，并做 BM25+向量混合检索）。",
+    "memory.summary_every = 每积累这么多条新记录，让主机小助手滚动摘要一次（不接模型时用确定性兜底）。",
     "运行期也能换剧本：游戏内「⚙ 设置 → 剧本」读取并切换，或用 HTTP 接口 /api/scripts/load（只影响新开的房间）。"
   ],
   "models": {
@@ -32,6 +34,13 @@
       "model": "local-model",
       "temperature": 0.7
     }
+  },
+  "npc": {
+    "auto_persona": true
+  },
+  "memory": {
+    "chronicle": true,
+    "summary_every": 8
   },
   "server": {
     "host": "0.0.0.0",

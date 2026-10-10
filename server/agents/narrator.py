@@ -46,11 +46,12 @@ class NarratorAgent(Agent):
     max_steps = 6
     json_hint = NARRATOR_JSON_HINT
 
-    def __init__(self, store, provider=None, npc=None):
+    def __init__(self, store, provider=None, npc=None, chronicle=None):
         super().__init__(provider)
         self.store = store
         self.dm = DM(store, provider)
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
+        self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
 
     # ---- 提示词 ----
     # 第一层：System prompt —— 只写「我是谁、我能做什么、我的边界」，与具体剧本无关。
@@ -65,6 +66,7 @@ class NarratorAgent(Agent):
             "- 先用只读工具了解现状（read_scene / list_exits / list_checks / lookup_script），再决定动作。\n"
             "- 要推进场景就调 move_to；要投骰就调 roll_check；剧情明确产生新线索才调 set_flag。\n"
             "- 需要某个 NPC 的设定时用 npc_card；出场了剧本里没有的新 NPC 时用 npc_introduce 建档。\n"
+            "- 忘了此前发生过什么（谁做过什么、拿过什么），用 recall_history 检索本局档案，别自己瞎猜。\n"
             "- 收尾时调 finish(narration) 给出最终旁白；若无需推进任何东西，直接给旁白也可以。\n"
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
@@ -84,11 +86,14 @@ class NarratorAgent(Agent):
             f"{p.name}({p.character.get('cls', '')})" for p in state.players.values()
         )
         npc_block = f"\n【在场 NPC（人物卡）】\n{ctx.npc_brief}" if getattr(ctx, "npc_brief", "") else ""
+        hist = self.chronicle.digest(6) if self.chronicle is not None else ""
+        hist_block = f"\n【剧情档案（热层）】\n{hist}\n（需要更早的细节时用 recall_history 检索）" if hist else ""
         return (
             f"{self.store.build_context(state.current_scene, user_input)}\n\n"
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
+            f"{hist_block}"
             f"{npc_block}\n"
             f"玩家行动：{user_input}"
         )
@@ -141,6 +146,21 @@ class NarratorAgent(Agent):
                         read_only=False,
                     ),
                 ]
+            )
+        if self.chronicle is not None:
+            tools.append(
+                Tool(
+                    "recall_history",
+                    "检索本局此前发生过的剧情（旁白原文 / 玩家行动 / 骰点结论），用来回忆关键角色与事件。只读。",
+                    _obj(
+                        {
+                            "query": str_prop("检索关键词，如某个 NPC 的名字或一桩事件"),
+                            "k": int_prop("返回条数", 4),
+                            "actor": str_prop("只看与这个角色相关的记录，可选"),
+                        }
+                    ),
+                    self._t_recall_history,
+                )
             )
         tools.extend(
             [
@@ -220,6 +240,23 @@ class NarratorAgent(Agent):
                 {"check_id": c["id"], "skill": c["skill"], "dc": c.get("dc", 10)}
                 for c in ctx.state.current().get("checks", [])
             ]
+        }
+
+    def _t_recall_history(self, ctx, query="", k=4, actor=""):
+        if self.chronicle is None:
+            return {"error": "本局未启用剧情档案"}
+        hits = self.chronicle.search((query or "").strip(), k=k, actor=(actor or "").strip() or None)
+        return {
+            "hits": [
+                {
+                    "turn": h.get("turn"),
+                    "kind": h.get("kind"),
+                    "scene": h.get("scene"),
+                    "text": (h.get("text") or "")[:400],
+                }
+                for h in hits
+            ],
+            "note": "以上是本局档案里的原文摘录，请据此叙述，不要编造没有记录的事。",
         }
 
     def _t_lookup_script(self, ctx, query="", k=3):

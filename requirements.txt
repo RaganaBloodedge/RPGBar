@@ -4,3 +4,8 @@ httpx>=0.27
 websockets>=12
 jieba>=0.42.1
 rank-bm25>=0.2.2
+
+# 剧情档案的语义检索（可选）：装了才能用内置的 bge-small-zh 向量检索。
+# 不装也能玩 —— 检索自动退化成纯 BM25。装好后用 scripts/fetch_embedding.py 下模型。
+onnxruntime>=1.17
+tokenizers>=0.15

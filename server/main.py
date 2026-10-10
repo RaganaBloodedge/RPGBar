@@ -11,19 +11,19 @@
        槽位字段：kind(off|cloud|local) + base_url + model + temperature + api_key(省略=保持原值)
   服务端 → 客户端：
     {"type":"welcome","room":"...","you":"...","late":bool,"script":"剧本名","agents":{...},
-      "script_info":{...},"chunks":[...],"npcs":[...],
-      "prompt":{"advisor":"...","dm":"...(仅房主)"}}  # 连入即同步（含本房间已有 NPC）
+      "script_info":{...},"chunks":[...],"npcs":[...],"memory":{...},
+      "prompt":{"advisor":"...","dm":"...(仅房主)"}}  # 连入即同步（含本房间已有 NPC / 档案状态）
     {"type":"agent_status","agents":{...},"changed":["dm","advisor","assistant"]}   # 响应 configure
     {"type":"system","text":"..."}
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
     {"type":"suggestions","options":[...],"agent":{"source":"llm|scripted","tools":[...]}}
     {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
-    {"type":"state","state":{...}}   # state.flag_details=[{id,label}]；state.npcs=[人物卡摘要]
+    {"type":"state","state":{...}}   # state.flag_details=[{id,label}]；state.npcs=[人物卡摘要]；state.memory=档案状态
     {"type":"error","message":"..."}
 
 HTTP 接口：
-    GET  /api/version          版本 / 当前剧本 / 两个 Agent 的接线状态
+    GET  /api/version          版本 / 当前剧本 / 三个 Agent 的接线状态 / 剧情档案与嵌入模型状态
     GET  /api/net              本机可被访问的地址（含虚拟网卡，供主机分享给朋友）
     POST /api/models/test      探测一个模型槽位（含工具调用能力）
     GET  /api/scripts          列出可用的剧本文件
@@ -49,11 +49,14 @@ from .agents import (
     AssistantAgent,
     NarratorAgent,
     NarratorContext,
+    SummaryCtx,
     describe_agents,
 )
+from .chronicle import Chronicle
 from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
 from .dm import DM
+from .embedding import get_embedder
 from .llm import ToolCallingUnsupported, build_provider
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .rag import ScriptStore
@@ -165,10 +168,22 @@ default_dm_slot = dict(cfg["models"]["dm"])
 default_advisor_slot = dict(cfg["models"]["advisor"])
 default_assistant_slot = dict(cfg["models"].get("assistant") or {})
 NPC_AUTO_PERSONA = bool((cfg.get("npc") or {}).get("auto_persona", True))
+# 剧情档案：只增 JSONL + 混合检索（BM25 + 向量）。SUMMARY_EVERY 条新记录滚动摘要一次。
+MEM_CFG = cfg.get("memory") or {}
+CHRONICLE_ENABLED = bool(MEM_CFG.get("chronicle", True))
+SUMMARY_EVERY = max(2, int(MEM_CFG.get("summary_every", 8)))
+DATA_DIR = USER_DIR / "data"
+EMBEDDER = get_embedder() if CHRONICLE_ENABLED else None
 
 print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag / {len(store.chunk_list)} 个切片）")
 for w in store.warnings:
     print(f"[RPGBar] 剧本提示：{w}")
+if CHRONICLE_ENABLED:
+    _es = EMBEDDER.status() if EMBEDDER is not None else {"available": False, "reason": "未启用"}
+    if _es["available"]:
+        print(f"[RPGBar] 剧情档案：已启用（{_es['model']} {_es['dim']} 维 + BM25 混合检索）")
+    else:
+        print(f"[RPGBar] 剧情档案：已启用（纯 BM25；未加载嵌入模型：{_es['reason']}）")
 _agents = describe_agents(default_dm_slot, default_advisor_slot, default_assistant_slot)
 for key in ("dm", "advisor", "assistant"):
     a = _agents.get(key)
@@ -248,11 +263,20 @@ class Room:
         # NPC 子系统：人物卡 + 隔离记忆（房间级，随房间钉住剧本）
         self.npc_enabled = NPC_AUTO_PERSONA
         self.npc = NpcService(self.store) if self.npc_enabled else None
+        # 剧情档案：本局已输出的主线全文（只增 JSONL）+ 混合检索索引
+        self.chronicle = (
+            Chronicle(DATA_DIR / f"chronicle-{code}.jsonl", embedder=EMBEDDER, title=self.store.title)
+            if CHRONICLE_ENABLED
+            else None
+        )
+        self._summarized = len(self.chronicle) if self.chronicle else 0
 
     # ---- Agent 生命周期 ----
     def narrator(self) -> NarratorAgent:
         if self._narrator is None:
-            self._narrator = NarratorAgent(self.store, build_provider(self.dm_slot), npc=self.npc)
+            self._narrator = NarratorAgent(
+                self.store, build_provider(self.dm_slot), npc=self.npc, chronicle=self.chronicle
+            )
         return self._narrator
 
     def assistant(self) -> AssistantAgent:
@@ -332,7 +356,21 @@ class Room:
         snap = self.state.snapshot()
         if self.npc is not None:
             snap["npcs"] = self.npc.snapshot()
+        mem = self.memory_status()
+        if mem:
+            snap["memory"] = mem
         await self.broadcast({"type": "state", "state": snap})
+
+    def memory_status(self) -> dict:
+        """给界面看的剧情档案状态（DM 拿的是更完整的检索能力，这里只要一个计数）。"""
+        if self.chronicle is None:
+            return {}
+        return {
+            "entries": len(self.chronicle),
+            "actors": len(self.chronicle.actors()),
+            "has_summary": bool(self.chronicle.summary),
+            "embedding": bool(getattr(EMBEDDER, "available", False)),
+        }
 
     async def on_join(self, name, character, ws):
         async with self.lock:
@@ -356,17 +394,20 @@ class Room:
                     **self.room_context(name),
                     # 本房间已有的 NPC（人物卡）——晚加入也能认识在场的人
                     "npcs": self.npc.snapshot() if self.npc is not None else [],
+                    # 本房间的剧情档案状态（已记录多少条 / 是否已有滚动摘要）
+                    "memory": self.memory_status(),
                 },
             )
             if not late:
                 await self.broadcast({"type": "system", "text": f"{name} 加入了队伍"})
-                await self.broadcast(
-                    {"type": "narration", "author": "DM", "text": self.state.current().get("public_text", "")}
-                )
+                opening = self.state.current().get("public_text", "")
+                await self.broadcast({"type": "narration", "author": "DM", "text": opening})
+                self._chronicle_add(opening, kind="narration")
             else:
                 await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
                 intro = await DM(self.store, self.narrator().provider).introduce(self.state, name, character)
                 await self.broadcast({"type": "narration", "author": "DM", "text": intro})
+                self._chronicle_add(intro, kind="narration")
                 # 只发给新玩家：结构化「故事回顾」
                 await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
             await self.send_state()
@@ -412,6 +453,61 @@ class Room:
                 {"type": "agent_status", "agents": self.agents_status(name), "changed": changed},
             )
 
+    # ---- 剧情档案：只增落盘 + 滚动摘要 ----
+    def _chronicle_add(self, text, *, kind, scene="", actors=None, turn=None) -> None:
+        """把一条「已发生的事实」写进档案。写档案的永远是服务端，模型只读。"""
+        if self.chronicle is None:
+            return
+        self.chronicle.add(
+            text,
+            turn=(self.state.turn if turn is None else turn),
+            kind=kind,
+            scene=scene or self.state.current_scene,
+            actors=actors or [],
+        )
+
+    def _chronicle_turn(self, ctx, name: str, before_scene: str, parts: list) -> None:
+        """一回行动结束后，把本轮的权威结果（场景/骰点/旁白）记进档案。"""
+        if self.chronicle is None:
+            return
+        if self.state.current_scene != before_scene:
+            cur = self.state.current()
+            self._chronicle_add(
+                f"队伍进入「{cur.get('title', self.state.current_scene)}」（{self.state.current_scene}）",
+                kind="scene",
+                scene=self.state.current_scene,
+            )
+        for ev in ctx.events:
+            if ev.get("type") == "dice":
+                dc = f"DC{ev['dc']} " if ev.get("dc") else ""
+                res = "成功" if ev.get("success") else "失败"
+                self._chronicle_add(
+                    f"{ev.get('player', name)} 的 {ev.get('skill', '')} 检定 {dc}掷出 {ev.get('roll')}，{res}",
+                    kind="dice",
+                    actors=[ev.get("player", name)],
+                )
+        for p in parts:
+            self._chronicle_add(p, kind="narration")
+
+    async def _maybe_summarize(self) -> None:
+        """每积累 SUMMARY_EVERY 条记录，就让主机小助手把新剧情并进滚动摘要。"""
+        if self.chronicle is None:
+            return
+        total = len(self.chronicle)
+        if total - self._summarized < SUMMARY_EVERY:
+            return
+        batch = self.chronicle.entries[self._summarized : total]
+        ctx = SummaryCtx(
+            previous=self.chronicle.summary,
+            items=[e.get("text", "") for e in batch],
+            scene=self.state.current().get("title", ""),
+        )
+        res = await self.assistant().run_task("summarize", ctx)
+        text = str((res.data or {}).get("summary") or "").strip()
+        if text:
+            self.chronicle.set_summary(text, upto_turn=total)
+        self._summarized = total
+
     async def _npc_prepare(self, name, text) -> str:
         """玩家行动前：认出被提到的 NPC，必要时采样其反应，产出给 DM 的「NPC 素材」。
 
@@ -434,6 +530,11 @@ class Room:
                     f"候选权重 {opts}；骰点 {r['roll']} / {r['total']}。请据此叙述，但不要报出数值。）"
                 )
                 self.npc.remember(card.id, name, text, turn=self.state.turn, polarity=_polarity(text))
+                self._chronicle_add(
+                    f"{card.name} 对 {name} 的举动做出反应：{r['chosen']}",
+                    kind="npc",
+                    actors=[card.name, name],
+                )
             else:
                 self.npc.remember(card.id, name, text, turn=self.state.turn, polarity=0.0)
         brief = self.npc.briefs_for(cards)
@@ -441,6 +542,8 @@ class Room:
 
     async def on_action(self, name, text):
         async with self.lock:
+            before_scene = self.state.current_scene
+            self._chronicle_add(f"{name} 尝试：{text}", kind="action", actors=[name])
             npc_brief = await self._npc_prepare(name, text)
             ctx = NarratorContext(state=self.state, player_name=name, npc_brief=npc_brief)
             res = await self.narrator().run(ctx, text)
@@ -451,6 +554,8 @@ class Room:
                 parts.append(res.text.strip())
             for p in parts:
                 await self.broadcast({"type": "narration", "author": "DM", "text": p})
+            self._chronicle_turn(ctx, name, before_scene, parts)
+            await self._maybe_summarize()
             await self.send_state()
 
     async def on_suggest(self, name, ws):
@@ -502,6 +607,11 @@ async def api_version():
             "warnings": store.warnings,
         },
         "agents": describe_agents(default_dm_slot, default_advisor_slot, default_assistant_slot),
+        "memory": {
+            "chronicle": CHRONICLE_ENABLED,
+            "summary_every": SUMMARY_EVERY,
+            "embedding": EMBEDDER.status() if EMBEDDER is not None else {"available": False, "reason": "未启用"},
+        },
     }
 
 

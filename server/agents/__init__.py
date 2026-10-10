@@ -13,7 +13,7 @@
 from .advisor import AdvisorAgent, AdvisorContext
 from .base import Agent, AgentResult, Step, Tool
 from .narrator import NarratorAgent, NarratorContext
-from .persona import AssistantAgent
+from .persona import AssistantAgent, SummaryCtx
 from .tool_agent import Task, ToolAgent, parse_json
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "AdvisorAgent",
     "AdvisorContext",
     "AssistantAgent",
+    "SummaryCtx",
     "describe_agents",
 ]
 

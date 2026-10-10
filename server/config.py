@@ -65,6 +65,10 @@ DEFAULTS = {
     },
     # NPC 子系统：是否允许用模型为次要 NPC 生成人物小传（关掉则走原型兜底表）
     "npc": {"auto_persona": True},
+    # 剧情档案：把已输出的主线全文落到本地只增 JSONL，并提供 BM25 + 向量混合检索。
+    # summary_every：每积累这么多条新记录，就让主机小助手滚动摘要一次（不接模型时用确定性兜底）。
+    # 嵌入模型（bge-small-zh-v1.5）缺失时自动退化成纯 BM25，不影响游玩。
+    "memory": {"chronicle": True, "summary_every": 8},
     "server": {"host": "0.0.0.0", "port": 8000},
     # 剧本文件（相对 RESOURCE_DIR；也可写绝对路径）
     "script": "scripts/sample_script.json",

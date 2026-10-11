@@ -33,7 +33,7 @@ python -m server.main
 - **同一局域网**：直接连上面的局域网地址。
 - **跨网络**：给服务器电脑做公网映射 / 内网穿透（如 frp、cpolar），或把服务器部署到云主机。
 
-## 三个 Agent 与两条模型通道
+## 三个 Agent 与三条模型通道
 
 游戏里有**三个 Agent**，都按标准写法实现（模型自己决定调哪个工具 → 服务端执行 → 结果回灌 → 循环到收尾）：
 
@@ -85,6 +85,45 @@ cp config.example.json config.json
 
 > 旧变量名 `RPGBAR_LLM_API_KEY` / `_BASE_URL` / `_MODEL` 仍然可用，会自动映射到主机 DM 槽位。
 
+### 内置引擎（进程内，零外部服务）
+
+第三条通道：**内置推理引擎**（`RPGBarEngine` —— 这个项目自己的 C++ 引擎）。
+它**进程内直连 `rpg_engine.dll`**，不用起 llama.cpp / Ollama，也不占任何端口，
+不用管版本兼容、不用管端口冲突；权重就是一份 GGUF。
+
+改一处开关、把想用它的槽位 `kind` 改成 `engine`：
+
+```jsonc
+{
+  "engine": {
+    "enabled": true,
+    "lib": "",        // 留空 = 自动找 models/rpg_engine.dll
+    "model": "",      // 留空 = 自动找 models/Qwen3-*.gguf
+    "threads": 0,     // 0 = 引擎按 CPU 核数自己定
+    "context": 2048,  // 每个会话的 KV Cache 容量（约 230 MiB/会话，别盲目调大）
+    "max_tokens": 512,
+    "think": true     // Qwen3 思考模式；关掉更快，但裁定质量下降
+  },
+  "models": {
+    "assistant": { "kind": "engine" },   // 主机小助手：跑在主机
+    "advisor":   { "kind": "engine" }    // 玩家小助手：每端一份，本地跑
+  }
+}
+```
+
+**先自检这台机器能不能用**（不启动服务器，也不写任何文件）：
+
+```bash
+python scripts/engine_probe.py
+```
+
+它会把「库 → 权重 → 单轮对话 → 工具调用」挨个跑一遍，并报出引擎版本与实测
+tok/s。**引擎没启用、或库与权重找不到时，`kind=engine` 的槽位会自动退化为
+`off`** —— 不报错，游戏照常可玩（与"三个槽位默认留空"是同一条不变量）。
+
+> 代价要提前知道：4B 权重在只有 CPU 的机器上约 7–10 tok/s，DM 一轮 25–35 秒。
+> 这是"全离线、不依赖任何外部服务"的固有代价，不是缺陷。
+
 DeepSeek / 智谱 GLM / 通义 Qwen 均为 OpenAI 兼容接口，改 `base_url` + `model` 即可切换。
 llama.cpp 的 `llama-server`、Ollama、LM Studio 同样暴露 OpenAI 兼容的 `/v1/chat/completions`，
 所以**本地模型与云 API 是同一套代码，只是 `base_url` 不同**：
@@ -98,6 +137,8 @@ llama-server -m qwen3-8b.Q4_K_M.gguf --port 8080   # 本地起一个
 很多小模型、老版本服务不认 `tools` 参数。这时 Agent 会自动降级为**单轮 JSON 协议**：
 把同样的意图写成 `{"narration": "...", "move_to": "...", "set_flags": [...]}`，
 功能不减，只是少了多轮工具往复。「测试连接」会直接把结果告诉你。
+（**内置引擎不需要这条降级**：Qwen3 原生支持工具调用，引擎的 ChatML 渲染与
+`<tool_call>` 解析都对着官方模板逐字节做过对拍。）
 
 ## 剧情档案与内置嵌入模型
 

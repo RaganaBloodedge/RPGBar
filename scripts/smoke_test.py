@@ -1461,6 +1461,74 @@ async def run_live_chronicle():
             pass
 
 
+async def run_unit_engine():
+    """内置引擎的接入层。
+
+    刻意**不加载真实的 dll 与权重**（那样每个跑测试的机器都要先下 1.8 GB），
+    只验那些"坏了会静默出错"的形状与退化逻辑：路径找不到时不回退、引擎没启用时
+    槽位自动退化、工具调用形状转换对得上 `agents/base.py` 的消费方式。
+    """
+    print("\n== 内置引擎接入（不加载真实 dll）==")
+    from server import engine as engine_mod
+    from server.config import DEFAULTS, _apply_engine_slots
+    from server.llm import EngineProvider, _to_openai_calls, build_provider
+
+    # 1. 写了路径却找不到 → 返回 None，不偷偷换一个能加载的
+    check("引擎：显式路径不存在时不回退",
+          engine_mod.find_lib("Z:/nope/rpg_engine.dll") is None
+          and engine_mod.find_model("Z:/nope/nope.gguf") is None)
+    check("引擎：库或权重缺一就不建 Provider（静默退化）",
+          build_provider({"kind": "engine", "lib": "Z:/nope.dll",
+                          "model": "Z:/nope.gguf"}) is None)
+    check("引擎：kind=off 仍然返回 None（老行为不变）",
+          build_provider({"kind": "off"}) is None and build_provider(None) is None)
+
+    # 2. 配置：engine.enabled=false 时，kind=engine 的槽位退化为 off
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["models"]["assistant"]["kind"] = "engine"
+    _apply_engine_slots(cfg)
+    check("引擎：未启用时 engine 槽位退化为 off",
+          cfg["models"]["assistant"]["kind"] == "off")
+
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["engine"].update({"enabled": True, "context": 3072, "think": False})
+    cfg["models"]["advisor"]["kind"] = "engine"
+    _apply_engine_slots(cfg)
+    slot = cfg["models"]["advisor"]
+    check("引擎：启用后把 engine 段供货给槽位",
+          slot["kind"] == "engine" and slot["context"] == 3072
+          and slot["think"] is False and "lib" in slot)
+    cfg["models"]["advisor"]["context"] = 512
+    _apply_engine_slots(cfg)
+    check("引擎：槽位自己写了的字段优先于 engine 段",
+          cfg["models"]["advisor"]["context"] == 512)
+
+    # 3. 槽位公开状态：带 engine 详情，且**不下发绝对路径**
+    pub = describe_agents(
+        {"kind": "off"}, {"kind": "engine", "model": "D:/somewhere/Qwen3-1.7B.gguf"}
+    )["advisor"]
+    check("引擎：公开状态带 engine 详情",
+          isinstance(pub.get("engine"), dict) and "lib_ok" in pub["engine"]
+          and "ready" in pub["engine"])
+    check("引擎：公开状态只给权重文件名，不给本机路径",
+          pub["model"] == "Qwen3-1.7B.gguf", str(pub.get("model")))
+
+    # 4. 工具调用形状（Agent 层按 OpenAI 形状消费，见 agents/base.py）
+    calls = _to_openai_calls([
+        {"name": "read_scene", "arguments": {"scene": "大厅"}},
+        {"name": "bad", "arguments": None},   # 参数没解析出来 → 丢掉
+        {"name": "text", "arguments": "{}"},  # 不是对象 → 丢掉
+    ])
+    check("引擎：tool_calls 转成 OpenAI 形状",
+          len(calls) == 1 and calls[0]["type"] == "function"
+          and bool(calls[0]["id"])
+          and calls[0]["function"]["name"] == "read_scene"
+          and json.loads(calls[0]["function"]["arguments"]) == {"scene": "大厅"},
+          json.dumps(calls, ensure_ascii=False))
+    check("引擎：Provider 声明支持工具调用（Qwen3 原生 tool calling）",
+          EngineProvider.supports_tools is True)
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
@@ -1470,6 +1538,7 @@ async def main():
     await run_unit_npc()
     await run_unit_chronicle()
     await run_unit_scripts()
+    await run_unit_engine()
     if not unit_only:
         await run_live()
         await run_live_version()

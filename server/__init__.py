@@ -4,4 +4,4 @@
 每次发版记得同步更新 CHANGELOG.md。
 """
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"

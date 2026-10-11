@@ -29,6 +29,19 @@
 （暂无）
 
 
+## [0.10.1] - 2026-10-11
+
+### 修复
+
+- **CI 的 Windows 任务其实从来没跑起来过**。Windows runner 的控制台代码页不是
+  UTF-8（英文版是 cp1252），而 `smoke_test.py` 的第一行 `print` 就是中文 —— 直接抛
+  `UnicodeEncodeError`，一个断言都跑不到，任务判红。现在脚本自己把 stdout / stderr
+  重置成 UTF-8（`errors="replace"` 兜底），CI 里也加了 `PYTHONUTF8=1`，两层保险。
+  中文 Windows 的系统代码页是 cp936，能印中文，所以本地一直没暴露这个问题。
+- 同一条修复也覆盖 `scripts/fetch_embedding.py` 与 `scripts/engine_probe.py`：
+  前者在英文 Windows 上一样会崩。
+
+
 ## [0.10.0] - 2026-10-11
 
 ### 新增

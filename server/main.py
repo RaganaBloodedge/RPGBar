@@ -197,7 +197,7 @@ print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 
 
 
 # ---- 模型槽位的清洗与合并 ----
-ALLOWED_KINDS = ("off", "cloud", "local")
+ALLOWED_KINDS = ("off", "cloud", "local", "engine")
 
 
 def clean_slot_patch(patch) -> dict:
@@ -648,7 +648,11 @@ async def api_models_test(payload: dict = Body(...)):
     out = {"ok": False, "reply": "", "elapsed_ms": 0, "tool_calling": None}
     provider = build_provider(slot)
     if provider is None:
-        out["error"] = "配置不完整：云 API 需要 api_key，本地模型需要 base_url 与 model"
+        if (slot.get("kind") or "").lower() == "engine":
+            out["error"] = ("内置引擎不可用：库或权重没找到"
+                            "（在服务器上跑 python scripts/engine_probe.py 自检）")
+        else:
+            out["error"] = "配置不完整：云 API 需要 api_key，本地模型需要 base_url 与 model"
         return out
     if slot.get("base_url"):
         provider.base_url = slot["base_url"].rstrip("/")

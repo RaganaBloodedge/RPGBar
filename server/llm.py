@@ -1,12 +1,20 @@
 """LLM Provider 抽象：OpenAI 兼容接口，云 API 与本地模型共用同一套。
 
-两条通道都走 OpenAI 兼容协议，只是 `base_url` 不同：
+三条通道，对外都是同一组方法（`chat` / `chat_with_tools` / `close`）：
+
 - 云端 API：https://api.deepseek.com/v1、https://api.openai.com/v1、…（需要 api_key）
-- 本地模型：llama.cpp server（`llama-server`，默认 :8080）、Ollama（:11434/v1）、LM Studio（:1234/v1）
+- 本地服务：llama.cpp server（`llama-server`，默认 :8080）、Ollama（:11434/v1）、LM Studio（:1234/v1）
+- **内置引擎**：进程内直连 `rpg_engine.dll`，零 HTTP（见 `engine.py`）
 
 除了最基础的单轮 `chat()`，还提供标准 Agent 所需的 `chat_with_tools()`：
 把工具（JSON Schema）发给模型，模型返回 `tool_calls`，由调用方执行后把结果回灌。
 """
+import asyncio
+import json
+import threading
+from pathlib import Path
+
+from . import engine as engine_mod
 
 
 class ModelError(Exception):
@@ -100,19 +108,196 @@ class OpenAICompatProvider(LLMProvider):
         await self._client.aclose()
 
 
-def build_provider(slot) -> OpenAICompatProvider | None:
+def _to_openai_calls(calls) -> list:
+    """把引擎的 `{name, arguments}` 转成 OpenAI 的 `{id, type, function:{…}}`。
+
+    转这一层是必须的，不是风格问题：`agents/base.py` 的工具循环按 OpenAI 形状取
+    `call["function"]["name"]` 与 `fn["arguments"]`（字符串）。让 Agent 层去兼容
+    两种形状，等于把"换个后端"的成本摊到每个消费点上。
+
+    `arguments` 为 null 的调用**直接丢掉**：那表示引擎没能解析出合法参数（引擎自己
+    已经记了带原文的日志）。放一个 `{}` 出去会被当成"参数为空的调用"真的执行一次，
+    比丢掉更糟。
+    """
+    out = []
+    for c in calls or []:
+        if not isinstance(c, dict):
+            continue
+        args = c.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        out.append(
+            {
+                "id": f"call_{len(out)}",
+                "type": "function",
+                "function": {
+                    "name": c.get("name") or "",
+                    "arguments": json.dumps(args, ensure_ascii=False),
+                },
+            }
+        )
+    return out
+
+
+class EngineProvider(LLMProvider):
+    """内置自研引擎（进程内原生库，零 HTTP）。
+
+    **声明支持工具调用。** 这一点与"小模型多半不会函数调用"的常见印象相反，但在
+    这条路径上是事实：Qwen3 是原生 tool calling 模型，引擎的 ChatML 渲染与
+    `<tool_call>` 解析都对着官方模板逐字节对过（RPGBarEngine 的 `docs/DESIGN.md` §16）。
+    让 DM 在这条路径上降级成单轮 JSON，等于白丢模型本来就会的能力。
+
+    `temperature` 目前**只是收下**：引擎要 M2.5 才实现采样的确定性筛选，在那之前
+    一律按贪心跑。写在注释里而不是省略掉，是为了将来排查"调了旋钮没变化"时能立刻
+    定位。
+    """
+
+    name = "engine"
+    supports_tools = True
+
+    def __init__(self, lib, model_path, *, threads=0, context=2048, max_tokens=512,
+                 temperature=0.8, stop=None, think=True, label="engine"):
+        self.lib = lib
+        self.model_path = str(model_path)
+        self.threads = int(threads)
+        self.context = int(context)
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.stop = [str(s) for s in (stop or [])]
+        self.think = bool(think)
+        self.label = label
+        self.name = f"engine[{Path(self.model_path).stem}]"
+        self.last_usage: dict = {}
+
+        self._model = None
+        self._session = None
+        self._init_lock = threading.Lock()
+        # 引擎约定「单个会话同一时刻只允许一次 generate」，这里照着串行化。
+        self._busy = threading.Lock()
+
+    # ---- 生命周期 ----
+
+    def _ensure(self) -> int:
+        """懒建 model + session，返回会话句柄。
+
+        懒建而不是在 `__init__` 里建：`build_provider()` 在**建房、玩家加入、改配置**
+        等好几条路径上都会被调用一次，而加载权重要读 1~2.5 GB、每个会话的 KV Cache
+        又是几百 MB。构造时就分配的话，一次误调用就会真吃掉这些内存。
+        （同一个 Agent 的 Provider 由 `Room` 缓存，所以正常路径下只会建一次。）
+        """
+        with self._init_lock:
+            if self._session is None:
+                self._model = self.lib.model_for(
+                    self.model_path, threads=self.threads, max_pos=self.context
+                )
+                self._session = self.lib.new_session(
+                    self._model, max_seq=self.context, max_tokens=self.max_tokens,
+                    stop=self.stop,
+                )
+            return self._session
+
+    def _close_sync(self) -> None:
+        """销毁会话。**不卸载权重** —— 同一份权重通常被多个 Provider 共用（DM 与
+        小助手同进程），谁先 close 谁就会把别人的会话一起带走。权重交给进程退出回收。
+        """
+        with self._init_lock:
+            if self._session is not None:
+                try:
+                    self.lib.destroy_session(self._session)
+                finally:
+                    self._session = None
+
+    async def close(self):
+        self._close_sync()
+
+    def __del__(self):
+        try:
+            self._close_sync()
+        except Exception:  # noqa: BLE001  解释器收尾时什么都可能缺，静默即可
+            pass
+
+    # ---- 生成 ----
+
+    def _run(self, messages, tools) -> dict:
+        """同步跑一轮（阻塞几十秒，调用方负责丢到线程里）。"""
+        session = self._ensure()
+        req = {
+            "messages": [dict(m) for m in messages],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "enable_thinking": self.think,
+        }
+        if tools:
+            req["tools"] = tools
+        with self._busy:
+            reply = self.lib.generate(session, req)
+        self.last_usage = reply.get("usage") or {}
+        return reply
+
+    async def chat(self, messages, json_mode: bool = False) -> str:
+        # json_mode 对引擎没有意义：它的输出格式靠 messages 里的格式提示约束
+        # （`agents/` 的 json_hint 就是干这个的）。这里收下参数只为接口一致。
+        reply = await asyncio.to_thread(self._run, messages, None)
+        return reply.get("text") or ""
+
+    async def chat_with_tools(self, messages, tools) -> dict:
+        reply = await asyncio.to_thread(self._run, messages, tools)
+        return {
+            "content": reply.get("text") or "",
+            "tool_calls": _to_openai_calls(reply.get("tool_calls")),
+        }
+
+    # ---- 界面用的状态 ----
+
+    def describe(self) -> dict:
+        return {
+            "model": Path(self.model_path).name,
+            "context": self.context,
+            "max_tokens": self.max_tokens,
+            "think": self.think,
+            "usage": dict(self.last_usage),
+        }
+
+
+def build_provider(slot) -> LLMProvider | None:
     """由一个「模型槽位」配置构建 Provider；返回 None 表示走脚本化兜底。
 
-    槽位字段：kind（cloud/local/off）+ base_url + api_key + model + temperature。
+    槽位字段：kind + 各自的连接参数。
     - kind=off（默认，即"留空"）：不接模型，全部走脚本化兜底。
     - kind=cloud：必须有 api_key。
     - kind=local：不要求 api_key（本地服务一般不需要）。
+    - kind=engine：内置引擎，需要 `lib`（动态库）与 `model`（权重文件），二者在
+      `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（静默退化，
+      与"引擎加载失败 → 视为 off"是同一条降级链）。
     """
     if not isinstance(slot, dict):
         return None
     kind = (slot.get("kind") or "off").lower()
     if kind in ("off", "none", "scripted", ""):
         return None
+
+    if kind == "engine":
+        lib_path = engine_mod.find_lib((slot.get("lib") or "").strip())
+        model_path = engine_mod.find_model((slot.get("model") or "").strip())
+        if lib_path is None or model_path is None:
+            return None
+        try:
+            lib = engine_mod.open_lib(lib_path)
+        except engine_mod.EngineError:
+            # 库坏了/版本不对 → 当作没接模型。这条路径上"能玩"比"报错"重要。
+            return None
+        return EngineProvider(
+            lib,
+            model_path,
+            threads=int(slot.get("threads") or 0),
+            context=int(slot.get("context") or 2048),
+            max_tokens=int(slot.get("max_tokens") or 512),
+            temperature=float(slot.get("temperature", 0.8)),
+            stop=slot.get("stop"),
+            think=bool(slot.get("think", True)),
+            label="engine",
+        )
+
     base_url = (slot.get("base_url") or "").strip()
     model = (slot.get("model") or "").strip()
     api_key = (slot.get("api_key") or "").strip()
@@ -128,3 +313,4 @@ def build_provider(slot) -> OpenAICompatProvider | None:
         timeout=float(slot.get("timeout", 120.0)),
         label="local" if kind == "local" else "cloud",
     )
+

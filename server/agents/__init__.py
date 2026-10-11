@@ -10,6 +10,8 @@
 
 `describe_agents()` 供 `/api/version` 与界面展示模型槽位的接线状态。
 """
+from pathlib import Path
+
 from .advisor import AdvisorAgent, AdvisorContext
 from .base import Agent, AgentResult, Step, Tool
 from .narrator import NarratorAgent, NarratorContext
@@ -49,13 +51,40 @@ def _slot_public(slot, label) -> dict:
     slot = slot or {}
     kind = (slot.get("kind") or "off").lower()
     has_key = bool((slot.get("api_key") or "").strip())
-    ready = kind == "local" or (kind == "cloud" and has_key)
-    return {
+    engine_detail = None
+    if kind == "engine":
+        engine_detail = _engine_public(slot)
+        ready = engine_detail["ready"]
+    else:
+        ready = kind == "local" or (kind == "cloud" and has_key)
+    model = slot.get("model", "")
+    if kind == "engine" and model:
+        model = Path(model).name  # 内置引擎的 model 是权重路径，别把本机路径发给前端
+    out = {
         "label": label,
         "kind": kind,
         "base_url": slot.get("base_url", ""),
-        "model": slot.get("model", ""),
+        "model": model,
         "has_api_key": has_key,
         "ready": ready,
         "mode": "model" if ready else "scripted",
+    }
+    if engine_detail is not None:
+        out["engine"] = engine_detail
+    return out
+
+
+def _engine_public(slot) -> dict:
+    """内置引擎槽位的公开状态：只给布尔与文件名，不给绝对路径。"""
+    from ..engine import find_lib, find_model
+
+    lib = find_lib((slot.get("lib") or "").strip())
+    weights = find_model((slot.get("model") or "").strip())
+    return {
+        "lib_ok": lib is not None,
+        "model_ok": weights is not None,
+        "lib_name": lib.name if lib is not None else "",
+        "model_name": weights.name if weights is not None else "",
+        "context": int(slot.get("context") or 0),
+        "ready": lib is not None and weights is not None,
     }

@@ -34,7 +34,22 @@ CONFIG_PATH = USER_DIR / "config.json"
 EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 
 DEFAULTS = {
-    # 模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/ local（本地模型）
+    # 内置推理引擎（RPGBarEngine）：进程内直连 rpg_engine.dll，不需要任何外部服务。
+    # enabled=false（默认）时，任何 kind=engine 的槽位都自动退化为 off —— 没装引擎
+    # 的机器照常可玩（与"三个槽位默认留空"是同一条不变量）。
+    # lib / model 留空 = 自动探测：models/rpg_engine.dll 与 models/Qwen3-*.gguf。
+    # context 是每个会话的 KV Cache 容量（一个会话约 230 MiB @2048），别盲目调大。
+    "engine": {
+        "enabled": False,
+        "lib": "",
+        "model": "",
+        "threads": 0,        # 0 = 引擎按 CPU 核数自己决定
+        "context": 2048,
+        "max_tokens": 512,
+        "think": True,       # Qwen3 思考模式；关掉更快，但裁定质量下降
+    },
+    # 模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/
+    # local（本地服务）/ engine（内置引擎，由上面的 engine 段供货）。
     # 默认全部留空 —— 游戏照常可玩，配好任意一个即自动启用对应 Agent。
     # - dm：主机端 DM 大模型（推进剧情）。
     # - advisor：玩家端小助手小模型（只读，给行动建议）。
@@ -100,6 +115,27 @@ def _apply_env_slot(slot: dict, prefix: str) -> None:
         slot["kind"] = env[f"{prefix}_KIND"]
 
 
+def _apply_engine_slots(cfg: dict) -> None:
+    """把 `engine` 段供货给 `kind=engine` 的槽位；没启用就让它们退化为 off。
+
+    抽成独立函数是为了能被单元测试直接喂一份配置进去 —— 这段逻辑（"引擎没启用时
+    任何 engine 槽位都变成 off"）是"没装引擎的机器照常可玩"的实现处，值得单独测。
+    """
+    eng = cfg.get("engine") or {}
+    for name in ("dm", "assistant", "advisor"):
+        slot = (cfg.get("models") or {}).get(name)
+        if not isinstance(slot, dict):
+            continue
+        if (slot.get("kind") or "off").lower() != "engine":
+            continue
+        if not eng.get("enabled"):
+            slot["kind"] = "off"
+            continue
+        for key in ("lib", "model", "threads", "context", "max_tokens", "think"):
+            if key not in slot:
+                slot[key] = eng.get(key)
+
+
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
     if CONFIG_PATH.exists():
@@ -123,6 +159,21 @@ def load_config() -> dict:
     _apply_env_slot(cfg["models"]["dm"], "RPGBAR_DM_MODEL")
     _apply_env_slot(cfg["models"]["advisor"], "RPGBAR_ADVISOR_MODEL")
     _apply_env_slot(cfg["models"]["assistant"], "RPGBAR_ASSISTANT_MODEL")
+
+    # 内置引擎段：环境变量优先于配置文件的字段，但都要过一遍下面的"启用/退化"逻辑。
+    eng = cfg.setdefault("engine", {})
+    for key, env in (("lib", "RPGBAR_ENGINE_LIB"), ("model", "RPGBAR_ENGINE_MODEL")):
+        if os.environ.get(env):
+            eng[key] = os.environ[env]
+    if os.environ.get("RPGBAR_ENGINE"):
+        eng["enabled"] = os.environ["RPGBAR_ENGINE"].strip().lower() not in (
+            "", "0", "off", "false", "no",
+        )
+
+    # 把 engine 段供货给 kind=engine 的槽位（槽位自己写了字段就尊重槽位）；
+    # 引擎没启用时那些槽位退化为 off —— 不报错、不影响游玩。
+    _apply_engine_slots(cfg)
+
     if os.environ.get("RPGBAR_SCRIPT"):
         cfg["script"] = os.environ["RPGBAR_SCRIPT"]
     return cfg

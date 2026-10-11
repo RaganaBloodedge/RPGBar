@@ -57,6 +57,7 @@ from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
 from .dm import DM
 from .embedding import get_embedder
+from .engine import derive_seed
 from .llm import ToolCallingUnsupported, build_provider
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .rag import ScriptStore
@@ -251,6 +252,10 @@ class Room:
         self.code = code
         # 房间在创建时「钉住」当时的活动剧本：之后服务端换剧本，进行中的对局不受影响。
         self.store = script_store or store
+        # 本局随机种子：建房时掷一次、整局固定（引擎是纯函数，不给种子则每个房间
+        # 每一局的随机流都一模一样 —— "换个房间重开"其实拿到同一串随机数）。
+        # 只进服务端日志、不下发：想复现某一局的剧情，从日志里取这个数。
+        self.seed = secrets.randbits(63)
         self.state = GameState(self.store, self.store.start_scene)
         self.clients = []  # list[(name, websocket)]
         self.lock = asyncio.Lock()
@@ -272,17 +277,27 @@ class Room:
         self._summarized = len(self.chronicle) if self.chronicle else 0
 
     # ---- Agent 生命周期 ----
+    def _provider(self, slot, label):
+        """按会话派生种子后构建 Provider。
+
+        每个会话（DM / 主机小助手 / 每个玩家的小助手）拿一个**独立**的种子：
+        大家都要有创造性，但不该共用同一条随机流。种子落在会话上而不是槽位上 ——
+        槽位是配置、会原样下发给前端。
+        """
+        return build_provider(slot, seed=derive_seed(self.seed, label))
+
     def narrator(self) -> NarratorAgent:
         if self._narrator is None:
             self._narrator = NarratorAgent(
-                self.store, build_provider(self.dm_slot), npc=self.npc, chronicle=self.chronicle
+                self.store, self._provider(self.dm_slot, "dm"),
+                npc=self.npc, chronicle=self.chronicle
             )
         return self._narrator
 
     def assistant(self) -> AssistantAgent:
         """主机端小模型（NPC 人设 / 反应权重 / 摘要）。"""
         if self._assistant is None:
-            agent = AssistantAgent(self.store, build_provider(self.assistant_slot))
+            agent = AssistantAgent(self.store, self._provider(self.assistant_slot, "assistant"))
             self._assistant = agent
             if self.npc is not None:
                 self.npc.set_agent(agent)
@@ -292,7 +307,8 @@ class Room:
         info = self.advisors.get(name)
         if info is None or info.get("agent") is None:
             slot = info["slot"] if info else dict(default_advisor_slot)
-            info = {"slot": slot, "agent": AdvisorAgent(self.store, build_provider(slot))}
+            agent = AdvisorAgent(self.store, self._provider(slot, f"advisor:{name}"))
+            info = {"slot": slot, "agent": agent}
             self.advisors[name] = info
         return info["agent"]
 
@@ -799,6 +815,13 @@ async def ws_endpoint(ws: WebSocket):
                 code = gen_code()
             room = Room(code, room_store or store)
             rooms[code] = room
+            # 本局种子进日志、不进界面：要复现某一局的剧情就从这里取数
+            # （同一个种子 + 同一串输入 → 同一条随机流 → 同一个故事）。
+            print(
+                f"[RPGBar] 新房「{code}」本局种子 {room.seed}"
+                f"（DM {derive_seed(room.seed, 'dm')}"
+                f" / 小助手 {derive_seed(room.seed, 'assistant')}）"
+            )
         await room.on_join(name, character, ws)
 
         while True:

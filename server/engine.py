@@ -11,6 +11,10 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
 - **宿主每轮传完整 messages**：引擎自己做最长公共前缀匹配，只对新增的部分做前向。
   所以这里**不需要**替引擎记住对话历史，每轮把 messages 拼好直接传即可
   （拼装由 `agents/` 负责）。
+- **种子是会话属性**：引擎不产生随机性，随机数由宿主给的 `seed` 按 KV 绝对位置
+  展开（`u = f(seed, 位置)`）。`derive_seed()` 把「本局种子 + 会话标签」派生成各
+  会话的独立种子；**不给种子就会落到引擎默认 0** —— 那样每个房间、每一局的随机流
+  都完全一样，"换个房间重开"其实是同一串随机数。
 - **异常不穿 C ABI**：失败时返回负数 / 空指针，错误文本走 `rpg_engine_last_error()`。
 
 本模块的定位是"**任何一台机器上都能静默缺席**"：库或权重找不到时
@@ -20,6 +24,7 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import sys
 import threading
@@ -30,6 +35,31 @@ from .config import RESOURCE_DIR, USER_DIR
 
 class EngineError(Exception):
     """引擎不可用或调用失败（库/权重缺失、ABI 报错、返回非法 JSON）。"""
+
+
+# ---------------------------------------------------------------- 随机种子
+
+# 引擎的 seed 是无符号 64 位。房间种子只掷 63 位 —— 留一位余量，免得将来某个
+# 环节把它当有符号数（JSON / 某些语言的 int）时变成负数。
+MAX_SEED = (1 << 64) - 1
+
+
+def derive_seed(room_seed: int, label: str) -> int:
+    """由「本局种子 + 会话标签」派生一个独立的 64 位种子。
+
+    为什么要派生而不是直接共用：引擎是纯函数 —— 同一个 seed、同一段 KV 位置
+    → 同一个随机数 u。DM 与小助手共用同一份权重、各持一个独立会话，如果两边
+    拿同一个 seed，两边在相同位置就会抽到同一个 u。实际影响很小（两边提示词与
+    分布都不同），但派生一次是免费的，而且让"小助手也有创造性、但不与 DM 同
+    一条随机流"这件事在代码里显式。
+
+    用 blake2b 而**不是**内置 `hash()`：内置 hash 对 str 是按进程加盐的
+    （PYTHONHASHSEED），拿它当种子的话，"日志里记下的那个种子"换个进程就复现
+    不出来 —— 而可复现正是这个函数存在的全部理由。
+    """
+    key = (int(room_seed) & MAX_SEED).to_bytes(8, "big")
+    digest = hashlib.blake2b(label.encode("utf-8"), digest_size=8, key=key).digest()
+    return int.from_bytes(digest, "big")
 
 
 # ---------------------------------------------------------------- 找库 / 找权重
@@ -202,10 +232,14 @@ class EngineLib:
     # ---- 会话 ----
 
     def new_session(self, model: int, max_seq: int = 0, max_tokens: int = 512,
-                    stop: list[str] | None = None) -> int:
+                    stop: list[str] | None = None, seed: int | None = None) -> int:
         cfg: dict = {"max_seq": int(max_seq), "max_tokens": int(max_tokens)}
         if stop:
             cfg["stop"] = [str(s) for s in stop]
+        if seed is not None:
+            # 种子的落点是**会话**而不是每轮请求：本局固定，说一次就够。
+            # （引擎侧仍按"请求 > 会话"取值，将来要单轮换种子也不用改这里。）
+            cfg["seed"] = int(seed) & MAX_SEED
         h = self._lib.rpg_engine_session_create(
             ctypes.c_int32(model), json.dumps(cfg, ensure_ascii=False).encode("utf-8")
         )

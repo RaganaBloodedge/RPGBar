@@ -147,22 +147,30 @@ class EngineProvider(LLMProvider):
     `<tool_call>` 解析都对着官方模板逐字节对过（RPGBarEngine 的 `docs/DESIGN.md` §16）。
     让 DM 在这条路径上降级成单轮 JSON，等于白丢模型本来就会的能力。
 
-    `temperature` 目前**只是收下**：引擎要 M2.5 才实现采样的确定性筛选，在那之前
-    一律按贪心跑。写在注释里而不是省略掉，是为了将来排查"调了旋钮没变化"时能立刻
-    定位。
+    `temperature` 与 `seed` 决定"这一轮有多活"，两者是**正交的两条链**：
+
+    - `temperature` 是引擎内的**确定性筛选**（缩放 logits，改变分布形状），每轮随
+      请求传，所以在设置里改完立即生效；
+    - `seed` 是随机数的来源，房间创建时掷一次、整局固定（`main.Room.seed`），
+      引擎按 `u = f(seed, KV 绝对位置)` 展开。
+
+    同一个 `u` 配不同温度会选出不同 token；温度趋 0 时分布变成尖刺，那时无论种子
+    是什么都选同一个 token（贪心）。反过来，**不给 seed 就等于没有变化** —— 引擎
+    默认 0，每个房间每一局都会抽出同一串随机数。
     """
 
     name = "engine"
     supports_tools = True
 
     def __init__(self, lib, model_path, *, threads=0, context=2048, max_tokens=512,
-                 temperature=0.8, stop=None, think=True, label="engine"):
+                 temperature=0.8, seed=None, stop=None, think=True, label="engine"):
         self.lib = lib
         self.model_path = str(model_path)
         self.threads = int(threads)
         self.context = int(context)
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
+        self.seed = None if seed is None else int(seed)
         self.stop = [str(s) for s in (stop or [])]
         self.think = bool(think)
         self.label = label
@@ -192,7 +200,7 @@ class EngineProvider(LLMProvider):
                 )
                 self._session = self.lib.new_session(
                     self._model, max_seq=self.context, max_tokens=self.max_tokens,
-                    stop=self.stop,
+                    stop=self.stop, seed=self.seed,
                 )
             return self._session
 
@@ -259,7 +267,7 @@ class EngineProvider(LLMProvider):
         }
 
 
-def build_provider(slot) -> LLMProvider | None:
+def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
     """由一个「模型槽位」配置构建 Provider；返回 None 表示走脚本化兜底。
 
     槽位字段：kind + 各自的连接参数。
@@ -269,6 +277,10 @@ def build_provider(slot) -> LLMProvider | None:
     - kind=engine：内置引擎，需要 `lib`（动态库）与 `model`（权重文件），二者在
       `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（静默退化，
       与"引擎加载失败 → 视为 off"是同一条降级链）。
+
+    `seed` 是**运行时状态**而非配置，所以走形参而不是槽位字段 —— 槽位会原样下发
+    给前端，种子只该进服务端日志。目前只有 `kind=engine` 用它（引擎是纯函数，
+    不给种子则每局随机流相同）；云 / 本地服务的温度由对方服务端抽样，暂不转发。
     """
     if not isinstance(slot, dict):
         return None
@@ -293,6 +305,7 @@ def build_provider(slot) -> LLMProvider | None:
             context=int(slot.get("context") or 2048),
             max_tokens=int(slot.get("max_tokens") or 512),
             temperature=float(slot.get("temperature", 0.8)),
+            seed=seed,
             stop=slot.get("stop"),
             think=bool(slot.get("think", True)),
             label="engine",

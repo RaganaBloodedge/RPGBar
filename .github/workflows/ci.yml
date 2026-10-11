@@ -19,6 +19,11 @@ jobs:
   unit:
     name: 进程内校验（${{ matrix.os }} · py${{ matrix.python-version }}）
     runs-on: ${{ matrix.os }}
+    env:
+      # Windows runner 的控制台不是 UTF-8（英文版是 cp1252），脚本里第一行含中文的
+      # print 就会抛 UnicodeEncodeError —— 一个断言都跑不到。这条让整个解释器走
+      # UTF-8 模式（脚本自己也做了 stdout 兜底，两层保险）。
+      PYTHONUTF8: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +56,8 @@ jobs:
   integration:
     name: 实时联机 + 前端 DOM 校验
     runs-on: ubuntu-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
 

@@ -19,6 +19,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Windows 的 Python 默认按系统代码页编码 stdout（英文版是 cp1252），中文会直接抛
+# UnicodeEncodeError。这个脚本正是给玩家在 Windows 上跑的，所以显式转 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 from server import engine as engine_mod  # noqa: E402
 from server.llm import build_provider  # noqa: E402
 

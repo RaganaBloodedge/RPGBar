@@ -17,6 +17,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# 控制台编码：Windows 上 Python 默认按系统代码页编码 stdout，**英文版是 cp1252**，
+# 连"进程内校验"这几个字都印不出来 —— 而且是在第一行 print 就抛 UnicodeEncodeError，
+# 一个断言都跑不到（CI 的 windows runner 就是这么红的）。显式转成 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):  # 被重定向到不支持 reconfigure 的对象
+        pass
+
 from server import __version__
 from server.agents import (
     AdvisorAgent,

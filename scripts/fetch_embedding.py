@@ -19,6 +19,14 @@ import argparse
 import sys
 from pathlib import Path
 
+# Windows 的 Python 默认按系统代码页编码 stdout（英文版是 cp1252），中文会抛
+# UnicodeEncodeError。这个脚本给玩家在 Windows 上跑，显式转 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 REPO = "Xenova/bge-small-zh-v1.5"
 SOURCES = {
     "mirror": f"https://hf-mirror.com/{REPO}/resolve/main",

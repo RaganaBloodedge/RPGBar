@@ -164,6 +164,16 @@ async def run_unit():
     check("房间：所有人都拿到小助手 prompt", bool(other_ctx["prompt"]["advisor"]))
     check("房间：DM 与小助手 prompt 不相同", host_ctx["prompt"]["dm"] != host_ctx["prompt"]["advisor"])
 
+    # ---- 本局随机种子：建房时掷一次、整局固定（引擎是纯函数，不给种子则每局雷同）----
+    from server.engine import derive_seed
+
+    check("房间：建房时掷出本局种子（63 位无符号）",
+          isinstance(room.seed, int) and 0 <= room.seed < 2 ** 63, str(room.seed))
+    check("房间：DM 与小助手各得一条独立随机流",
+          derive_seed(room.seed, "dm") != derive_seed(room.seed, "assistant"))
+    check("房间：同种子同标签可复现（日志里那个数能还原同一局）",
+          derive_seed(room.seed, "dm") == derive_seed(room.seed, "dm"))
+
 
 async def run_unit_totsk():
     """第二个剧本《蛇王墓·第一层》：验证真实模组（多场景/门控/机关）也能被引擎驱动。"""
@@ -1536,6 +1546,82 @@ async def run_unit_engine():
           json.dumps(calls, ensure_ascii=False))
     check("引擎：Provider 声明支持工具调用（Qwen3 原生 tool calling）",
           EngineProvider.supports_tools is True)
+
+    # 5. 随机种子：引擎是纯函数，随机数由宿主给的 seed 展开。
+    #    「谁带 seed、谁带 temperature」是一条协议（种子落在会话上、温度落在请求上），
+    #    用假 lib 就能验，不需要 1.8 GB 权重。
+    check("引擎：derive_seed 跨进程稳定（换成内置 hash 就会挂）",
+          engine_mod.derive_seed(123456789, "dm") == 16183909127468317860,
+          str(engine_mod.derive_seed(123456789, "dm")))
+    check("引擎：derive_seed 落在 uint64 内",
+          0 <= engine_mod.derive_seed(0, "dm") <= engine_mod.MAX_SEED
+          and 0 <= engine_mod.derive_seed(engine_mod.MAX_SEED, "x") <= engine_mod.MAX_SEED)
+    check("引擎：不同会话拿到不同种子",
+          len({engine_mod.derive_seed(7654321, lb)
+               for lb in ("dm", "assistant", "advisor:阿甲")}) == 3)
+    check("引擎：不同房间拿到不同种子",
+          engine_mod.derive_seed(1, "dm") != engine_mod.derive_seed(2, "dm"))
+
+    class _FakeLib:
+        """只验协议形状，不碰真实 dll。"""
+
+        def __init__(self):
+            self.session_cfg = None
+            self.request = None
+
+        def model_for(self, path, **kw):
+            return 1
+
+        def new_session(self, model, **kw):
+            self.session_cfg = kw
+            return 2
+
+        def generate(self, session, req):
+            self.request = req
+            return {"text": "ok", "usage": {}}
+
+        def destroy_session(self, session):
+            pass
+
+    fake = _FakeLib()
+    EngineProvider(fake, "Z:/fake.gguf", context=1024, max_tokens=64,
+                   temperature=0.9, seed=4242
+                   )._run([{"role": "user", "content": "在吗"}], None)
+    check("引擎：种子在建会话时一次性交给引擎（整局固定）",
+          fake.session_cfg.get("seed") == 4242, str(fake.session_cfg))
+    check("引擎：温度每轮随请求传（设置里改完即时生效）",
+          fake.request.get("temperature") == 0.9 and "temperature" not in fake.session_cfg,
+          str(fake.request))
+
+    fake2 = _FakeLib()
+    EngineProvider(fake2, "Z:/f.gguf")._ensure()
+    check("引擎：没给种子时把 None 原样带下去",
+          fake2.session_cfg.get("seed") is None, str(fake2.session_cfg))
+
+    # 「不带种子」的真正落点在 EngineLib.new_session：不往会话配置里写这个键
+    # （引擎侧"没写 = 用它自己的默认"，于是 M4 的老请求依旧逐位一致）。
+    from server.engine import EngineLib
+
+    seen = {}
+
+    class _StubCore:
+        def rpg_engine_session_create(self, model, buf):
+            seen["cfg"] = json.loads(buf.decode("utf-8"))
+            return 7
+
+    stub = object.__new__(EngineLib)
+    stub._lib = _StubCore()
+    stub.new_session(1, max_seq=512, max_tokens=32)
+    check("引擎：不给种子时会话配置里没有 seed 键", "seed" not in seen["cfg"], str(seen["cfg"]))
+    stub.new_session(1, seed=4242)
+    check("引擎：给了种子就写进会话配置", seen["cfg"].get("seed") == 4242, str(seen["cfg"]))
+    stub.new_session(1, seed=(1 << 70) + 5)
+    check("引擎：越界的种子被钳进 uint64",
+          seen["cfg"]["seed"] == ((1 << 70) + 5) & engine_mod.MAX_SEED, str(seen["cfg"]))
+
+    leaked = describe_agents({}, {"kind": "engine", "model": "Q.gguf", "seed": 4242})["advisor"]
+    check("引擎：公开状态不含种子（只进服务端日志）",
+          "seed" not in json.dumps(leaked, ensure_ascii=False), json.dumps(leaked, ensure_ascii=False))
 
 
 async def main():

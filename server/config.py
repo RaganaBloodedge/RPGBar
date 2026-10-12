@@ -115,6 +115,23 @@ def _apply_env_slot(slot: dict, prefix: str) -> None:
         slot["kind"] = env[f"{prefix}_KIND"]
 
 
+def _looks_like_engine_weight(value) -> bool:
+    """槽位里的 `model` 在 **engine 语境**下是否说得通 —— 即它像个权重文件。
+
+    槽位 DEFAULTS 里的 `model` 是给云 / 本地通道用的**模型名**（`deepseek-chat`、
+    `qwen2.5-3b-instruct`、`local-model` …）。这些名字在 engine 通道下毫无意义：
+    引擎要的是 `.gguf` 文件。所以判断"槽位是不是自己指定了 engine 的权重"，
+    不能看它**有没有**写 `model`（DEFAULTS 里永远有），要看它写的东西**说不说得通**。
+
+    说得通（`.gguf` 结尾，或带路径分隔符）→ 尊重槽位，支持"DM 用 4B、小助手用
+    1.7B"这类分槽位配置；说不通 → 用 `engine` 段的 `model` 顶替。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return False
+    return s.lower().endswith(".gguf") or "/" in s or "\\" in s
+
+
 def _apply_engine_slots(cfg: dict) -> None:
     """把 `engine` 段供货给 `kind=engine` 的槽位；没启用就让它们退化为 off。
 
@@ -131,9 +148,15 @@ def _apply_engine_slots(cfg: dict) -> None:
         if not eng.get("enabled"):
             slot["kind"] = "off"
             continue
-        for key in ("lib", "model", "threads", "context", "max_tokens", "think"):
+        for key in ("lib", "threads", "context", "max_tokens", "think"):
             if key not in slot:
                 slot[key] = eng.get(key)
+        # `model` 单独处理，见 `_looks_like_engine_weight`：判据是"槽位写的值在
+        # engine 下说不说得通"，而不是"槽位有没有这个键" —— 后者会让 engine 段的
+        # 权重路径永远被槽位的云模型名挡住（README 推荐的写法开不通的根因）。
+        # engine 段留空时把槽位也清空，交给 `find_model("")` 自动探测。
+        if not _looks_like_engine_weight(slot.get("model")):
+            slot["model"] = eng.get("model") or ""
 
 
 def load_config() -> dict:

@@ -58,12 +58,18 @@ def _slot_public(slot, label) -> dict:
     else:
         ready = kind == "local" or (kind == "cloud" and has_key)
     model = slot.get("model", "")
-    if kind == "engine" and model:
-        model = Path(model).name  # 内置引擎的 model 是权重路径，别把本机路径发给前端
+    if kind == "engine":
+        # 内置引擎的 model 是权重路径（也可能留空 = 自动探测）—— 两种都别把本机
+        # 路径发给前端。留空时回落到**探测到的实际文件名**，否则界面上会显示成空，
+        # 看着像"没配上"，而其实引擎已经就绪。
+        model = Path(model).name if model else ""
+        model = model or (engine_detail or {}).get("model_name", "")
     out = {
         "label": label,
         "kind": kind,
-        "base_url": slot.get("base_url", ""),
+        # 内置引擎没有 base_url 这个概念（进程内直连）—— 槽位里那个是云通道留下的
+        # 默认值，显示出去只会误导，这里置空。
+        "base_url": "" if kind == "engine" else slot.get("base_url", ""),
         "model": model,
         "has_api_key": has_key,
         "ready": ready,

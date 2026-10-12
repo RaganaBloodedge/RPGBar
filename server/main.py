@@ -191,7 +191,8 @@ for key in ("dm", "advisor", "assistant"):
     if not a:
         continue
     if a["ready"]:
-        print(f"[RPGBar] {a['label']}：{a['kind']} · {a['base_url']} · {a['model']}")
+        where = "进程内直连" if a["kind"] == "engine" else a["base_url"]
+        print(f"[RPGBar] {a['label']}：{a['kind']} · {where} · {a['model']}")
     else:
         print(f"[RPGBar] {a['label']}：未接模型（留空），走脚本化兜底")
 print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 API 或本地模型）。")

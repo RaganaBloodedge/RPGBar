@@ -959,8 +959,20 @@ def live_actions(script_name):
     return LIVE_SCRIPTS[0][1]
 
 
+_TIMEOUT_SCALE = float(os.environ.get("RPGBAR_TEST_TIMEOUT_SCALE", "1") or "1")
+"""联机测试的超时倍数。
+
+默认 1（即 6 / 8 秒），对云 API 与本机 llama.cpp 这类秒级返回的通道够用。
+**内置引擎是纯 CPU 推理**：实测 1.7B 生成一条行动建议约 96 秒、DM 一轮旁白数十秒，
+远超默认值 —— 那样测出来的 `[FAIL]` 是"等不到"而不是"功能坏"。
+跑引擎配置时把倍数放宽，例如：
+
+    RPGBAR_TEST_TIMEOUT_SCALE=30 python scripts/smoke_test.py
+"""
+
+
 async def recv_until(ws, pred, timeout=6.0):
-    end = time.time() + timeout
+    end = time.time() + timeout * _TIMEOUT_SCALE
     got = None
     while time.time() < end:
         try:
@@ -1054,7 +1066,7 @@ async def run_live_version():
 async def collect(ws, count, timeout=8.0):
     """按顺序收集若干条消息（不丢弃中间消息，便于断言顺序）。"""
     msgs = []
-    end = time.time() + timeout
+    end = time.time() + timeout * _TIMEOUT_SCALE
     while len(msgs) < count and time.time() < end:
         try:
             msgs.append(json.loads(await asyncio.wait_for(ws.recv(), timeout=end - time.time())))
@@ -1521,6 +1533,34 @@ async def run_unit_engine():
     _apply_engine_slots(cfg)
     check("引擎：槽位自己写了的字段优先于 engine 段",
           cfg["models"]["advisor"]["context"] == 512)
+
+    # 2.5 槽位 `model` 的供货（README 推荐写法的实现处）
+    # 槽位 DEFAULTS 里的 model 是云 / 本地通道的**模型名**（deepseek-chat 等），
+    # 在 engine 下没有意义 —— 判据必须是"这个值说不说得通"，不是"槽位有没有这个键"。
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["engine"].update({"enabled": True, "model": "D:/weights/Qwen3-1.7B.gguf"})
+    cfg["models"]["dm"]["kind"] = "engine"
+    _apply_engine_slots(cfg)
+    check("引擎：engine.model 顶替槽位的云模型名默认值",
+          cfg["models"]["dm"]["model"] == "D:/weights/Qwen3-1.7B.gguf",
+          repr(cfg["models"]["dm"]["model"]))
+
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["engine"].update({"enabled": True, "model": "D:/weights/default.gguf"})
+    cfg["models"]["dm"].update(
+        {"kind": "engine", "model": "D:/weights/Qwen3-4B.gguf"})
+    _apply_engine_slots(cfg)
+    check("引擎：槽位显式写的权重路径优先于 engine 段",
+          cfg["models"]["dm"]["model"] == "D:/weights/Qwen3-4B.gguf",
+          repr(cfg["models"]["dm"]["model"]))
+
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["engine"].update({"enabled": True, "model": ""})
+    cfg["models"]["dm"]["kind"] = "engine"
+    _apply_engine_slots(cfg)
+    check("引擎：engine.model 留空时槽位也清空（触发自动探测）",
+          cfg["models"]["dm"]["model"] == "",
+          repr(cfg["models"]["dm"]["model"]))
 
     # 3. 槽位公开状态：带 engine 详情，且**不下发绝对路径**
     pub = describe_agents(

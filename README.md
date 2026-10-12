@@ -91,7 +91,17 @@ cp config.example.json config.json
 它**进程内直连 `rpg_engine.dll`**，不用起 llama.cpp / Ollama，也不占任何端口，
 不用管版本兼容、不用管端口冲突；权重就是一份 GGUF。
 
-改一处开关、把想用它的槽位 `kind` 改成 `engine`：
+**第一步：把引擎产物接到本项目**（动态库 + 权重，二者都在引擎仓库里）：
+
+```bash
+python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
+```
+
+默认用**硬链接**（同一磁盘卷内零额外空间 —— 权重 1 GB 量级，复制一份纯属浪费），
+跨盘或文件系统不支持时自动回退为复制。`models/` 下出现 `rpg_engine.dll` 与
+`Qwen3-*.gguf` 即可。也可以跳过这一步，直接在下面把 `lib` / `model` 写成绝对路径。
+
+**第二步：改一处开关**，把想用它的槽位 `kind` 改成 `engine`：
 
 ```jsonc
 {
@@ -110,6 +120,10 @@ cp config.example.json config.json
   }
 }
 ```
+
+> 槽位**只需要写 `kind`** —— `lib` / `model` / `threads` / `context` 由 `engine` 段
+> 统一供货。想让某个槽位用**另一份权重**（比如 DM 用 4B、小助手用 1.7B），在那个槽位里
+> 写一行 `"model": "<绝对路径>.gguf"` 就行：**槽位显式写的权重优先于 `engine` 段**。
 
 **先自检这台机器能不能用**（不启动服务器，也不写任何文件）：
 

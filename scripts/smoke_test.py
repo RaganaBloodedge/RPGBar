@@ -985,6 +985,23 @@ async def recv_until(ws, pred, timeout=6.0):
     return got
 
 
+async def drain_pending(ws, budget=0.05, limit=80):
+    """把**已经排队**的消息读干净。
+
+    房间事件是广播的（DM 的 `thinking` 是房间级状态，见 main.py 的 `broadcast`），
+    所以别的玩家推进场景时塞进本连接的那些 `thinking(dm, active=True)` 会一直躺在
+    socket 里。若不断言前先清掉，下面 `recv_until(thinking)` 拿到的就是**上一轮**的
+    旧事件 —— 断言"本轮请求先广播了什么"必须先清场。
+
+    （小助手的 `thinking` 是 `send_to` 私发给请求者的，不会串台；会被串的只有 DM 的。）
+    """
+    for _ in range(limit):
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=budget)
+        except Exception:  # noqa: BLE001  TimeoutError / 连接关闭都算"清完了"
+            break
+
+
 async def run_live():
     print("== 实时联机校验（需服务器已启动） ==")
     try:
@@ -1023,12 +1040,26 @@ async def run_live():
         check("联机：检定触发骰子事件", bool(dice_ev), "无 dice 事件")
 
         # 梅林请求助手建议
+        # 先清掉房间广播塞进来的旧事件（亚瑟那两步的 thinking(dm) 都还在 b 的队列里），
+        # 否则下面拿到的会是「亚瑟行动时的 DM 思考」而不是「梅林请求的助手思考」。
+        await drain_pending(b)
         await b.send(json.dumps({"type": "suggest"}, ensure_ascii=False))
+        th = await recv_until(
+            b,
+            lambda m: m["type"] == "thinking" and m.get("who") == "advisor" and m.get("active") is True,
+        )
+        check("联机：请求建议会先广播「助手思考中」", bool(th), str(th)[:80])
         sug = await recv_until(b, lambda m: m["type"] == "suggestions")
         check("联机：助手建议返回", bool(sug) and len(sug.get("options", [])) > 0, str(sug)[:80])
 
         # 梅林自由发挥（触发 DM 旁白）
+        await drain_pending(b)
         await b.send(json.dumps({"type": "action", "text": "我环顾四周，警惕地观察"}, ensure_ascii=False))
+        th2 = await recv_until(
+            b,
+            lambda m: m["type"] == "thinking" and m.get("who") == "dm" and m.get("active") is True,
+        )
+        check("联机：行动会先广播「DM 推理中」", bool(th2), str(th2)[:80])
         nar = await recv_until(b, lambda m: m["type"] == "narration")
         check("联机：自由发挥触发 DM 旁白", bool(nar), "无 narration")
     finally:
@@ -1418,10 +1449,16 @@ async def run_live_npc():
         await a.send(json.dumps({"type": "join", "name": "甲", "room": room, "character": {"cls": "战士"}}, ensure_ascii=False))
         wa = await recv_until(a, lambda m: m["type"] == "welcome")
         npcs = (wa or {}).get("npcs") or []
-        check("NPC 实时：welcome 同步本房间 NPC 列表", any(n.get("name") == "老周" for n in npcs), str(npcs)[:140])
+        # 断言「房间的 NPC 列表被同步下来了、每张卡都有名字」——不写死具体名字：
+        # NPC 来自**当前活动剧本**（sample_script 是老周、蛇王墓是卡特·维恩……），
+        # 写死一个名字等于把这条断言绑在某个剧本上。
+        check("NPC 实时：welcome 同步本房间 NPC 列表",
+              bool(npcs) and all(n.get("name") for n in npcs), str(npcs)[:140])
         check("NPC 实时：NPC 卡带身份", any(n.get("role") for n in npcs), str(npcs)[:140])
 
-        await a.send(json.dumps({"type": "action", "text": "我打了老周一拳"}, ensure_ascii=False))
+        # 互动对象取本房间第一张人物卡（同样不写死名字）。
+        npc_name = npcs[0]["name"] if npcs else "路人"
+        await a.send(json.dumps({"type": "action", "text": f"我盯着{npc_name}看"}, ensure_ascii=False))
         got, deadline = [], time.time() + 10
         while time.time() < deadline:
             try:
@@ -1562,6 +1599,40 @@ async def run_unit_engine():
           cfg["models"]["dm"]["model"] == "",
           repr(cfg["models"]["dm"]["model"]))
 
+    # 2.6 界面上的「内置引擎」开关（设置抽屉里那一段）：白名单 + 房间级合并
+    from server.main import Room, clean_engine_patch
+
+    dirty = clean_engine_patch({
+        "enabled": True, "think": True,
+        "lib": "C:/evil.dll", "model": "C:/evil.gguf",   # 不在白名单 → 必须丢掉
+        "context": 999999, "max_tokens": 1, "junk": 1,
+    })
+    check("引擎：界面补丁只收白名单字段（lib / model 进不来）",
+          "lib" not in dirty and "model" not in dirty and "junk" not in dirty,
+          str(dirty))
+    check("引擎：界面补丁把 context / max_tokens 钳进合理区间",
+          dirty["context"] == 32768 and dirty["max_tokens"] == 16, str(dirty))
+    check("引擎：界面补丁接受布尔开关",
+          dirty["enabled"] is True and dirty["think"] is True, str(dirty))
+    check("引擎：界面补丁对垃圾输入返回空",
+          clean_engine_patch(None) == {} and clean_engine_patch("x") == {})
+
+    # 合并语义：engine_slot 覆盖槽位同名项、但**不改动原槽位**（它还要下发前端）
+    room = Room.__new__(Room)   # 绕过 __init__：这条断言只碰 _effective_slot
+    room.engine_slot = {"enabled": True, "think": True, "context": 8192, "max_tokens": 256}
+    dm = {"kind": "engine", "think": False, "context": 1024, "model": "D:/w.gguf"}
+    eff = room._effective_slot(dm)
+    check("引擎：界面设置覆盖槽位里的同名字段",
+          eff["think"] is True and eff["context"] == 8192 and eff["max_tokens"] == 256,
+          str(eff))
+    check("引擎：合并不改动原槽位",
+          dm["think"] is False and dm["context"] == 1024, str(dm))
+    check("引擎：非 engine 槽位原样返回",
+          room._effective_slot({"kind": "cloud"}) == {"kind": "cloud"})
+    room.engine_slot = {"enabled": False}
+    check("引擎：界面关掉引擎后该槽位视为没模型",
+          room._effective_slot({"kind": "engine"}) is None)
+
     # 3. 槽位公开状态：带 engine 详情，且**不下发绝对路径**
     pub = describe_agents(
         {"kind": "off"}, {"kind": "engine", "model": "D:/somewhere/Qwen3-1.7B.gguf"}
@@ -1586,6 +1657,34 @@ async def run_unit_engine():
           json.dumps(calls, ensure_ascii=False))
     check("引擎：Provider 声明支持工具调用（Qwen3 原生 tool calling）",
           EngineProvider.supports_tools is True)
+
+    # 4b. 生成锁：引擎在**同一份权重**上不支持并发 generate（两个房间同时跑 →
+    #     服务器进程无声消失：日志停在「已创建会话 #2」，无异常栈）。所以锁必须按
+    #     **权重路径**共享 —— 一个房间一个 Provider，实例级锁在多房间时形同虚设。
+    check("引擎：同一份权重的生成锁是同一把（全局串行）",
+          engine_mod.model_lock("D:/m/Qwen3-1.7B.gguf") is engine_mod.model_lock("D:/m/Qwen3-1.7B.gguf"))
+    check("引擎：不同权重的生成锁互不影响（可并行）",
+          engine_mod.model_lock("D:/m/A.gguf") is not engine_mod.model_lock("D:/m/B.gguf"))
+    _pa = EngineProvider(None, "D:/m/Qwen3-1.7B.gguf")
+    _pb = EngineProvider(None, "D:/m/Qwen3-1.7B.gguf")
+    check("引擎：同权重的两个 Provider 共用生成锁（多房间并发被真正串行化）",
+          _pa._gen_lock is _pb._gen_lock is engine_mod.model_lock("D:/m/Qwen3-1.7B.gguf"))
+
+    # 4c. model_for 的加载在锁内：避免两个线程同时 miss、重复加载同一份 GGUF。
+    class _CountingLib(engine_mod.EngineLib):
+        def __init__(self):  # 不碰真实 dll
+            self._lock = __import__("threading").Lock()
+            self._models = {}
+            self.loads = 0
+
+        def load_model(self, model_path, **kw):
+            self.loads += 1
+            return 100 + self.loads
+
+    _lib = _CountingLib()
+    _h1 = _lib.model_for("D:/m/X.gguf")
+    _h2 = _lib.model_for("D:/m/X.gguf")
+    check("引擎：同一路径只加载一次权重", _h1 == _h2 and _lib.loads == 1, f"loads={_lib.loads}")
 
     # 5. 随机种子：引擎是纯函数，随机数由宿主给的 seed 展开。
     #    「谁带 seed、谁带 temperature」是一条协议（种子落在会话上、温度落在请求上），

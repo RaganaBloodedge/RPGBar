@@ -194,6 +194,32 @@ function startFakeLLM() {
   check("房主能看到两份 prompt", w.document.querySelectorAll("#room-sync .prompt-block").length === 2,
     String(w.document.querySelectorAll("#room-sync .prompt-block").length));
 
+  // ---- 「正在思考」提示：点「助手建议」应**立刻**出现占位（不等服务端）----
+  // 这类"点了没反应"的体验问题最容易静默回归，所以钉成断言。
+  $("suggest-btn").click();
+  check("点建议后发出 suggest 消息", sent.some((m) => m.type === "suggest"), JSON.stringify(sent.slice(-1)));
+  const logThink = q("#log .thinking");
+  const sugThink = q("#suggestions .thinking");
+  check("点建议后聊天框出现「助手正在思考…」", !!logThink && logThink.textContent.indexOf("助手正在思考") >= 0,
+    logThink ? logThink.textContent : "无");
+  check("建议区同时出现助手占位", !!sugThink);
+  check("思考期间「助手建议」按钮被禁用", $("suggest-btn").disabled === true);
+  // 服务端回 suggestions → 占位撤掉、选项渲染
+  ws.deliver({ type: "suggestions", options: ["观察四周", "检查石门"], agent: { source: "scripted" } });
+  check("收到建议后聊天框占位被撤掉", !q("#log .thinking"));
+  check("建议选项已渲染", w.document.querySelectorAll("#suggestions .suggestion").length === 2,
+    String(w.document.querySelectorAll("#suggestions .suggestion").length));
+  check("脚本化来源被标出（warn 标签）", !!q("#suggestions .suggest-src.warn"));
+  check("建议返回后按钮恢复可用", $("suggest-btn").disabled === false);
+  // 退化告警：agent_note（非 llm）要醒目地进聊天框
+  ws.deliver({ type: "agent_note", who: "dm", source: "degraded", stopped: "error", error: "序列超长" });
+  check("退化告警进聊天框（醒目条目）", !!q("#log .entry.system.warn"),
+    (q("#log .entry.system.warn") || {}).textContent || "无");
+  // busy：上一条没跑完时要有明确反馈（之前是静默丢弃）
+  ws.deliver({ type: "busy", who: "advisor", message: "上一轮还在推理中，稍后再点。" });
+  check("busy 提示进聊天框", ($("log").textContent || "").indexOf("请稍候") >= 0, "");
+  ws.deliver({ type: "thinking", active: false, who: "advisor" });
+
   // ---- 在场人物：welcome 里的 npcs 应渲染到侧栏（人物卡由主机小助手生成，连入即同步）----
   const npcItems = w.document.querySelectorAll("#npcs li");
   check("侧栏渲染出在场人物", npcItems.length === 1, String(npcItems.length));
@@ -218,6 +244,21 @@ function startFakeLLM() {
   check("DM 卡片未被锁（我是房主）", !$("card-dm").classList.contains("locked"));
   check("主机小助手卡片未被锁（我是房主）", !$("card-assistant").classList.contains("locked"));
   check("初始徽标为「未接入（脚化）」", $("badge-dm").textContent.indexOf("未接入") === 0, $("badge-dm").textContent);
+
+  // ---- 内置引擎卡片：think 开关默认关 ----
+  check("抽屉里有内置引擎卡片", !!$("card-engine"), "");
+  const engBoxes = () => $("card-engine").querySelectorAll(".check-field input[type=checkbox]");
+  check("引擎卡片有两个开关（启用 / think）", engBoxes().length === 2, String(engBoxes().length));
+  check("think 默认不勾（默认关）", engBoxes()[1].checked === false, "checked=" + engBoxes()[1].checked);
+  check("未启用时 think 开关不可点", engBoxes()[1].disabled === true);
+  check("内置引擎徽标为「未启用」", $("badge-engine").textContent.indexOf("未启用") === 0, $("badge-engine").textContent);
+
+  // 勾选「启用内置引擎」→ think 变可点，并出现 context / max_tokens
+  engBoxes()[0].checked = true;
+  engBoxes()[0].dispatchEvent(new w.Event("change", { bubbles: true }));
+  check("启用后出现 context / max_tokens 输入框", $("card-engine").querySelectorAll(".field input").length === 2, String($("card-engine").querySelectorAll(".field input").length));
+  check("启用后 think 开关可点", engBoxes()[1].disabled === false);
+  check("think 仍是默认关（启用不会自动打开思考）", engBoxes()[1].checked === false);
 
   // ---- 切到本地模型 ----
   const dmSeg = $("card-dm").querySelectorAll(".seg button");
@@ -318,7 +359,10 @@ function startFakeLLM() {
   check("configure 带上 DM 槽位（房主）", !!cfg && cfg.dm && cfg.dm.kind === "local", JSON.stringify(cfg && cfg.dm));
   check("configure 带上助手槽位与 key", !!cfg && cfg.advisor && cfg.advisor.kind === "cloud" && cfg.advisor.api_key === "sk-ui-check", JSON.stringify(cfg && cfg.advisor));
   check("configure 带上主机小助手槽位（房主）", !!cfg && cfg.assistant && cfg.assistant.kind === "local" && cfg.assistant.model === "assistant-model", JSON.stringify(cfg && cfg.assistant));
+  check("configure 带上内置引擎段（房主）", !!cfg && !!cfg.engine && cfg.engine.enabled === true, JSON.stringify(cfg && cfg.engine));
+  check("引擎段 think === false（默认关）", !!cfg && !!cfg.engine && cfg.engine.think === false, JSON.stringify(cfg && cfg.engine));
   check("本机保存了设置（localStorage）", !!w.localStorage.getItem("rpgbar.models"), String(w.localStorage.getItem("rpgbar.models")).slice(0, 60));
+  check("本机保存了引擎设置", !!w.localStorage.getItem("rpgbar.engine"), String(w.localStorage.getItem("rpgbar.engine")));
 
   // ---- 服务端回执后徽标/胶囊刷新 ----
   ws.deliver({
@@ -355,6 +399,8 @@ function startFakeLLM() {
   check("非房主时主机小助手卡片被锁", $("card-assistant").classList.contains("locked"), $("card-assistant").className);
   check("非房主时主机小助手无法切换模式", $("card-assistant").querySelectorAll(".seg button")[0].disabled === true);
   check("非房主时玩家小助手仍可编辑", !$("card-advisor").classList.contains("locked"), $("card-advisor").className);
+  check("非房主时内置引擎卡片被锁", $("card-engine").classList.contains("locked"), $("card-engine").className);
+  check("非房主时引擎开关不可点", $("card-engine").querySelectorAll(".check-field input[type=checkbox]")[0].disabled === true);
   const scriptBtns = $("script-card").querySelectorAll(".slot-actions .btn");
   check("非房主时剧本卡片也被锁", $("script-card").querySelector(".lock-note").textContent.indexOf("房主") >= 0, "");
   check("非房主不能「设为活动剧本」", scriptBtns[1].disabled === true, "disabled=" + scriptBtns[1].disabled);
@@ -364,6 +410,7 @@ function startFakeLLM() {
   $("settings-clear").click();
   await sleep(150);
   check("清除后本地设置被移除", !w.localStorage.getItem("rpgbar.models"), String(w.localStorage.getItem("rpgbar.models")));
+  check("清除后引擎设置也被移除", !w.localStorage.getItem("rpgbar.engine"), String(w.localStorage.getItem("rpgbar.engine")));
   check("清除后徽标回到未接入", $("badge-dm").textContent.indexOf("未接入") === 0, $("badge-dm").textContent);
 
   check("全程无 JS 运行时异常", jsErrors.length === 0, jsErrors.join(" | "));

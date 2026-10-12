@@ -15,6 +15,14 @@
       "prompt":{"advisor":"...","dm":"...(仅房主)"}}  # 连入即同步（含本房间已有 NPC / 档案状态）
     {"type":"agent_status","agents":{...},"changed":["dm","advisor","assistant"]}   # 响应 configure
     {"type":"system","text":"..."}
+    {"type":"thinking","active":bool,"who":"dm|advisor","label":"..."}
+      # 模型推理中（active=true）/ 结束（false）。引擎在 CPU 上跑一轮要几十秒到
+      # 几分钟，界面靠它显示「DM 正在推理剧情…」，否则玩家只看到一片静止
+    {"type":"busy","who":"dm|advisor","message":"..."}
+      # 上一条请求还没跑完，本次被拒（之前是静默丢弃，玩家点了没反应、以为卡死）
+    {"type":"agent_note","who":"dm|advisor","source":"llm|scripted|degraded",
+      "stopped":"final|error|no_provider|no_tools|max_steps","error":"...","tools":[...]}
+      # 本轮是否真的跑了模型；source 非 llm 时界面要把「退化」明确摆出来
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
     {"type":"suggestions","options":[...],"agent":{"source":"llm|scripted","tools":[...]}}
@@ -168,6 +176,9 @@ store = ScriptStore(active["path"], label=active["rel"])
 default_dm_slot = dict(cfg["models"]["dm"])
 default_advisor_slot = dict(cfg["models"]["advisor"])
 default_assistant_slot = dict(cfg["models"].get("assistant") or {})
+# 内置引擎段（config.json 的 engine）—— 只把**可公开调节**的几项开放给界面，
+# lib / model 这类本机路径永远只留在服务端（与槽位的 api_key 同理）。
+default_engine_slot = dict(cfg.get("engine") or {})
 NPC_AUTO_PERSONA = bool((cfg.get("npc") or {}).get("auto_persona", True))
 # 剧情档案：只增 JSONL + 混合检索（BM25 + 向量）。SUMMARY_EVERY 条新记录滚动摘要一次。
 MEM_CFG = cfg.get("memory") or {}
@@ -236,6 +247,27 @@ def merge_slot(slot: dict, patch: dict) -> dict:
     return slot
 
 
+def clean_engine_patch(patch) -> dict:
+    """内置引擎段的白名单清洗（只收界面能调的那几项）。
+
+    `lib` / `model`（本机路径）**不在白名单里** —— 它们是服务端的事，收进来就等于
+    让任意客户端去指一个能被加载的 dll，且没有意义（一个进程只加载一份库）。
+    """
+    if not isinstance(patch, dict):
+        return {}
+    out = {}
+    for key in ("enabled", "think"):
+        if key in patch:
+            out[key] = bool(patch[key])
+    for key, lo, hi in (("context", 256, 32768), ("max_tokens", 16, 4096)):
+        if key in patch:
+            try:
+                out[key] = max(lo, min(hi, int(patch[key])))
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
 def _polarity(text: str) -> float:
     """粗略判断一次行动对 NPC 是好是坏（只用来微调好感度，不做剧情判定）。"""
     t = text or ""
@@ -263,6 +295,9 @@ class Room:
         self.owner = None  # 房主（第一个加入的人）才能改 DM / 主机小助手模型
         self.dm_slot = dict(default_dm_slot)
         self.assistant_slot = dict(default_assistant_slot)
+        # 内置引擎的「界面可调项」（enabled / think / context / max_tokens）。
+        # 房间级：一个房间改了不影响别的房间；lib / model 仍取服务端全局配置。
+        self.engine_slot = dict(default_engine_slot)
         self.advisors = {}  # name -> {"slot": dict, "agent": AdvisorAgent}
         self._narrator = None
         self._assistant = None
@@ -278,6 +313,23 @@ class Room:
         self._summarized = len(self.chronicle) if self.chronicle else 0
 
     # ---- Agent 生命周期 ----
+    def _effective_slot(self, slot):
+        """把「内置引擎」小节的设置并入 engine 槽位。
+
+        并入**只发生在内存里的一次拷贝上**：槽位本身不动（它还要原样描述给前端），
+        引擎段里的本机路径也不会因此流出去。引擎被界面关掉时返回 None —— 调用方
+        按「这个槽位没有模型」处理，自然落到脚本化兜底。
+        """
+        if (slot.get("kind") or "off").lower() != "engine":
+            return slot
+        merged = dict(slot)
+        for key in ("enabled", "think", "context", "max_tokens"):
+            if key in self.engine_slot:
+                merged[key] = self.engine_slot[key]
+        if not merged.get("enabled"):
+            return None
+        return merged
+
     def _provider(self, slot, label):
         """按会话派生种子后构建 Provider。
 
@@ -285,6 +337,9 @@ class Room:
         大家都要有创造性，但不该共用同一条随机流。种子落在会话上而不是槽位上 ——
         槽位是配置、会原样下发给前端。
         """
+        slot = self._effective_slot(slot)
+        if slot is None:
+            return None
         return build_provider(slot, seed=derive_seed(self.seed, label))
 
     def narrator(self) -> NarratorAgent:
@@ -314,9 +369,33 @@ class Room:
         return info["agent"]
 
     def agents_status(self, name=None) -> dict:
-        status = describe_agents(self.dm_slot, self.advisor_slot_for(name), self.assistant_slot)
+        status = describe_agents(
+            self._effective_slot(self.dm_slot),
+            self._effective_slot(self.advisor_slot_for(name)),
+            self._effective_slot(self.assistant_slot),
+        )
         status["owner"] = self.owner
+        status["engine"] = self.engine_public(status)
         return status
+
+    def engine_public(self, status=None) -> dict:
+        """内置引擎的「界面可见状态」（绝不含权重路径等本机信息）。
+
+        `ready` 取自 DM 槽位的引擎探测结果 —— 与「模型设置」里显示的是同一份
+        判据，免得两个地方各说各话。
+        """
+        if status is None:
+            status = describe_agents(self._effective_slot(self.dm_slot), None, None)
+        detail = (status.get("dm") or {}).get("engine") or {}
+        eng = self.engine_slot
+        return {
+            "enabled": bool(eng.get("enabled")),
+            "think": bool(eng.get("think")),
+            "context": int(eng.get("context") or 0),
+            "max_tokens": int(eng.get("max_tokens") or 0),
+            "ready": bool(detail.get("ready")),
+            "model": detail.get("model_name", ""),
+        }
 
     def advisor_slot_for(self, name):
         info = self.advisors.get(name)
@@ -422,7 +501,14 @@ class Room:
                 self._chronicle_add(opening, kind="narration")
             else:
                 await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
-                intro = await DM(self.store, self.narrator().provider).introduce(self.state, name, character)
+                await self.broadcast(
+                    {"type": "thinking", "active": True, "who": "dm",
+                     "label": "DM 正在为你补上之前的剧情…"}
+                )
+                try:
+                    intro = await DM(self.store, self.narrator().provider).introduce(self.state, name, character)
+                finally:
+                    await self.broadcast({"type": "thinking", "active": False, "who": "dm"})
                 await self.broadcast({"type": "narration", "author": "DM", "text": intro})
                 self._chronicle_add(intro, kind="narration")
                 # 只发给新玩家：结构化「故事回顾」
@@ -465,6 +551,23 @@ class Room:
                 merge_slot(info["slot"], adv_patch)
                 info["agent"] = None  # 重建
                 changed.append("advisor")
+            eng_patch = clean_engine_patch(msg.get("engine"))
+            if eng_patch:
+                if self.owner == name:
+                    self.engine_slot.update(eng_patch)
+                    # 引擎设置变了 → 三个 Agent 与所有玩家的小助手都得重建
+                    self._narrator = None
+                    self._assistant = None
+                    if self.npc is not None:
+                        self.npc.set_agent(None)
+                    for info in self.advisors.values():
+                        info["agent"] = None
+                    changed.append("engine")
+                else:
+                    await self.send_to(
+                        ws,
+                        {"type": "error", "message": f"只有房主（{self.owner}）可以修改内置引擎设置"},
+                    )
             await self.send_to(
                 ws,
                 {"type": "agent_status", "agents": self.agents_status(name), "changed": changed},
@@ -558,38 +661,77 @@ class Room:
         return (brief + "\n" + "\n".join(notes)).strip()
 
     async def on_action(self, name, text):
-        async with self.lock:
-            before_scene = self.state.current_scene
-            self._chronicle_add(f"{name} 尝试：{text}", kind="action", actors=[name])
-            npc_brief = await self._npc_prepare(name, text)
-            ctx = NarratorContext(state=self.state, player_name=name, npc_brief=npc_brief)
-            res = await self.narrator().run(ctx, text)
-            for ev in ctx.events:
-                await self.broadcast(ev)
-            parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]
-            if res.text and res.text.strip():
-                parts.append(res.text.strip())
-            for p in parts:
-                await self.broadcast({"type": "narration", "author": "DM", "text": p})
-            self._chronicle_turn(ctx, name, before_scene, parts)
-            await self._maybe_summarize()
-            await self.send_state()
+        # 让界面知道「正在等模型」而不是「卡住了」。引擎在 CPU 上跑一次行动要
+        # 几十秒到几分钟，期间没有任何消息往来 —— 没有这个事件，玩家只会看到
+        # 一片静止，然后怀疑掉线。
+        await self.broadcast(
+            {"type": "thinking", "active": True, "who": "dm", "label": "DM 正在推理剧情…"}
+        )
+        try:
+            async with self.lock:
+                before_scene = self.state.current_scene
+                self._chronicle_add(f"{name} 尝试：{text}", kind="action", actors=[name])
+                npc_brief = await self._npc_prepare(name, text)
+                ctx = NarratorContext(state=self.state, player_name=name, npc_brief=npc_brief)
+                res = await self.narrator().run(ctx, text)
+                for ev in ctx.events:
+                    await self.broadcast(ev)
+                parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]
+                if res.text and res.text.strip():
+                    parts.append(res.text.strip())
+                for p in parts:
+                    await self.broadcast({"type": "narration", "author": "DM", "text": p})
+                self._chronicle_turn(ctx, name, before_scene, parts)
+                await self._maybe_summarize()
+                await self.send_state()
+                note = self._agent_note("dm", res)
+                if note["source"] != "llm":  # 正常走模型不必刷屏；退化必须可见
+                    await self.broadcast(note)
+        finally:
+            await self.broadcast({"type": "thinking", "active": False, "who": "dm"})
 
     async def on_suggest(self, name, ws):
-        agent = self.advisor(name)
-        res = await agent.suggest(AdvisorContext(state=self.state, player_name=name))
         await self.send_to(
-            ws,
-            {
-                "type": "suggestions",
-                "options": res.data.get("options", []),
-                "agent": {
-                    "source": res.source,
-                    "stopped": res.stopped,
-                    "tools": res.used_tools,
-                },
-            },
+            ws, {"type": "thinking", "active": True, "who": "advisor", "label": "助手正在思考…"}
         )
+        try:
+            agent = self.advisor(name)
+            res = await agent.suggest(AdvisorContext(state=self.state, player_name=name))
+            await self.send_to(
+                ws,
+                {
+                    "type": "suggestions",
+                    "options": res.data.get("options", []),
+                    "agent": {
+                        "source": res.source,
+                        "stopped": res.stopped,
+                        "tools": res.used_tools,
+                        "error": (res.error or "")[:300],
+                    },
+                },
+            )
+            note = self._agent_note("advisor", res)
+            if note["source"] != "llm":
+                await self.send_to(ws, note)
+        finally:
+            await self.send_to(ws, {"type": "thinking", "active": False, "who": "advisor"})
+
+    @staticmethod
+    def _agent_note(who: str, res) -> dict:
+        """把「这一轮到底有没有真跑到模型」整理成一条可下发的事件。
+
+        `AgentResult.source`：llm（走了模型）/ scripted（压根没配模型）/ degraded
+        （配了模型但这轮报错、退回脚本兜底）。后两者界面上必须说清楚，否则玩家
+        只会觉得"DM 敷衍了一句"，而剧情其实原地没动。
+        """
+        return {
+            "type": "agent_note",
+            "who": who,
+            "source": getattr(res, "source", "") or "",
+            "stopped": getattr(res, "stopped", "") or "",
+            "error": (getattr(res, "error", "") or "")[:300],
+            "tools": list(getattr(res, "used_tools", []) or []),
+        }
 
     async def on_roll(self, name):
         await self.broadcast(
@@ -790,6 +932,7 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     name = None
     room = None
+    pump = None
     try:
         first = json.loads(await ws.receive_text())
         if first.get("type") != "join":
@@ -823,16 +966,60 @@ async def ws_endpoint(ws: WebSocket):
                 f"（DM {derive_seed(room.seed, 'dm')}"
                 f" / 小助手 {derive_seed(room.seed, 'assistant')}）"
             )
+        # ---- 消息泵：把「收」与「处理」拆开 ----
+        # `receive_text()` 必须一直有人在 await 着。uvicorn 的 WebSocket keepalive
+        # 依赖它：一旦没人收，服务器发的 ping 就得不到 pong 处理，默认 20 秒把连接
+        # 掐断（实测点「助手建议」时第 21.6 秒收到 code 1006）。而一次引擎推理要
+        # 几十秒到几分钟，串在主循环里必然超时 —— 与模型快慢无关。
+        #
+        # 泵只负责收、主循环照旧**串行**处理消息（保持原有的顺序语义，不引入并发），
+        # 所以刻意不用 create_task 去跑业务。
+        inbox: asyncio.Queue = asyncio.Queue()
+
+        async def pump():
+            try:
+                while True:
+                    inbox.put_nowait(await ws.receive_text())
+            except Exception:  # noqa: BLE001 —— 断开/异常一律当作收尾信号
+                inbox.put_nowait(None)
+
+        pump = asyncio.create_task(pump())
+
+        # join 也可能慢（中途加入要让 DM 补剧情），放在泵之后就不怕它超时了。
         await room.on_join(name, character, ws)
 
+        busy = False  # 本连接是否有耗时任务在跑（同一玩家开两个标签页互不影响）
         while True:
-            raw = await ws.receive_text()
+            raw = await inbox.get()
+            if raw is None:
+                break
             msg = json.loads(raw)
             t = msg.get("type")
             if t == "action":
-                await room.on_action(name, (msg.get("text") or "").strip())
+                if busy:
+                    # 之前这里是静默 `continue`：玩家点了没任何反应，还以为卡死。
+                    await Room.send_to(ws, {
+                        "type": "busy", "who": "dm",
+                        "message": "DM 正在推理这一轮，请等它结束再行动。",
+                    })
+                    continue
+                busy = True
+                try:
+                    await room.on_action(name, (msg.get("text") or "").strip())
+                finally:
+                    busy = False
             elif t == "suggest":
-                await room.on_suggest(name, ws)
+                if busy:
+                    await Room.send_to(ws, {
+                        "type": "busy", "who": "advisor",
+                        "message": "上一轮还在推理中，助手建议要排在它后面 —— 等这轮结束再点。",
+                    })
+                    continue
+                busy = True
+                try:
+                    await room.on_suggest(name, ws)
+                finally:
+                    busy = False
             elif t == "configure":
                 await room.on_configure(name, msg, ws)
             elif t == "roll":
@@ -845,6 +1032,8 @@ async def ws_endpoint(ws: WebSocket):
         except Exception:
             pass
     finally:
+        if pump is not None:
+            pump.cancel()
         if room is not None and name is not None:
             room.state.remove_player(name)
             room.clients = [(n, w) for n, w in room.clients if n != name]
@@ -853,6 +1042,18 @@ async def ws_endpoint(ws: WebSocket):
                 await room.send_state()
             else:
                 rooms.pop(room.code, None)
+
+
+# 静态资源（app.js / style.css / index.html）改动频繁，而"改了前端、浏览器还在用
+# 旧文件"这类问题排查起来极费劲（界面看着没变化，实际是缓存）。这里挂 no-cache：
+# 浏览器仍走 ETag/Last-Modified 条件请求（没变就 304，很快），但一变立刻生效。
+@app.middleware("http")
+async def _no_cache_web(request, call_next):
+    resp = await call_next(request)
+    path = request.url.path
+    if path == "/" or path.endswith((".js", ".css", ".html")):
+        resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return resp
 
 
 WEB_DIR = RESOURCE_DIR / "web"

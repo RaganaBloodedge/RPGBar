@@ -110,9 +110,9 @@ python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
     "lib": "",        // 留空 = 自动找 models/rpg_engine.dll
     "model": "",      // 留空 = 自动找 models/Qwen3-*.gguf
     "threads": 0,     // 0 = 引擎按 CPU 核数自己定
-    "context": 2048,  // 每个会话的 KV Cache 容量（约 230 MiB/会话，别盲目调大）
-    "max_tokens": 512,
-    "think": true     // Qwen3 思考模式；关掉更快，但裁定质量下降
+    "context": 4096,  // 每个会话的 KV Cache 容量（@4096≈896 MiB/会话）；别调到 4096 以下
+    "max_tokens": 768,
+    "think": false    // Qwen3 思考模式，默认关；打开 = 每轮 35-50 秒、质量略好（见下）
   },
   "models": {
     "assistant": { "kind": "engine" },   // 主机小助手：跑在主机
@@ -124,6 +124,17 @@ python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
 > 槽位**只需要写 `kind`** —— `lib` / `model` / `threads` / `context` 由 `engine` 段
 > 统一供货。想让某个槽位用**另一份权重**（比如 DM 用 4B、小助手用 1.7B），在那个槽位里
 > 写一行 `"model": "<绝对路径>.gguf"` 就行：**槽位显式写的权重优先于 `engine` 段**。
+
+> ⚠ **`context` 别调到 4096 以下**。DM 第一轮 prompt（职责 + 剧本 + 本轮上下文 +
+> 十几个工具的 JSON Schema）实测就要 2400+ token，2048 装不下会让引擎报「序列超长」、
+> DM 悄悄退化成脚本兜底（剧情原地不动，界面还看不出异常）。
+
+> 💡 **嫌慢就把 `think` 关掉**（引擎 0.4.1 起可以随便关）—— **游戏内**「⚙ 设置 →
+> 内置引擎」就有这个开关，不用改这个文件。实测同一份 prompt：
+> `false` 时每轮约 **4–6 秒**；`true` 时每轮先吐 250–370 个思考 token，约
+> **35–50 秒**。关掉只是建议质量略降，功能不减。之前"开了工具就不能关思考"是引擎的
+> 一个堆越界 bug 导致的（同一会话第二次生成时越界写），已修，详见说明书 §7.3。
+> 另：第一次生成前有约 30 秒的权重冷缺页开销（mmap），与 `think` 无关。
 
 **先自检这台机器能不能用**（不启动服务器，也不写任何文件）：
 

@@ -38,15 +38,20 @@ DEFAULTS = {
     # enabled=false（默认）时，任何 kind=engine 的槽位都自动退化为 off —— 没装引擎
     # 的机器照常可玩（与"三个槽位默认留空"是同一条不变量）。
     # lib / model 留空 = 自动探测：models/rpg_engine.dll 与 models/Qwen3-*.gguf。
-    # context 是每个会话的 KV Cache 容量（一个会话约 230 MiB @2048），别盲目调大。
+    # context 是每个会话的 KV Cache 容量。**默认 4096**：DM 的第一轮 prompt
+    # （职责 + 剧本次级 prompt + 本轮上下文 + 十几个工具的 JSON Schema）实测就要
+    # 2400+ token，2048 装不下 → 引擎报「序列超长」→ DM 静默退化成脚本兜底。
+    # 代价（引擎自报实测）：KV Cache @2048≈448 MiB、@4096≈896 MiB / 会话。
     "engine": {
         "enabled": False,
         "lib": "",
         "model": "",
         "threads": 0,        # 0 = 引擎按 CPU 核数自己决定
-        "context": 2048,
+        "context": 4096,
         "max_tokens": 512,
-        "think": True,       # Qwen3 思考模式；关掉更快，但裁定质量下降
+        # Qwen3 思考模式。**默认关闭**：实测每轮 4-6 秒，打开约 35-50 秒（质量略好）。
+        # 游戏内「设置 → 内置引擎」有开关，改这里就是改那个开关的默认值。
+        "think": False,
     },
     # 模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/
     # local（本地服务）/ engine（内置引擎，由上面的 engine 段供货）。

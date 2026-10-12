@@ -12,7 +12,10 @@
     "  想让某槽位用另一份权重（如 DM 用 4B），在槽位里写 model=<绝对路径>.gguf（优先于 engine 段）。",
     "  lib / model 留空会自动找 models/rpg_engine.dll 与 models/Qwen3-*.gguf；也可写绝对路径。",
     "  engine 没启用或库/权重找不到时，kind=engine 的槽位自动退化为 off（不报错，照常可玩）。",
-    "  context 是每个会话的 KV Cache 容量（@2048 约 230 MiB/会话），别盲目调大。",
+    "  context 是每个会话的 KV Cache 容量，默认 4096（@2048≈448 MiB/会话，@4096≈896 MiB/会话）。",
+    "  别调小于 4096：DM 第一轮 prompt 实测就 2400+ token，2048 装不下会让 DM 静默退化成脚本兜底。",
+    "  think = 是否让模型先思考再回答，默认 false。实测每轮：false 约 4-6 秒，true 约 35-50 秒（质量略好）。",
+    "          游戏内「⚙ 设置 → 内置引擎」有同一个开关（房主可改，全房间共用）。",
     "三个槽位默认都是 off —— 也就是说，什么都不配也能正常玩，配一个就自动启用一个 Agent。",
     "也可以完全不改这个文件，直接在游戏里点顶栏的「⚙ 设置」接入（模型只存在浏览器本机）。",
     "script = 起始剧本（相对 scripts/ 目录，也可写绝对路径）。",
@@ -25,9 +28,9 @@
     "lib": "",
     "model": "",
     "threads": 0,
-    "context": 2048,
-    "max_tokens": 512,
-    "think": true
+    "context": 4096,
+    "max_tokens": 768,
+    "think": false
   },
   "models": {
     "dm": {

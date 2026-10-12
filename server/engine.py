@@ -204,16 +204,20 @@ class EngineLib:
         return h
 
     def model_for(self, model_path: str | Path, **kw) -> int:
-        """按**绝对路径**缓存：同一份权重在进程内只加载一次。"""
+        """按**绝对路径**缓存：同一份权重在进程内只加载一次。
+
+        加载动作**放在锁内**：把它放锁外（先查、miss 了再慢慢加载）会让两个线程
+        同时 miss、同时 `load_model` 同一份 GGUF —— 白读 1 GB，而且会往引擎的模型
+        注册表里塞进两个句柄（后写的覆盖前者，先加载那份就此泄漏）。加载期间持锁
+        是正确的取舍：本来也只应该发生一次。
+        """
         key = str(Path(model_path).expanduser().resolve())
         with self._lock:
             h = self._models.get(key)
-            if h is not None:
-                return h
-        h = self.load_model(key, **kw)
-        with self._lock:
-            self._models[key] = h
-        return h
+            if h is None:
+                h = self.load_model(key, **kw)
+                self._models[key] = h
+            return h
 
     def unload_model(self, model: int) -> None:
         with self._lock:
@@ -274,3 +278,30 @@ def open_lib(lib_path: str | Path) -> EngineLib:
             lib = EngineLib(key)
             _libs[key] = lib
         return lib
+
+
+# ---------------------------------------------------------------- 生成锁
+
+# **同一份权重同一时刻只允许一个 generate。**
+#
+# 为什么是"按权重"而不是"按会话"：引擎里一个 model 持有一份共享的线程池，多个
+# session 的 generate 会往同一个池子里提交任务。实测两个房间各自点一次「助手建议」
+# （两个会话、同一份权重、并发 generate），服务器进程会**无声消失** —— 日志停在
+# 「已创建会话 #2」，没有 Python 异常、没有 traceback（典型的堆/资源竞争崩溃）。
+# 在 CPU 上并发跑本来也没有收益（只会互相抢核），串行化是唯一正确的语义。
+#
+# 宿主侧的 `EngineProvider` 原先只有一把**实例级**锁（`self._busy`）—— 一个房间一个
+# Provider，多房间时这把锁形同虚设。这里改成"按权重路径共享"，才是真正串行。
+_model_locks: dict[str, threading.Lock] = {}
+_model_locks_guard = threading.Lock()
+
+
+def model_lock(model_path: str | Path) -> threading.Lock:
+    """取「这份权重」的全局生成锁（同路径共享同一把）。"""
+    key = str(Path(model_path).expanduser().resolve())
+    with _model_locks_guard:
+        lk = _model_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _model_locks[key] = lk
+        return lk

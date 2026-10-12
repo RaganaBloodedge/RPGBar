@@ -193,6 +193,7 @@
     div.appendChild(meta);
     div.appendChild(body);
     logEl.appendChild(div);
+    refreshThinking();
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -306,6 +307,7 @@
     div.appendChild(meta);
     div.appendChild(body);
     logEl.appendChild(div);
+    refreshThinking();
     logEl.scrollTop = logEl.scrollHeight;
   }
 
@@ -316,6 +318,72 @@
     p.appendChild(b);
     if (text) p.appendChild(document.createTextNode(text));
     return p;
+  }
+
+  /* ==================== 「正在思考」提示 ==================== */
+
+  // 服务端在跑模型前会先发一条 thinking 事件；前端在点按「行动／助手建议」时也会
+  // **先本地显示**（乐观 UI），这样即使服务端正忙、提示要晚一点到，玩家也立刻有反馈。
+  // 内置引擎在 CPU 上跑一次行动要几十秒到几分钟，期间没有任何消息往来 —— 没有这个
+  // 提示，玩家只会看到画面静止，然后以为掉线（这件事真的发生过）。
+  var thinking = { dm: null, advisor: null }; // who -> 聊天框里的占位节点
+  var thinkingSuggest = null; // 建议区里的助手占位（仅 advisor）
+
+  function setBusy(on) {
+    sendBtn.disabled = !!on;
+    suggestBtn.disabled = !!on;
+  }
+
+  var THINK_LABEL = { dm: "DM 正在推理剧情…", advisor: "助手正在思考…" };
+
+  // 占位提示一律挂在**聊天框（log）**里 —— 这是玩家视线所在。助手的提示另在建议区
+  // 也放一份，免得建议区空白、看着像没点动。
+  function showThinking(who, label) {
+    who = who === "advisor" ? "advisor" : "dm";
+    label = label || THINK_LABEL[who];
+    if (!thinking[who]) {
+      var el = document.createElement("div");
+      el.className = "thinking " + (who === "advisor" ? "is-advisor" : "is-dm");
+      var sp = document.createElement("span");
+      sp.className = "spinner";
+      el.appendChild(sp);
+      el.appendChild(document.createTextNode(label));
+      thinking[who] = el;
+      logEl.appendChild(el);
+    }
+    if (who === "advisor" && !(thinkingSuggest && thinkingSuggest.parentNode)) {
+      var el2 = document.createElement("div");
+      el2.className = "thinking is-advisor";
+      var sp2 = document.createElement("span");
+      sp2.className = "spinner";
+      el2.appendChild(sp2);
+      el2.appendChild(document.createTextNode(label));
+      thinkingSuggest = el2;
+      suggestionsEl.innerHTML = "";
+      suggestionsEl.appendChild(el2);
+    }
+    refreshThinking();
+    setBusy(true);
+  }
+
+  function clearThinking(who) {
+    who = who === "advisor" ? "advisor" : "dm";
+    var el = thinking[who];
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+    thinking[who] = null;
+    if (who === "advisor" && thinkingSuggest) {
+      if (thinkingSuggest.parentNode) thinkingSuggest.parentNode.removeChild(thinkingSuggest);
+      thinkingSuggest = null;
+    }
+    if (!thinking.dm && !thinking.advisor) setBusy(false);
+  }
+
+  // 提示要一直待在日志末尾，别被随后到来的旁白／状态挤到中间去。
+  function refreshThinking() {
+    ["dm", "advisor"].forEach(function (w) {
+      if (thinking[w] && thinking[w].parentNode) logEl.appendChild(thinking[w]);
+    });
+    if (logEl) logEl.scrollTop = logEl.scrollHeight;
   }
 
   function handleMessage(msg) {
@@ -363,7 +431,9 @@
         addEntry(msg.success === false ? "dice fail" : "dice", "骰子", label);
         break;
       case "suggestions":
+        clearThinking("advisor");
         suggestionsEl.innerHTML = "";
+        thinkingSuggest = null;
         (msg.options || []).forEach(function (opt) {
           var chip = document.createElement("span");
           chip.className = "suggestion";
@@ -372,10 +442,10 @@
           suggestionsEl.appendChild(chip);
         });
         var ag = msg.agent || {};
-        if (ag.source === "scripted") {
+        if (ag.source && ag.source !== "llm") {
           var tag = document.createElement("span");
-          tag.className = "suggest-src";
-          tag.textContent = "脚本化兜底";
+          tag.className = "suggest-src warn";
+          tag.textContent = ag.source === "degraded" ? "已降级 · 非模型输出" : "脚本化兜底";
           suggestionsEl.appendChild(tag);
         } else if (ag.source) {
           var tag2 = document.createElement("span");
@@ -387,10 +457,38 @@
       case "state":
         renderState(msg.state);
         break;
+      case "agent_note":
+        renderAgentNote(msg);
+        break;
+      case "busy":
+        if ((msg.who || "dm") === "advisor") clearThinking("advisor");
+        addEntry("system", "请稍候", msg.message || "上一轮还在推理中，请等它结束。");
+        break;
+      case "thinking":
+        if (msg.active) showThinking(msg.who || "dm", msg.label);
+        else clearThinking(msg.who || "dm");
+        break;
       case "error":
         addEntry("system", "错误", msg.message);
+        clearThinking("dm");
+        clearThinking("advisor");
         break;
     }
+  }
+
+  // 把「这一轮其实没有跑到模型」摆到聊天框里。之前退化是静默的：DM 报错 → 悄悄
+  // 换成剧本化兜底 → 玩家以为"DM 敷衍了一句"，而剧情其实原地没动。
+  function renderAgentNote(msg) {
+    if (!msg || msg.source === "llm") return; // 正常走模型，不必刷屏
+    var who = msg.who === "advisor" ? "助手" : "DM";
+    var tag = msg.source === "degraded" ? "降级" : "脚本化兜底";
+    var reason = msg.stopped ? "（" + msg.stopped + "）" : "";
+    var detail = msg.error ? "：" + msg.error : "";
+    var tips = msg.source === "degraded"
+      ? "这一轮界面上的旁白/建议是剧本化文案，不是模型生成，剧情可能没有推进。"
+      : "这一轮没有接入模型，用的是剧本化文案。";
+    addEntry("system warn", "⚠ " + who + " " + tag + reason,
+      tips + detail + (msg.hint ? "　" + msg.hint : ""));
   }
 
   function send(obj) {
@@ -402,6 +500,17 @@
   /* ==================== 模型设置抽屉 ==================== */
 
   var SETTINGS_KEY = "rpgbar.models";
+  // 内置引擎（RPGBarEngine）的界面开关。与三个槽位分开存：它是「同一份引擎、
+  // 三个 Agent 共用」的全局设置，不属于任何一个槽位。think 默认 **false** ——
+  // 关掉每轮 4-6 秒，打开约 35-50 秒（裁定质量略好），默认选快的那个。
+  var ENGINE_KEY = "rpgbar.engine";
+  var engineState = {
+    enabled: false,
+    think: false,
+    context: 4096,
+    max_tokens: 512
+  };
+  var engineStored = false; // 本机是否存过引擎设置（没存过就不干扰服务端 config.json）
   var PRESETS = {
     cloud: [
       { label: "DeepSeek", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat" },
@@ -460,11 +569,132 @@
     } catch (e) {}
   }
 
+  function loadEngineSaved() {
+    try {
+      var raw = localStorage.getItem(ENGINE_KEY);
+      if (!raw) return;
+      engineStored = true;
+      var o = JSON.parse(raw) || {};
+      if (typeof o.enabled === "boolean") engineState.enabled = o.enabled;
+      if (typeof o.think === "boolean") engineState.think = o.think;
+      if (typeof o.context === "number" && o.context > 0) engineState.context = o.context;
+      if (typeof o.max_tokens === "number" && o.max_tokens > 0) engineState.max_tokens = o.max_tokens;
+    } catch (e) {}
+  }
+
+  function persistEngineSaved() {
+    try { localStorage.setItem(ENGINE_KEY, JSON.stringify(engineState)); } catch (e) {}
+  }
+
   function el(tag, cls, text) {
     var e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text != null) e.textContent = text;
     return e;
+  }
+
+  // ---- 内置引擎卡片（与三个槽位并列的一块，全局共用一份引擎）----
+
+  function engineCheck(prop, label, hint, disabled) {
+    var wrap = el("label", "check-field");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!engineState[prop];
+    box.disabled = !!disabled;
+    box.onchange = function () {
+      engineState[prop] = box.checked;
+      renderEngineCard(); // think / context 那几行跟着启用来回显隐
+    };
+    wrap.appendChild(box);
+    var body = el("span", "check-body");
+    body.appendChild(el("span", "check-label", label));
+    if (hint) body.appendChild(el("span", "check-hint", hint));
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  function engineField(prop, label, ph, disabled, type) {
+    var wrap = el("div", "field");
+    wrap.appendChild(el("label", "", label));
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = ph || "";
+    input.value = engineState[prop];
+    input.disabled = !!disabled;
+    input.autocomplete = "off";
+    input.oninput = function () {
+      engineState[prop] = type === "number" ? (parseInt(input.value, 10) || 0) : input.value;
+    };
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function buildEngineCard() {
+    var card = el("div", "slot");
+    card.id = "card-engine";
+
+    var head = el("div", "slot-head");
+    head.appendChild(el("span", "slot-title", "内置引擎（进程内直连）"));
+    var badge = el("span", "slot-badge");
+    badge.id = "badge-engine";
+    paintEngineBadge(badge);
+    head.appendChild(badge);
+    card.appendChild(head);
+
+    var locked = !isOwner;
+    if (locked) {
+      card.classList.add("locked");
+      card.appendChild(el("p", "lock-note",
+        "只有房主（" + (ownerName || "首位加入者") + "）可以修改内置引擎设置。"));
+    }
+
+    card.appendChild(engineCheck(
+      "enabled", "启用内置引擎",
+      "三个 Agent 都改走进程内引擎（覆盖上面的云 / 本地接线）。关掉则回到脚本化兜底。",
+      locked
+    ));
+    card.appendChild(engineCheck(
+      "think", "让模型先思考再回答（think）",
+      "关闭（推荐）：实测每轮约 4–6 秒。开启：约 35–50 秒，裁定质量略好。",
+      locked || !engineState.enabled
+    ));
+    if (engineState.enabled) {
+      card.appendChild(engineField("context", "上下文长度（KV Cache 容量）", "4096", locked, "number"));
+      card.appendChild(engineField("max_tokens", "单轮最多生成 token", "512", locked, "number"));
+    }
+    return card;
+  }
+
+  function renderEngineCard() {
+    var host = document.getElementById("engine-card");
+    if (!host) return;
+    host.innerHTML = "";
+    host.appendChild(buildEngineCard());
+  }
+
+  function paintEngineBadge(badgeEl) {
+    if (!badgeEl) return;
+    var info = serverAgents && serverAgents.engine;
+    var running = !!(info && info.enabled && info.ready);
+    badgeEl.className = "slot-badge" + (running ? " on" : "");
+    if (running) {
+      badgeEl.textContent = "已启用 · " + (info.model || "内置引擎") + (info.think ? " · think" : "");
+    } else if (info && info.enabled && !info.ready) {
+      badgeEl.textContent = "已启用，但引擎不可用";
+    } else if (engineState.enabled) {
+      badgeEl.textContent = "待保存";
+    } else {
+      badgeEl.textContent = "未启用（脚本化）";
+    }
+  }
+
+  function enginePayload() {
+    return {
+      enabled: !!engineState.enabled,
+      think: !!engineState.think,
+      context: engineState.context,
+      max_tokens: engineState.max_tokens
+    };
   }
 
   // 根据服务端状态 + 本机保存值，构建一个槽位的表单
@@ -630,6 +860,7 @@
     });
     SLOT_KEYS.forEach(refreshBadge);
     updateModelPill();
+    paintEngineBadge(document.getElementById("badge-engine"));
     // 房主身份变化（例如服务端换人/重连）时，DM 卡片的可编辑性跟着变
     if (wasOwner !== isOwner) rerenderSlotsIfOpen();
   }
@@ -638,6 +869,7 @@
     var drawer = document.getElementById("settings-drawer");
     if (drawer && !drawer.classList.contains("hidden")) {
       renderSlots();
+      renderEngineCard();  // 房主身份变化会影响引擎卡片的可编辑性
       renderScriptCard(); // 房主身份变化会影响「设为活动剧本」的可点性
     }
   }
@@ -660,6 +892,7 @@
     if (isOwner) {
       payload.dm = slotPayload("dm");            // 主机 DM 仅房主可改
       payload.assistant = slotPayload("assistant"); // 主机小助手（NPC/摘要）同样仅房主可改
+      payload.engine = enginePayload();           // 内置引擎（含 think）同样仅房主可改
     }
     payload.advisor = slotPayload("advisor");
     send(payload);
@@ -667,12 +900,15 @@
 
   function saveSettings() {
     persistSaved();
+    persistEngineSaved();
+    engineStored = true;
     sendConfigure();
   }
 
   // 加入房间后，把本机已保存的模型设置自动推给服务端（DM 仅房主可推）
   function pushSavedModels() {
     loadSaved();
+    loadEngineSaved();
     var payload = { type: "configure" };
     var has = false;
     if (isOwner && slotState.dm.kind !== "off") {
@@ -681,6 +917,12 @@
     }
     if (isOwner && slotState.assistant.kind !== "off") {
       payload.assistant = slotPayload("assistant");
+      has = true;
+    }
+    // 内置引擎只在**本机存过**设置时才推：没存过说明用户没在界面上动过它，
+    // 那就该让服务端 config.json 的配置说话，不能被前端的默认值（未启用）盖掉。
+    if (isOwner && engineStored) {
+      payload.engine = enginePayload();
       has = true;
     }
     if (slotState.advisor.kind !== "off") {
@@ -978,7 +1220,9 @@
     var overlay = document.getElementById("settings-overlay");
     if (!drawer) return;
     loadSaved();
+    loadEngineSaved();
     renderSlots();
+    renderEngineCard();
     renderScriptCard();
     loadScripts();
     hideMsg();
@@ -1024,11 +1268,15 @@
     };
     if (clearBtn) clearBtn.onclick = function () {
       try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
+      try { localStorage.removeItem(ENGINE_KEY); } catch (e) {}
+      engineStored = false;
+      engineState = { enabled: false, think: false, context: 4096, max_tokens: 512 };
       slotState.dm = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 };
       slotState.assistant = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.6 };
       slotState.advisor = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 };
       sendConfigure(); // 通知服务端回到脚本化，但不再写回本机
       renderSlots();
+      renderEngineCard();
       showMsg("已清除本机设置，两个 Agent 回到脚本化兜底。", "ok");
     };
     loadSaved();
@@ -1040,6 +1288,7 @@
     send({ type: "action", text: text });
     addEntry("player", you || "我", text);
     actionInput.value = "";
+    showThinking("dm"); // 乐观显示：不等服务端回 thinking，点完立刻有反馈
   }
 
   joinForm.addEventListener("submit", function (e) {
@@ -1066,9 +1315,14 @@
       try { handleMessage(JSON.parse(ev.data)); } catch (err) {}
     };
     ws.onclose = function () {
+      clearThinking("dm");
+      clearThinking("advisor");
+      setBusy(false);
       addEntry("system", "", "连接已断开，刷新页面重新加入");
     };
     ws.onerror = function () {
+      clearThinking("dm");
+      clearThinking("advisor");
       addEntry("system", "错误", "无法连接服务器");
     };
 
@@ -1081,7 +1335,10 @@
   actionInput.addEventListener("keydown", function (e) {
     if (e.key === "Enter") { sendAction(actionInput.value); }
   });
-  suggestBtn.addEventListener("click", function () { send({ type: "suggest" }); });
+  suggestBtn.addEventListener("click", function () {
+    send({ type: "suggest" });
+    showThinking("advisor"); // 乐观显示：点完立刻出现「助手正在思考…」
+  });
   rollBtn.addEventListener("click", function () { send({ type: "roll" }); });
   copyBtn.addEventListener("click", function () {
     var code = roomCode.textContent;

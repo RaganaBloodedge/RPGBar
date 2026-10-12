@@ -162,7 +162,7 @@ class EngineProvider(LLMProvider):
     name = "engine"
     supports_tools = True
 
-    def __init__(self, lib, model_path, *, threads=0, context=2048, max_tokens=512,
+    def __init__(self, lib, model_path, *, threads=0, context=4096, max_tokens=512,
                  temperature=0.8, seed=None, stop=None, think=True, label="engine"):
         self.lib = lib
         self.model_path = str(model_path)
@@ -180,8 +180,10 @@ class EngineProvider(LLMProvider):
         self._model = None
         self._session = None
         self._init_lock = threading.Lock()
-        # 引擎约定「单个会话同一时刻只允许一次 generate」，这里照着串行化。
-        self._busy = threading.Lock()
+        # 引擎在同一份权重上**不支持并发 generate**（两个房间同时跑 → 进程无声消失）。
+        # 锁按**权重路径**共享（`engine.model_lock`），而不是每个 Provider 一把 ——
+        # 一个房间一个 Provider，实例级锁在多房间并发时形同虚设。
+        self._gen_lock = engine_mod.model_lock(self.model_path)
 
     # ---- 生命周期 ----
 
@@ -207,13 +209,17 @@ class EngineProvider(LLMProvider):
     def _close_sync(self) -> None:
         """销毁会话。**不卸载权重** —— 同一份权重通常被多个 Provider 共用（DM 与
         小助手同进程），谁先 close 谁就会把别人的会话一起带走。权重交给进程退出回收。
+
+        销毁也要在生成锁里：`session_destroy` 与另一个会话正在跑的 `generate` 并发
+        同样会让引擎崩。
         """
-        with self._init_lock:
-            if self._session is not None:
-                try:
-                    self.lib.destroy_session(self._session)
-                finally:
-                    self._session = None
+        with self._gen_lock:
+            with self._init_lock:
+                if self._session is not None:
+                    try:
+                        self.lib.destroy_session(self._session)
+                    finally:
+                        self._session = None
 
     async def close(self):
         self._close_sync()
@@ -227,8 +233,13 @@ class EngineProvider(LLMProvider):
     # ---- 生成 ----
 
     def _run(self, messages, tools) -> dict:
-        """同步跑一轮（阻塞几十秒，调用方负责丢到线程里）。"""
-        session = self._ensure()
+        """同步跑一轮（阻塞几十秒，调用方负责丢到线程里）。
+
+        **建会话与前向必须在同一把锁里**：`session_create` 与另一个会话正在跑的
+        `generate` 并发时，引擎会崩 —— 实测两个房间同时点「助手建议」，日志停在
+        「已创建会话 #2」然后整个进程无声消失。所以锁的范围是「取会话 → 前向」整段，
+        而不是只包 `generate`。
+        """
         req = {
             "messages": [dict(m) for m in messages],
             "max_tokens": self.max_tokens,
@@ -237,7 +248,8 @@ class EngineProvider(LLMProvider):
         }
         if tools:
             req["tools"] = tools
-        with self._busy:
+        with self._gen_lock:
+            session = self._ensure()
             reply = self.lib.generate(session, req)
         self.last_usage = reply.get("usage") or {}
         return reply
@@ -302,12 +314,12 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
             lib,
             model_path,
             threads=int(slot.get("threads") or 0),
-            context=int(slot.get("context") or 2048),
+            context=int(slot.get("context") or 4096),
             max_tokens=int(slot.get("max_tokens") or 512),
             temperature=float(slot.get("temperature", 0.8)),
             seed=seed,
             stop=slot.get("stop"),
-            think=bool(slot.get("think", True)),
+            think=bool(slot.get("think", False)),
             label="engine",
         )
 

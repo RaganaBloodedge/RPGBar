@@ -121,6 +121,15 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .entry.dice.fail .body { color: var(--red); }
 .entry.system .body { color: var(--text-dim); font-style: italic; }
 .entry.system { text-align: center; }
+/* 告警条目：DM / 助手这一轮没跑到模型（退化到脚本化兜底）时，醒目地摆到聊天框 */
+.entry.system.warn {
+  text-align: left; font-style: normal;
+  background: rgba(201, 123, 123, .12);
+  border: 1px solid var(--red); border-left: 3px solid var(--red);
+  border-radius: 8px; padding: 10px 14px; margin: 10px 0 14px;
+}
+.entry.system.warn .meta { color: var(--red); font-style: normal; letter-spacing: .3px; }
+.entry.system.warn .body { color: var(--text); font-style: normal; font-size: 13.5px; }
 
 /* ---- 故事回顾（中途加入补课）---- */
 .entry.recap {
@@ -150,6 +159,25 @@ form input:focus, form select:focus { border-color: var(--accent); }
   padding: 4px 10px; border-radius: 14px; border: 1px dashed var(--border);
 }
 .suggest-src.on { color: var(--green); border-color: var(--green); border-style: solid; }
+.suggest-src.warn { color: var(--red); border-color: var(--red); border-style: solid; }
+/* 「正在推理 / 思考中」占位：服务端跑模型期间显示，免得画面静止被当成掉线。
+   挂在聊天框里（玩家视线所在），助手的那份在建议区也有一份。 */
+.thinking {
+  display: flex; align-items: center; gap: 8px; width: fit-content;
+  font-size: 13px; color: var(--gold-soft);
+  padding: 6px 14px; border-radius: 20px;
+  border: 1px dashed var(--accent); background: var(--panel);
+  margin: 6px 0 14px;
+}
+.thinking.is-dm { margin-top: 8px; }
+.thinking.is-advisor { color: var(--blue); border-color: var(--blue); }
+.spinner {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: rpgbar-spin .8s linear infinite;
+}
+.thinking.is-advisor .spinner { border-top-color: var(--blue); }
+@keyframes rpgbar-spin { to { transform: rotate(360deg); } }
 .composer-row { display: flex; gap: 10px; }
 #action-input {
   flex: 1; padding: 12px 14px; font-size: 15px;
@@ -164,6 +192,8 @@ form input:focus, form select:focus { border-color: var(--accent); }
   transition: filter .15s;
 }
 .btn:hover { filter: brightness(1.12); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn:disabled:hover { filter: none; }
 .btn.primary { background: var(--accent); color: #1a1208; font-weight: 600; }
 .btn.ghost { background: var(--panel); color: var(--text-dim); border: 1px solid var(--border); }
 .btn.dice-btn { width: 100%; background: var(--panel-2); color: var(--gold-soft); border: 1px solid var(--accent); }
@@ -257,6 +287,17 @@ form input:focus, form select:focus { border-color: var(--accent); }
 .slot-result.ok { color: var(--green); }
 .slot-result.err { color: var(--red); }
 .slot-result.warn { color: var(--gold-soft); }
+
+/* 内置引擎的开关项：一行一个复选框 + 说明文字 */
+.check-field { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; cursor: pointer; }
+.slot.locked .check-field { cursor: not-allowed; }
+.check-field input[type="checkbox"] {
+  width: 15px; height: 15px; margin: 2px 0 0; flex: 0 0 auto;
+  accent-color: var(--accent); cursor: inherit;
+}
+.check-body { display: flex; flex-direction: column; gap: 1px; }
+.check-label { font-size: 12px; color: var(--text); line-height: 1.5; }
+.check-hint { font-size: 11px; color: var(--text-dim); line-height: 1.5; }
 
 .settings-msg {
   font-size: 12px; line-height: 1.6; padding: 10px 12px; border-radius: 8px;

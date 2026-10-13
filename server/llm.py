@@ -142,6 +142,12 @@ def _to_openai_calls(calls) -> list:
 class EngineProvider(LLMProvider):
     """内置自研引擎（进程内原生库，零 HTTP）。
 
+    **两个后端、同一个 ABI**：`backend="cpu"` 用 `RPGBarEngine`（纯 CPU），
+    `backend="gpu"` 用 `RPGBarEngineCUDA`（CUDA）—— 宿主侧的差别只有"加载哪一个
+    文件"，调用代码一行不改（这正是"一个 ABI、两个实现"当初要买的东西）。
+    请求的后端与实际加载的后端可能不同（gpu 缺库时退回 cpu），所以两个值都记下来：
+    `self.backend` 是配置、`self.lib_backend` 是事实。
+
     **声明支持工具调用。** 这一点与"小模型多半不会函数调用"的常见印象相反，但在
     这条路径上是事实：Qwen3 是原生 tool calling 模型，引擎的 ChatML 渲染与
     `<tool_call>` 解析都对着官方模板逐字节对过（RPGBarEngine 的 `docs/DESIGN.md` §16）。
@@ -163,8 +169,14 @@ class EngineProvider(LLMProvider):
     supports_tools = True
 
     def __init__(self, lib, model_path, *, threads=0, context=4096, max_tokens=512,
-                 temperature=0.8, seed=None, stop=None, think=True, label="engine"):
+                 temperature=0.8, seed=None, stop=None, think=True, label="engine",
+                 backend="cpu"):
         self.lib = lib
+        self.backend = engine_mod.normalize_backend(backend)   # 请求的后端（cpu / gpu）
+        # **实际**用的是哪个后端（按文件名推断，只是提示：权威来源是加载后读
+        # model_info —— 见 _log_backend_once）。请求 gpu 而没找到 CUDA 版产物时
+        # 这两个值不一样，界面据此标出"实际：CPU"。
+        self.lib_backend = engine_mod.lib_backend_hint(getattr(lib, "path", ""))
         self.model_path = str(model_path)
         self.threads = int(threads)
         self.context = int(context)
@@ -176,6 +188,7 @@ class EngineProvider(LLMProvider):
         self.label = label
         self.name = f"engine[{Path(self.model_path).stem}]"
         self.last_usage: dict = {}
+        self.actual_backend = ""   # 首次加载后由 model_info 填（权威）
 
         self._model = None
         self._session = None
@@ -186,6 +199,33 @@ class EngineProvider(LLMProvider):
         self._gen_lock = engine_mod.model_lock(self.model_path)
 
     # ---- 生命周期 ----
+
+    def _log_backend_once(self) -> None:
+        """首次加载权重后，把"**实际**跑在哪个后端"打出来（一次）。
+
+        为什么值得一行日志：请求的后端与实际用的后端**可能不一样** —— 选了 GPU
+        但机器上没有 CUDA 版产物时 `find_lib` 会退回 CPU 版（见 engine.find_lib）。
+        玩家反馈"我明明选了 GPU 怎么还这么慢"时，这行日志与界面上的"实际：CPU"
+        是同一个答案。`model_info` 需要模型句柄，所以只能在这里做（不为了显示一行
+        字去搬 1 GiB 权重上卡）。
+
+        这一整段是**日志**，不是功能：任何异常都不许冒出去（测试里的假 lib、
+        老引擎没有这个方法……都不该让一次生成失败）。
+        """
+        if self.actual_backend:
+            return
+        try:
+            self.actual_backend = self.lib.model_backend(self._model)
+            name = Path(getattr(self.lib, "path", "") or "").name or "?"
+            note = ""
+            if (self.backend == "gpu" and self.actual_backend
+                    and self.actual_backend != "gpu"):
+                note = ("（**选的是 GPU，实际不是** —— 没找到 CUDA 版产物？"
+                        "跑 python scripts/sync_engine.py --backend gpu 看看）")
+            print(f"[RPGBar] 内置引擎：请求后端 {self.backend} · "
+                  f"实际后端 {self.actual_backend or '未知'} · 库 {name}{note}")
+        except Exception:  # noqa: BLE001  日志失败不算失败
+            pass
 
     def _ensure(self) -> int:
         """懒建 model + session，返回会话句柄。
@@ -200,6 +240,7 @@ class EngineProvider(LLMProvider):
                 self._model = self.lib.model_for(
                     self.model_path, threads=self.threads, max_pos=self.context
                 )
+                self._log_backend_once()
                 self._session = self.lib.new_session(
                     self._model, max_seq=self.context, max_tokens=self.max_tokens,
                     stop=self.stop, seed=self.seed,
@@ -275,6 +316,8 @@ class EngineProvider(LLMProvider):
             "context": self.context,
             "max_tokens": self.max_tokens,
             "think": self.think,
+            "backend": self.backend,          # 请求的后端（cpu / gpu）
+            "lib_backend": self.lib_backend,  # 按文件名推断的实际后端（提示）
             "usage": dict(self.last_usage),
         }
 
@@ -289,6 +332,9 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
     - kind=engine：内置引擎，需要 `lib`（动态库）与 `model`（权重文件），二者在
       `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（静默退化，
       与"引擎加载失败 → 视为 off"是同一条降级链）。
+      `backend`（cpu / gpu）决定找**哪一份**库：gpu 先找 CUDA 版产物
+      （`rpg_engine_cuda.dll`），找不到退回 CPU 版（不返回 None —— 那样 DM 会变成
+      脚本化，玩家看到的是"游戏坏了"，见 `engine.find_lib`）。
 
     `seed` 是**运行时状态**而非配置，所以走形参而不是槽位字段 —— 槽位会原样下发
     给前端，种子只该进服务端日志。目前只有 `kind=engine` 用它（引擎是纯函数，
@@ -301,7 +347,8 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
         return None
 
     if kind == "engine":
-        lib_path = engine_mod.find_lib((slot.get("lib") or "").strip())
+        backend = engine_mod.normalize_backend(slot.get("backend"))
+        lib_path = engine_mod.find_lib((slot.get("lib") or "").strip(), backend)
         model_path = engine_mod.find_model((slot.get("model") or "").strip())
         if lib_path is None or model_path is None:
             return None
@@ -321,6 +368,7 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
             stop=slot.get("stop"),
             think=bool(slot.get("think", False)),
             label="engine",
+            backend=backend,
         )
 
     base_url = (slot.get("base_url") or "").strip()

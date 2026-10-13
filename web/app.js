@@ -503,9 +503,13 @@
   // 内置引擎（RPGBarEngine）的界面开关。与三个槽位分开存：它是「同一份引擎、
   // 三个 Agent 共用」的全局设置，不属于任何一个槽位。think 默认 **false** ——
   // 关掉每轮 4-6 秒，打开约 35-50 秒（裁定质量略好），默认选快的那个。
+  // backend（cpu / gpu）决定加载哪一份库：cpu = rpg_engine.dll，
+  // gpu = rpg_engine_cuda.dll（同一份 ABI 的另一份实现）。默认 cpu —— 与这个
+  // 下拉框出现之前的行为完全一致。
   var ENGINE_KEY = "rpgbar.engine";
   var engineState = {
     enabled: false,
+    backend: "cpu",
     think: false,
     context: 4096,
     max_tokens: 512
@@ -576,6 +580,7 @@
       engineStored = true;
       var o = JSON.parse(raw) || {};
       if (typeof o.enabled === "boolean") engineState.enabled = o.enabled;
+      if (o.backend === "cpu" || o.backend === "gpu") engineState.backend = o.backend;
       if (typeof o.think === "boolean") engineState.think = o.think;
       if (typeof o.context === "number" && o.context > 0) engineState.context = o.context;
       if (typeof o.max_tokens === "number" && o.max_tokens > 0) engineState.max_tokens = o.max_tokens;
@@ -629,6 +634,27 @@
     return wrap;
   }
 
+  // 下拉字段（目前只有「推理后端」用）。刻意用 <select> 而不是一排按钮或复选框：
+  // 后端是个**开关式**选择（cpu 或 gpu 二选一），下拉在窄抽屉里最省地方，
+  // 也不会被误认成"两个可以同时勾"的开关。
+  function engineSelect(prop, label, options, hint, disabled) {
+    var wrap = el("div", "field");
+    wrap.appendChild(el("label", "", label));
+    var sel = document.createElement("select");
+    sel.disabled = !!disabled;
+    options.forEach(function (o) {
+      var opt = document.createElement("option");
+      opt.value = o.value;
+      opt.textContent = o.label;
+      sel.appendChild(opt);
+    });
+    sel.value = engineState[prop] || options[0].value;
+    sel.onchange = function () { engineState[prop] = sel.value; };
+    wrap.appendChild(sel);
+    if (hint) wrap.appendChild(el("span", "field-hint", hint));
+    return wrap;
+  }
+
   function buildEngineCard() {
     var card = el("div", "slot");
     card.id = "card-engine";
@@ -659,6 +685,11 @@
       locked || !engineState.enabled
     ));
     if (engineState.enabled) {
+      card.appendChild(engineSelect("backend", "推理后端", [
+        { value: "cpu", label: "CPU（rpg_engine.dll）" },
+        { value: "gpu", label: "GPU · CUDA（rpg_engine_cuda.dll）" }
+      ], "GPU 需要先跑 scripts/sync_engine.py --backend gpu 把 CUDA 版产物接到 models/；"
+        + "找不到时会自动退回 CPU，徽标会标出实际用的是哪个。", locked));
       card.appendChild(engineField("context", "上下文长度（KV Cache 容量）", "4096", locked, "number"));
       card.appendChild(engineField("max_tokens", "单轮最多生成 token", "512", locked, "number"));
     }
@@ -678,9 +709,15 @@
     var running = !!(info && info.enabled && info.ready);
     badgeEl.className = "slot-badge" + (running ? " on" : "");
     if (running) {
-      badgeEl.textContent = "已启用 · " + (info.model || "内置引擎") + (info.think ? " · think" : "");
+      // 后端要显出来，而且是**实际**那个：选了 GPU 却落回 CPU（没找到 CUDA 版
+      // 产物）时，徽标必须说"实际 CPU" —— 否则玩家会以为自己在用 GPU，
+      // 然后把"怎么还是这么慢"归因到别处。
+      var be = engineBackendText(info);
+      badgeEl.textContent = "已启用 · " + be + " · " + (info.model || "内置引擎")
+        + (info.think ? " · think" : "");
     } else if (info && info.enabled && !info.ready) {
-      badgeEl.textContent = "已启用，但引擎不可用";
+      badgeEl.textContent = "已启用，但引擎不可用"
+        + (info.backend === "gpu" && !info.lib_backend ? "（没找到 GPU 库）" : "");
     } else if (engineState.enabled) {
       badgeEl.textContent = "待保存";
     } else {
@@ -688,9 +725,24 @@
     }
   }
 
+  // 后端的人话（供徽标用）。以服务端探测的**实际**库为准，不认界面上的选择 ——
+  // 界面上的选择只是"请求"，`lib_backend` 才是事实。
+  // ⚠️ 比较一律用原始码（`gpu` / `cpu`），别拿显示文案比 —— "GPU" !== "gpu"，
+  // 那样写会让"回落"那句永远不触发，而徽标看起来一切正常（jsdom 那条断言抓过）。
+  function engineBackendText(info) {
+    info = info || {};
+    var req = info.backend === "gpu" ? "gpu" : "cpu";
+    var actual = (info.lib_backend === "gpu" || info.lib_backend === "cpu")
+      ? info.lib_backend : "";
+    if (!actual) return req === "gpu" ? "GPU" : "CPU";
+    if (req === "gpu" && actual === "cpu") return "实际 CPU（GPU 库缺失）";
+    return actual === "gpu" ? "GPU" : "CPU";
+  }
+
   function enginePayload() {
     return {
       enabled: !!engineState.enabled,
+      backend: engineState.backend === "gpu" ? "gpu" : "cpu",
       think: !!engineState.think,
       context: engineState.context,
       max_tokens: engineState.max_tokens
@@ -1270,7 +1322,7 @@
       try { localStorage.removeItem(SETTINGS_KEY); } catch (e) {}
       try { localStorage.removeItem(ENGINE_KEY); } catch (e) {}
       engineStored = false;
-      engineState = { enabled: false, think: false, context: 4096, max_tokens: 512 };
+      engineState = { enabled: false, backend: "cpu", think: false, context: 4096, max_tokens: 512 };
       slotState.dm = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 };
       slotState.assistant = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.6 };
       slotState.advisor = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 };

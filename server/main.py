@@ -65,7 +65,7 @@ from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
 from .dm import DM
 from .embedding import get_embedder
-from .engine import derive_seed
+from .engine import BACKENDS, derive_seed, normalize_backend
 from .llm import ToolCallingUnsupported, build_provider
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .rag import ScriptStore
@@ -196,13 +196,33 @@ if CHRONICLE_ENABLED:
         print(f"[RPGBar] 剧情档案：已启用（{_es['model']} {_es['dim']} 维 + BM25 混合检索）")
     else:
         print(f"[RPGBar] 剧情档案：已启用（纯 BM25；未加载嵌入模型：{_es['reason']}）")
+def backend_text(eng) -> str:
+    """把内置引擎的后端状态说成一句人话（启动日志与错误文案用）。
+
+    界面有自己的文案（`web/app.js`）。这里的存在理由是**看日志的人**：选了 GPU
+    却落回 CPU 时，日志必须说出来（退回规则见 `engine.find_lib`）—— 否则"怎么
+    还是这么慢"会变成一场没有线索的排查。
+    """
+    eng = eng or {}
+    req = normalize_backend(eng.get("backend"))
+    lib_be = str(eng.get("lib_backend") or "")
+    if req == "gpu" and lib_be == "cpu":
+        return "GPU 后端（没找到 rpg_engine_cuda，实际退回了 CPU）"
+    if not lib_be:
+        return "GPU 后端" if req == "gpu" else "CPU 后端"
+    return "GPU 后端（CUDA）" if req == "gpu" else "CPU 后端"
+
+
 _agents = describe_agents(default_dm_slot, default_advisor_slot, default_assistant_slot)
 for key in ("dm", "advisor", "assistant"):
     a = _agents.get(key)
     if not a:
         continue
     if a["ready"]:
-        where = "进程内直连" if a["kind"] == "engine" else a["base_url"]
+        if a["kind"] == "engine":
+            where = "进程内直连 · " + backend_text(a.get("engine"))
+        else:
+            where = a["base_url"]
         print(f"[RPGBar] {a['label']}：{a['kind']} · {where} · {a['model']}")
     else:
         print(f"[RPGBar] {a['label']}：未接模型（留空），走脚本化兜底")
@@ -252,6 +272,10 @@ def clean_engine_patch(patch) -> dict:
 
     `lib` / `model`（本机路径）**不在白名单里** —— 它们是服务端的事，收进来就等于
     让任意客户端去指一个能被加载的 dll，且没有意义（一个进程只加载一份库）。
+
+    `backend` 在白名单里，但**只收 `cpu` / `gpu` 两个值**（`engine.BACKENDS`）：
+    它做的是"在这张枚举好的产物名单里挑一个"（`rpg_engine.dll` / `rpg_engine_cuda.dll`），
+    与上面那条边界不冲突 —— 客户端挑的是后端，指不了文件。
     """
     if not isinstance(patch, dict):
         return {}
@@ -259,6 +283,10 @@ def clean_engine_patch(patch) -> dict:
     for key in ("enabled", "think"):
         if key in patch:
             out[key] = bool(patch[key])
+    if "backend" in patch:
+        b = normalize_backend(patch["backend"], default="")
+        if b in BACKENDS:
+            out["backend"] = b
     for key, lo, hi in (("context", 256, 32768), ("max_tokens", 16, 4096)):
         if key in patch:
             try:
@@ -323,7 +351,7 @@ class Room:
         if (slot.get("kind") or "off").lower() != "engine":
             return slot
         merged = dict(slot)
-        for key in ("enabled", "think", "context", "max_tokens"):
+        for key in ("enabled", "think", "context", "max_tokens", "backend"):
             if key in self.engine_slot:
                 merged[key] = self.engine_slot[key]
         if not merged.get("enabled"):
@@ -383,11 +411,19 @@ class Room:
 
         `ready` 取自 DM 槽位的引擎探测结果 —— 与「模型设置」里显示的是同一份
         判据，免得两个地方各说各话。
+
+        后端那三个字段也来自同一份探测：`backend`（请求的后端）、`lib_backend`
+        （实际会加载的那份库）、`backend_fallback`（请求 GPU 却落回 CPU）。
+        DM 槽位不是 engine 时探测结果为空 —— 那就回落到房间配置里的请求值，
+        界面至少要能正确显示"当前选的是哪个"。
         """
         if status is None:
             status = describe_agents(self._effective_slot(self.dm_slot), None, None)
         detail = (status.get("dm") or {}).get("engine") or {}
         eng = self.engine_slot
+        req_backend = normalize_backend(
+            detail.get("backend") or eng.get("backend")
+        )
         return {
             "enabled": bool(eng.get("enabled")),
             "think": bool(eng.get("think")),
@@ -395,6 +431,10 @@ class Room:
             "max_tokens": int(eng.get("max_tokens") or 0),
             "ready": bool(detail.get("ready")),
             "model": detail.get("model_name", ""),
+            "backend": req_backend,
+            "lib_backend": str(detail.get("lib_backend") or ""),
+            "backend_fallback": bool(detail.get("backend_fallback")),
+            "lib_name": str(detail.get("lib_name") or ""),
         }
 
     def advisor_slot_for(self, name):

@@ -267,13 +267,15 @@ form input:focus, form select:focus { border-color: var(--accent); }
 
 .field { margin-bottom: 10px; }
 .field label { display: block; font-size: 11px; color: var(--text-dim); margin-bottom: 4px; }
-.field input {
+.field input, .field select {
   width: 100%; padding: 9px 10px; font-size: 13px;
   background: var(--bg); color: var(--text);
   border: 1px solid var(--border); border-radius: 7px; outline: none;
 }
-.field input:focus { border-color: var(--accent); }
-.field input:disabled { opacity: .55; }
+.field input:focus, .field select:focus { border-color: var(--accent); }
+.field input:disabled, .field select:disabled { opacity: .55; }
+/* 字段下方的补充说明（如"GPU 找不到会退回 CPU"）—— 与 check-hint 同色调，更小一号 */
+.field-hint { display: block; margin-top: 5px; font-size: 11px; color: var(--text-dim); line-height: 1.5; }
 .field textarea {
   width: 100%; padding: 9px 10px; font-size: 12px; resize: vertical;
   background: var(--bg); color: var(--text); border: 1px solid var(--border);

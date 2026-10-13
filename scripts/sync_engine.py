@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """把 RPGBarEngine 的产物同步到本项目的 models/ —— 供"内置引擎"通道使用。
 
+两个后端，两份产物
+------------------
+内置引擎有**两份实现、同一个 C ABI**：
+
+- CPU 版：`RPGBarEngine`（仓库同级目录 `../RPGBarEngine`）→ `rpg_engine.dll`
+- GPU 版：`RPGBarEngineCUDA`（`../RPGBarEngineCUDA`）→ 同步时**改名为**
+  `rpg_engine_cuda.dll`
+
+为什么要改名：游戏里那个「推理后端」下拉框只能"在这张枚举好的名单里挑"
+（`server/engine.py::_LIB_STEMS`），客户端指不了任意 dll —— 与"界面不许改
+lib / model"是同一条安全边界。文件名就是后端。
+
+⚠️ 改名只发生在**同步这一步**，另一个仓库的构建产物名不动（那边仍是
+`rpg_engine.dll` / `librpg_engine.so`）—— 那边的"同一个 ABI"故事也就不用改。
+
 为什么需要这个脚本
 ------------------
 内置引擎通道要求动态库与权重**在搜索路径里**（`server/engine.py::_search_dirs`）：
-`models/`（本项目）与前一级目录。引擎的产物却在另一个仓库（`RPGBarEngine/build`
-与 `RPGBarEngine/models`），所以要"接"过来。
+`models/`（本项目）与前一级目录。引擎的产物却在另一个仓库，所以要"接"过来。
 
 用硬链接而不是复制
 ------------------
@@ -15,12 +29,19 @@
 
 用法
 ----
-    python scripts/sync_engine.py                      # 自动找 ../RPGBarEngine
-    python scripts/sync_engine.py --engine-repo D:/RPGBarEngine
-    python scripts/sync_engine.py --all                # 同步全部 Qwen3-*.gguf
-    python scripts/sync_engine.py --copy               # 强制复制（跨盘/网络盘时用）
+    python scripts/sync_engine.py                  # 两个后端都接（找不到的那个会提示）
+    python scripts/sync_engine.py --backend cpu    # 只接 CPU 版
+    python scripts/sync_engine.py --backend gpu    # 只接 GPU 版（CUDA）
+    python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直接指路径
+    python scripts/sync_engine.py --cuda-repo D:/RPGBarEngineCUDA
+    python scripts/sync_engine.py --all            # 同步全部 Qwen3-*.gguf
+    python scripts/sync_engine.py --copy           # 强制复制（跨盘/网络盘时用）
 
-同步完可以直接自检：`python scripts/engine_probe.py`
+⚠️ **WSL 里构建的 CUDA 产物在 `~/cuda-build`，不在仓库的 `build/` 里**（那边只
+留源码、构建目录落在 ext4 上），所以 Linux 下多半要用 `--lib` 直接指过去。
+
+同步完务必自检（它会报出**实际**后端）：
+    python scripts/engine_probe.py --backend gpu
 """
 from __future__ import annotations
 
@@ -36,13 +57,27 @@ DEST = ROOT / "models"
 LIB_NAMES = ("rpg_engine.dll", "librpg_engine.so", "librpg_engine.dylib",
              "rpg_engine.so", "rpg_engine.dylib")
 
+# 后端 → 引擎仓库的目录名（同级目录下，可用 --engine-repo / --cuda-repo 覆盖）
+REPO_NAMES = {"cpu": "RPGBarEngine", "gpu": "RPGBarEngineCUDA"}
 
-def find_engine_repo(explicit: str | None) -> Path | None:
-    """找引擎仓库：显式路径优先，否则试同级目录 ../RPGBarEngine。"""
+
+def gpu_dest_name(name: str) -> str:
+    """CUDA 仓库的产物名 → 本项目里的名字（加 `_cuda`）。
+
+    `rpg_engine.dll` → `rpg_engine_cuda.dll`
+    `librpg_engine.so` → `librpg_engine_cuda.so`
+    """
+    p = Path(name)
+    return f"{p.stem}_cuda{p.suffix}"
+
+
+def find_engine_repo(explicit: str | None, which: str = "cpu") -> Path | None:
+    """找引擎仓库：显式路径优先，否则试同级目录 `../<REPO_NAMES[which]>`。"""
     if explicit:
         p = Path(explicit).expanduser().resolve()
         return p if p.is_dir() else None
-    for cand in (ROOT.parent / "RPGBarEngine", ROOT / "RPGBarEngine"):
+    name = REPO_NAMES.get(which, REPO_NAMES["cpu"])
+    for cand in (ROOT.parent / name, ROOT / name):
         if cand.is_dir():
             return cand
     return None
@@ -112,54 +147,131 @@ def human(n: int) -> str:
     return str(n)
 
 
+def _lib_jobs(args) -> tuple[list[tuple[Path, str, str]], list[str]]:
+    """要同步哪些库。返回 ([(源文件, 目标文件名, 后端)], [提示行])。
+
+    两份库分开找、分开报错：GPU 版找不到**不影响** CPU 版接好（那 1 GB 权重是
+    共用的，装一次两边都能用）。
+    """
+    jobs: list[tuple[Path, str, str]] = []
+    notes: list[str] = []
+
+    if args.backend in ("both", "cpu"):
+        repo = find_engine_repo(args.engine_repo, "cpu")
+        if repo is None:
+            notes.append(f"[!] 没找到 CPU 引擎仓库（{ROOT.parent / REPO_NAMES['cpu']}）——"
+                         f" 用 --engine-repo 指定")
+        else:
+            print(f"CPU 引擎仓库：{repo}")
+            lib = pick_lib(repo)
+            if lib is None:
+                notes.append("[!] CPU 仓库里没有动态库产物 —— 先在那边构建一次"
+                             "（build.sh / build.bat）")
+            else:
+                jobs.append((lib, lib.name, "cpu"))
+
+    if args.backend in ("both", "gpu"):
+        if args.lib:
+            # 直接指路径：WSL 构建的产物在 ~/cuda-build，不在仓库里，只能这么给
+            lib = Path(args.lib).expanduser()
+            if not lib.is_file():
+                notes.append(f"[x] --lib 指的文件不存在：{lib}")
+            else:
+                print(f"GPU 引擎库（--lib）：{lib}")
+                jobs.append((lib, gpu_dest_name(lib.name), "gpu"))
+        else:
+            repo = find_engine_repo(args.cuda_repo, "gpu")
+            if repo is None:
+                notes.append(f"[!] 没找到 CUDA 引擎仓库（{ROOT.parent / REPO_NAMES['gpu']}）——"
+                             f" 用 --cuda-repo 指定，或用 --lib 直接指产物")
+            else:
+                print(f"CUDA 引擎仓库：{repo}")
+                lib = pick_lib(repo)
+                if lib is None:
+                    notes.append(f"[!] {repo} 里没有动态库产物 —— WSL 里构建的话产物在"
+                                 f" ~/cuda-build，用 --lib 指过去")
+                else:
+                    jobs.append((lib, gpu_dest_name(lib.name), "gpu"))
+
+    return jobs, notes
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="同步引擎产物到 models/")
+    ap.add_argument("--backend", choices=("both", "cpu", "gpu"), default="both",
+                    help="同步哪个后端（默认 both）")
     ap.add_argument("--engine-repo", default=None,
-                    help="引擎仓库路径（默认自动找 ../RPGBarEngine）")
+                    help="CPU 引擎仓库路径（默认自动找 ../RPGBarEngine）")
+    ap.add_argument("--cuda-repo", default=None,
+                    help="CUDA 引擎仓库路径（默认自动找 ../RPGBarEngineCUDA）")
+    ap.add_argument("--lib", default="", help="GPU 引擎库直接指路径（跳过仓库查找）")
     ap.add_argument("--all", action="store_true",
                     help="同步全部 Qwen3-*.gguf（默认只挑一个）")
     ap.add_argument("--copy", action="store_true",
                     help="强制复制而不是硬链接")
     args = ap.parse_args()
 
-    repo = find_engine_repo(args.engine_repo)
-    if repo is None:
-        print("[x] 找不到引擎仓库。用 --engine-repo 指定，例如：")
-        print("      python scripts/sync_engine.py --engine-repo D:/RPGBarEngine")
+    jobs, notes = _lib_jobs(args)
+
+    # ---- 权重：两个后端**共用同一份 GGUF**，所以只找一次（优先 CPU 仓库）
+    weights: list[Path] = []
+    weights_from = ""
+    for which in ("cpu", "gpu"):
+        repo = find_engine_repo(
+            args.engine_repo if which == "cpu" else args.cuda_repo, which)
+        if repo is None:
+            continue
+        got = pick_weights(repo, args.all)
+        if got:
+            weights, weights_from = got, str(repo)
+            break
+
+    if not jobs and not weights:
+        print("[x] 既没找到动态库产物，也没找到 Qwen3-*.gguf。")
+        for n in notes:
+            print("   " + n)
         return 2
 
-    print(f"引擎仓库：{repo}")
     print(f"目标目录：{DEST}")
-    lib = pick_lib(repo)
-    weights = pick_weights(repo, args.all)
-    if lib is None and not weights:
-        print("[x] 仓库里既没找到动态库产物，也没找到 Qwen3-*.gguf。")
-        print("    先在引擎仓库跑一次构建（build.sh / build.bat）。")
-        return 2
+    if weights_from:
+        print(f"权重来源：{weights_from}")
 
     DEST.mkdir(parents=True, exist_ok=True)
     failures = 0
-    for src in ([lib] if lib else []) + weights:
-        if src is None:
-            continue
+    for src, dst_name, backend in jobs:
+        dst = DEST / dst_name
+        action, note = place(src, dst, args.copy)
+        size = human(src.stat().st_size)
+        mark = {"skip": "=", "link": "+", "copy": "+", "fail": "x"}[action]
+        tag = "GPU" if backend == "gpu" else "CPU"
+        extra = ""
+        if backend == "gpu" and src.name != dst_name:
+            extra = f"  （源名 {src.name}）"
+        print(f"  [{mark}] {dst_name:<28} {size:>10}  {tag} · {note}{extra}")
+        if action == "fail":
+            failures += 1
+
+    for src in weights:
         dst = DEST / src.name
         action, note = place(src, dst, args.copy)
         size = human(src.stat().st_size)
         mark = {"skip": "=", "link": "+", "copy": "+", "fail": "x"}[action]
-        print(f"  [{mark}] {src.name:<28} {size:>10}  {note}")
+        print(f"  [{mark}] {src.name:<28} {size:>10}  权重 · {note}")
         if action == "fail":
             failures += 1
 
-    if lib is None:
-        print("  [!] 没找到动态库产物 —— 先构建引擎仓库。")
-    if not weights:
-        print("  [!] 没找到 Qwen3-*.gguf —— 先下载权重。")
+    for n in notes:
+        print("  " + n)
 
     print()
     if failures:
         print(f"完成，但有 {failures} 个文件失败。")
         return 1
-    print("完成。自检：python scripts/engine_probe.py")
+    if not jobs:
+        print("只同步了权重：一个动态库都没接上 —— 引擎要库与权重都在才能用。")
+    print("自检（**它会报出实际跑在哪个后端**）：")
+    print("  python scripts/engine_probe.py --backend cpu")
+    print("  python scripts/engine_probe.py --backend gpu     # 接了 CUDA 版就跑这条")
     return 0
 
 

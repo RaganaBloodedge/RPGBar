@@ -16,6 +16,10 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
   会话的独立种子；**不给种子就会落到引擎默认 0** —— 那样每个房间、每一局的随机流
   都完全一样，"换个房间重开"其实是同一串随机数。
 - **异常不穿 C ABI**：失败时返回负数 / 空指针，错误文本走 `rpg_engine_last_error()`。
+- **两个后端、同一个 ABI**：CPU 版（`rpg_engine.dll`）与 CUDA 版
+  （`rpg_engine_cuda.dll`）是同一份 C 接口的两份实现，所以"用哪个后端"在宿主
+  侧就只是"**加载哪一个文件**"（`find_lib(backend=...)`）。选谁由配置 / 游戏内
+  设置决定，见下面的「后端」一节。
 
 本模块的定位是"**任何一台机器上都能静默缺席**"：库或权重找不到时
 `build_provider()` 直接返回 None，游戏退回脚本化兜底（与"引擎加载失败 → 视为 off"
@@ -62,14 +66,42 @@ def derive_seed(room_seed: int, label: str) -> int:
     return int.from_bytes(digest, "big")
 
 
-# ---------------------------------------------------------------- 找库 / 找权重
+# ---------------------------------------------------------------- 后端（CPU / GPU）
 
-def _lib_filenames() -> list[str]:
+# 两个后端的**产物文件名**。同一份 C ABI 有两份实现：
+#   cpu → RPGBarEngine（纯 CPU，`rpg_engine.dll`）
+#   gpu → RPGBarEngineCUDA（CUDA，`rpg_engine_cuda.dll`；ABI 一个函数不差）
+#
+# 「文件名即后端」是这个功能能做得**安全**的原因：界面上那个「CPU / GPU」选择器
+# 只能在这张表里挑，客户端永远指不了一个任意 dll —— 与"界面不许改 lib / model"
+# 是同一条边界（见 server/main.py::clean_engine_patch）。
+_LIB_STEMS = {"cpu": "rpg_engine", "gpu": "rpg_engine_cuda"}
+
+# 界面上能选的值（服务端白名单，见 main.clean_engine_patch）。
+BACKENDS = ("cpu", "gpu")
+
+
+def normalize_backend(value, default: str = "cpu") -> str:
+    """把配置 / 界面传来的值收敛到 BACKENDS 里的一个（认不出来就用默认值）。
+
+    顺手认几个别名（`cuda` / `host`）：配置文件是给人手写的，多认一个同义词比
+    让人对着文档查拼写好。但**界面白名单只放 cpu / gpu 两个值**。
+    """
+    b = str(value or "").strip().lower()
+    if b in ("gpu", "cuda"):
+        return "gpu"
+    if b in ("cpu", "host"):
+        return "cpu"
+    return default
+
+
+def _lib_filenames(backend: str = "cpu") -> list[str]:
+    stem = _LIB_STEMS.get(normalize_backend(backend), _LIB_STEMS["cpu"])
     if sys.platform == "win32":
-        return ["rpg_engine.dll"]
+        return [f"{stem}.dll"]
     if sys.platform == "darwin":
-        return ["librpg_engine.dylib", "rpg_engine.dylib"]
-    return ["librpg_engine.so", "rpg_engine.so"]
+        return [f"lib{stem}.dylib", f"{stem}.dylib"]
+    return [f"lib{stem}.so", f"{stem}.so"]
 
 
 def _search_dirs() -> list[Path]:
@@ -77,21 +109,71 @@ def _search_dirs() -> list[Path]:
     return [USER_DIR / "models", RESOURCE_DIR / "models", USER_DIR, RESOURCE_DIR]
 
 
-def find_lib(explicit: str = "") -> Path | None:
+def find_lib(explicit: str = "", backend: str = "cpu") -> Path | None:
     """找引擎动态库。
 
-    `explicit` 非空时**只用它**（写明路径却找不到，说明配置有问题，不该偷偷换
-    一个能加载的库继续跑 —— 那种"能用但不是你以为的那个"最难查）。
+    `explicit` 非空时**只用它**，且不考虑后端 —— 写明路径的人知道自己要哪一份
+    （写明路径却找不到，说明配置有问题，不该偷偷换一个能加载的库继续跑 ——
+    那种"能用但不是你以为的那个"最难查）。
+
+    否则按 `backend` 找：
+
+    - `cpu`：只认 CPU 版产物（`rpg_engine.dll`）。**默认值，与加这个开关之前
+      的行为逐字相同**（那时候的名单就只有这一个文件）。
+    - `gpu`：**先找 CUDA 版产物**（`rpg_engine_cuda.dll`），找不到就**退回 CPU 版**。
+
+    ⚠️ 为什么 `gpu` 要退回而不是"找不到就当作没引擎"：后者会让 `kind=engine`
+    的槽位退化成 `off` → DM 变脚本化 → 玩家看到的是"**游戏坏了**"，而不是
+    "GPU 不可用"。退回的代价只是慢，而且**退没退是看得见的**：公开状态里的
+    `lib_name` 会是 `rpg_engine.dll`，界面据此标出"实际：CPU（GPU 库缺失）"。
+    "能玩 + 说实话"优于"诚实但玩不了"。（真不想退回，把 `lib` 写成 CUDA 库的
+    绝对路径即可 —— 那条路不退回。）
     """
     if explicit:
         p = Path(explicit).expanduser()
         return p if p.is_file() else None
-    for name in _lib_filenames():
-        for d in _search_dirs():
-            p = d / name
-            if p.is_file():
-                return p
+    # 请求 gpu 时的尝试顺序：先 CUDA 版，再 CPU 版（见上面的退回说明）。
+    order = ["gpu", "cpu"] if normalize_backend(backend) == "gpu" else ["cpu"]
+    for b in order:
+        for name in _lib_filenames(b):
+            for d in _search_dirs():
+                p = d / name
+                if p.is_file():
+                    return p
     return None
+
+
+def lib_backend_hint(path) -> str:
+    """从**文件名**推断这份库是哪个后端（`""` = 没找到库）。
+
+    只是提示：文件名是同步脚本起的名字。**权威来源**是加载后 `model_info` 里的
+    `engine` / `backend` 键（见 `backend_from_info`）。
+    """
+    if not path:
+        return ""
+    return "gpu" if "cuda" in Path(path).name.lower() else "cpu"
+
+
+def backend_from_info(info: dict) -> str:
+    """从 `model_info` 判断**实际**跑在哪个后端 —— 这是权威答案。
+
+    不需要动 ABI：CUDA 版本来就多两个键（`engine` = `rpg_engine_cuda`、
+    `backend` = `cuda` / `host-only`），CPU 版 0.4.1 两个键都没有 —— 于是
+    "有没有这两个键"本身就是判别式（见 RPGBarEngineCUDA 的 `docs/DESIGN.md`，
+    ABI 只有 10 个函数、一个都不能加）。
+
+    返回值：`"cpu"` / `"gpu"` / `"host-only"`（编了 CUDA 仓库的宿主-only 产物，
+    没有 CUDA 后端 —— 能读元数据，生成会明确报错）。
+    """
+    if not isinstance(info, dict):
+        return ""
+    eng = str(info.get("engine") or "").strip().lower()
+    be = str(info.get("backend") or "").strip().lower()
+    if be == "host-only":
+        return "host-only"
+    if eng.endswith("cuda") or be == "cuda":
+        return "gpu"
+    return "cpu"
 
 
 def find_model(explicit: str = "") -> Path | None:
@@ -228,6 +310,15 @@ class EngineLib:
 
     def model_info(self, model: int) -> dict:
         return self._take_json(self._lib.rpg_engine_model_info(ctypes.c_int32(model)))
+
+    def model_backend(self, model: int) -> str:
+        """这份权重**实际**跑在哪个后端（读 `model_info`，权威）。
+
+        需要先加载模型（`model_info` 的入参是模型句柄）—— 所以它用在自检脚本与
+        "首次生成之后"的日志里，而不是给界面画状态用（界面不为了显示一行字去搬
+        1 GiB 权重上卡）。
+        """
+        return backend_from_info(self.model_info(model))
 
     def loaded_models(self) -> list[int]:
         with self._lock:

@@ -44,9 +44,17 @@ DEFAULTS = {
     # 代价（引擎自报实测）：KV Cache @2048≈448 MiB、@4096≈896 MiB / 会话。
     "engine": {
         "enabled": False,
+        # 推理后端：cpu（默认，纯 CPU）/ gpu（CUDA 版）。
+        # 落到文件层面就是"加载哪一份库"：cpu → models/rpg_engine.dll，
+        # gpu → models/rpg_engine_cuda.dll（同一份 C ABI 的两份实现，
+        # 见 server/engine.py 的「后端」一节）。游戏内「⚙ 设置 → 内置引擎」
+        # 有同一个下拉框（房主可改，全房间共用）。
+        # ⚠️ 选 gpu 而机器上没有 CUDA 版产物时**退回 CPU 版**（游戏照常能玩），
+        # 界面上会标出"实际：CPU"—— 详见 engine.find_lib 的说明。
+        "backend": "cpu",
         "lib": "",
         "model": "",
-        "threads": 0,        # 0 = 引擎按 CPU 核数自己决定
+        "threads": 0,        # 0 = 引擎按 CPU 核数自己决定（gpu 后端忽略线程数）
         "context": 4096,
         "max_tokens": 512,
         # Qwen3 思考模式。**默认关闭**：实测每轮 4-6 秒，打开约 35-50 秒（质量略好）。
@@ -153,7 +161,7 @@ def _apply_engine_slots(cfg: dict) -> None:
         if not eng.get("enabled"):
             slot["kind"] = "off"
             continue
-        for key in ("lib", "threads", "context", "max_tokens", "think"):
+        for key in ("backend", "lib", "threads", "context", "max_tokens", "think"):
             if key not in slot:
                 slot[key] = eng.get(key)
         # `model` 单独处理，见 `_looks_like_engine_weight`：判据是"槽位写的值在
@@ -189,8 +197,13 @@ def load_config() -> dict:
     _apply_env_slot(cfg["models"]["assistant"], "RPGBAR_ASSISTANT_MODEL")
 
     # 内置引擎段：环境变量优先于配置文件的字段，但都要过一遍下面的"启用/退化"逻辑。
+    # （`backend` 的别名收敛（cuda → gpu）在 server/engine.normalize_backend 里做 ——
+    #  config 不能反向 import engine（engine 要 import 本模块的路径常量），所以
+    #  这里只原样收下，读的时候再过一遍。）
     eng = cfg.setdefault("engine", {})
-    for key, env in (("lib", "RPGBAR_ENGINE_LIB"), ("model", "RPGBAR_ENGINE_MODEL")):
+    for key, env in (("backend", "RPGBAR_ENGINE_BACKEND"),
+                     ("lib", "RPGBAR_ENGINE_LIB"),
+                     ("model", "RPGBAR_ENGINE_MODEL")):
         if os.environ.get(env):
             eng[key] = os.environ[env]
     if os.environ.get("RPGBAR_ENGINE"):

@@ -81,11 +81,22 @@ def _slot_public(slot, label) -> dict:
 
 
 def _engine_public(slot) -> dict:
-    """内置引擎槽位的公开状态：只给布尔与文件名，不给绝对路径。"""
-    from ..engine import find_lib, find_model
+    """内置引擎槽位的公开状态：只给布尔与文件名，不给绝对路径。
 
-    lib = find_lib((slot.get("lib") or "").strip())
+    三个「后端」字段是给界面用的：
+    - `backend`：配置里请求的后端（`cpu` / `gpu`）；
+    - `lib_backend`：**实际**会加载的那份库（由文件名推得 —— 权威答案在
+      `model_info` 里，但那要先把权重搬上卡，界面不为一行字付这个代价）；
+    - `backend_fallback`：请求了 GPU 却落回 CPU（`gpu` 缺 CUDA 版产物时的退回，
+      见 `engine.find_lib`）。界面据此标出"实际：CPU（GPU 库缺失）"——
+      这个标志存在的理由就一句：**别让玩家以为自己跑在 GPU 上**。
+    """
+    from ..engine import find_lib, find_model, lib_backend_hint, normalize_backend
+
+    backend = normalize_backend(slot.get("backend"))
+    lib = find_lib((slot.get("lib") or "").strip(), backend)
     weights = find_model((slot.get("model") or "").strip())
+    lib_backend = lib_backend_hint(lib)
     return {
         "lib_ok": lib is not None,
         "model_ok": weights is not None,
@@ -93,4 +104,7 @@ def _engine_public(slot) -> dict:
         "model_name": weights.name if weights is not None else "",
         "context": int(slot.get("context") or 0),
         "ready": lib is not None and weights is not None,
+        "backend": backend,
+        "lib_backend": lib_backend,
+        "backend_fallback": bool(backend == "gpu" and lib_backend == "cpu"),
     }

@@ -178,14 +178,14 @@ function startFakeLLM() {
     prompt: { advisor: "（小助手公开版 prompt）", dm: "（DM 完整版 prompt）" },
     agents: {
       owner: "亚瑟",
-      dm: { kind: "off", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: false, ready: false, mode: "scripted" },
-      assistant: { kind: "off", base_url: "http://127.0.0.1:8081/v1", model: "qwen2.5-3b-instruct", has_api_key: false, ready: false, mode: "scripted" },
-      advisor: { kind: "off", base_url: "http://127.0.0.1:8080/v1", model: "local-model", has_api_key: false, ready: false, mode: "scripted" },
+      dm: { kind: "off", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: false, ready: false, mode: "off" },
+      assistant: { kind: "off", base_url: "http://127.0.0.1:8081/v1", model: "qwen2.5-3b-instruct", has_api_key: false, ready: false, mode: "off" },
+      advisor: { kind: "off", base_url: "http://127.0.0.1:8080/v1", model: "local-model", has_api_key: false, ready: false, mode: "off" },
     },
   });
   check("welcome 后顶栏显示房间码", $("room-code").textContent === "ABC12", $("room-code").textContent);
   check("welcome 后品牌名跟随剧本", (q(".brand-name") || {}).textContent === "RPGBar · 古堡秘宝", (q(".brand-name") || {}).textContent);
-  check("模型状态胶囊显示脚本化", $("model-pill").textContent === "模型：脚本化", $("model-pill").textContent);
+  check("一个模型都没接时胶囊显示未接入", $("model-pill").textContent === "模型：未接入", $("model-pill").textContent);
   // 「本房间」同步块：剧本 + 切片 + 两份 prompt（房主能看到 DM 那份）
   const syncEl = $("room-sync");
   check("welcome 后同步块显示剧本名", !!syncEl && (syncEl.textContent || "").indexOf("古堡秘宝") >= 0, syncEl ? syncEl.textContent : "无");
@@ -205,15 +205,16 @@ function startFakeLLM() {
   check("建议区同时出现助手占位", !!sugThink);
   check("思考期间「助手建议」按钮被禁用", $("suggest-btn").disabled === true);
   // 服务端回 suggestions → 占位撤掉、选项渲染
-  ws.deliver({ type: "suggestions", options: ["观察四周", "检查石门"], agent: { source: "scripted" } });
+  ws.deliver({ type: "suggestions", options: ["观察四周", "检查石门"], agent: { source: "failed" } });
   check("收到建议后聊天框占位被撤掉", !q("#log .thinking"));
   check("建议选项已渲染", w.document.querySelectorAll("#suggestions .suggestion").length === 2,
     String(w.document.querySelectorAll("#suggestions .suggestion").length));
-  check("脚本化来源被标出（warn 标签）", !!q("#suggestions .suggest-src.warn"));
+  check("没产出的一轮被标出（warn 标签）", !!q("#suggestions .suggest-src.warn"),
+    (q("#suggestions .suggest-src.warn") || {}).textContent || "无");
   check("建议返回后按钮恢复可用", $("suggest-btn").disabled === false);
-  // 退化告警：agent_note（非 llm）要醒目地进聊天框
-  ws.deliver({ type: "agent_note", who: "dm", source: "degraded", stopped: "error", error: "序列超长" });
-  check("退化告警进聊天框（醒目条目）", !!q("#log .entry.system.warn"),
+  // 失败告警：agent_note（非 llm）要醒目地进聊天框
+  ws.deliver({ type: "agent_note", who: "dm", source: "failed", stopped: "error", error: "序列超长" });
+  check("失败告警进聊天框（醒目条目）", !!q("#log .entry.system.warn"),
     (q("#log .entry.system.warn") || {}).textContent || "无");
   // busy：上一条没跑完时要有明确反馈（之前是静默丢弃）
   ws.deliver({ type: "busy", who: "advisor", message: "上一轮还在推理中，稍后再点。" });

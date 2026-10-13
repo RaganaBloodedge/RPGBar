@@ -15,7 +15,7 @@
 "选了 GPU 其实是 CPU"是这条路上最容易让人白排查半天的事。
 
 退出码：0 = 可用；1 = 库与权重都在但用不了（生成失败、库版本不匹配）；
-2 = 库或权重缺失（游戏会自动退回脚本化兜底，**不是故障**）。
+2 = 库或权重缺失（该槽位就当没接模型 —— 不再有脚本化兜底，游戏会显式失败）。
 """
 import argparse
 import asyncio
@@ -58,7 +58,7 @@ def main() -> int:
     print("引擎库  :", lib or "（没找到）")
     print("权重    :", weights or "（没找到）")
     if lib is None or weights is None:
-        print("\n内置引擎不可用 —— 游戏会退回脚本化兜底，这不是故障。")
+        print("\n内置引擎不可用 —— 这个槽位就用不上模型了（2026-10-13 起不再有脚本化兜底）。")
         if args.backend == "gpu":
             print("GPU 版要接 CUDA 仓库的产物：")
             print("  python scripts/sync_engine.py --backend gpu"

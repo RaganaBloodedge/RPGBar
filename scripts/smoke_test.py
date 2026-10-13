@@ -113,7 +113,11 @@ async def run_unit():
     r2 = __import__("server.dice", fromlist=["roll"]).roll(20)
     check("骰子设种子可复现", r1 == r2, f"{r1} vs {r2}")
 
-    # DM（脚本化兜底）：行动 → 检定 / 出口
+    # DM 的状态机实现：行动 → 检定 / 出口（`dm.py` 的确定性流水线）
+    #
+    # ⚠️ 2026-10-13 取消脚本化兜底后，这条流水线**不再是运行路径**：接了模型时
+    # 由 DM 调 `roll_check` / `move_to` 决定走哪个检定与出口，没模型时直接失败。
+    # 这里继续测它是为了守住"行动↔检定/出口 的匹配语义"这一层行为定义。
     dm = DM(store, None)
     state3 = GameState(store, "gate")
     state3.add_player("A", {"name": "A", "cls": "战士"})
@@ -122,8 +126,6 @@ async def run_unit():
     check("检定行动触发 dice 事件", "dice" in types, str(types))
     evs2 = await dm.handle_action(state3, "A", "推开铁门进入门厅")
     check("出口行动推进场景", state3.current_scene == "hall", state3.current_scene)
-    opts = await dm.suggest(state3)
-    check("助手建议非空", isinstance(opts, list) and len(opts) > 0, str(opts))
 
     # ---- 中途加入：进度判定 / 剧情回顾 / DM 引导 ----
     store2 = ScriptStore(SCRIPT)
@@ -144,11 +146,10 @@ async def run_unit():
     r = prog.recap()
     check("回顾含中文线索", any(f["label"] != f["id"] for f in r["flags"]), str(r["flags"]))
 
+    # 取消脚本化兜底（2026-10-13）：没有模型就不产这段「新玩家登场」旁白。
+    # 有模型时由 `introduce()` 调模型生成（实时联机部分覆盖）。
     intro = await dm.introduce(prog, "梅林", {"cls": "法师"})
-    check("引导旁白非空", bool(intro and intro.strip()))
-    check("引导旁白含新玩家名字与职业", "梅林" in intro and "法师" in intro, intro[:60])
-    check("引导旁白复述此前行程", "门厅" in intro, intro[:80])
-    check("引导旁白复述已获线索", "暗门" in intro, intro[:120])
+    check("无模型：中途加入不产引导旁白", not (intro or "").strip(), repr(intro))
 
     # ---- 房间级剧本同步：连入即拿到「剧本 + 两份 Agent 次级 prompt」----
     from server.main import Room
@@ -293,7 +294,8 @@ async def run_unit_totsk():
         check("回顾线索均为中文描述", all(f["label"] != f["id"] for f in rec["flags"]), str(rec["flags"])[:120])
 
         intro = await dm.introduce(run, "latecomer", {"cls": "法师"})
-        check("蛇王墓的中途加入旁白非空", bool(intro and intro.strip()), intro[:60])
+        check("蛇王墓：无模型的中途加入不产旁白（取消脚本化兜底）",
+              not (intro or "").strip(), repr(intro))
     finally:
         dice_mod.roll_check = real_roll
 
@@ -399,7 +401,7 @@ async def run_unit_scripts():
     check("每片都不超过上限的 1.5 倍",
           all(c.chars <= 900 * 1.5 for c in doc2.chunks), str([c.chars for c in doc2.chunks]))
 
-    # --- 9. 无结构文本也能真跑起来（无模型 → 脚本化提示）---
+    # --- 9. 无结构文本也能真跑起来（状态机层仍可确定性推进，但 DM 侧不产旁白）---
     st_txt = ScriptStore.from_content(md, name="雾港塔")
     check("文本剧本也能建 ScriptStore", st_txt.fmt == "text" and st_txt.start_scene == "c01", st_txt.start_scene)
     s_txt = GameState(st_txt, st_txt.start_scene)
@@ -573,7 +575,7 @@ async def run_unit_agents():
         "",
     )
 
-    # --- 6. 小助手：接了模型走工具循环，没接走脚本化 ---
+    # --- 6. 小助手：接了模型走工具循环，没接就显式失败（取消脚本化兜底） ---
     s6 = GameState(store, start)
     s6.add_player("A", {"cls": "法师"})
     adv_fake = FakeProvider([_reply(tool_call("finish", {"options": ["检查石门", "观察四周", "听一听"]}))])
@@ -582,22 +584,25 @@ async def run_unit_agents():
     check("小助手：用了 finish 工具", r6.used_tools == ["finish"], str(r6.used_tools))
     r6b = await AdvisorAgent(store, None).suggest(AdvisorContext(state=s6, player_name="A"))
     check(
-        "小助手：无模型时给脚本化建议",
-        bool(r6b.data.get("options")) and r6b.source == "scripted",
+        "小助手：无模型时不给建议（显式失败）",
+        not r6b.data.get("options") and r6b.source == "failed",
         f"{r6b.data} / {r6b.source}",
     )
 
-    # --- 7. 无 provider：DM 退化为确定性流水线，玩法不变 ---
+    # --- 7. 无 provider：DM 显式失败（取消脚本化兜底，2026-10-13 拍板）---
     s7 = GameState(store, start)
     s7.add_player("A", {"cls": "战士"})
     n7 = NarratorAgent(store, None)
     ctx7 = NarratorContext(state=s7, player_name="A")
     r7 = await n7.run(ctx7, "我环顾四周，警惕地观察")
     check("无模型：stopped=no_provider", r7.stopped == "no_provider", r7.stopped)
-    check("无模型：交给确定性流水线（产出可广播的事件）", bool(ctx7.events), str(ctx7.events)[:100])
+    check("无模型：source=failed", r7.source == "failed", r7.source)
+    check("无模型：不产出任何旁白", not (r7.text or "").strip(), repr(r7.text))
+    check("无模型：不产出可广播的事件", not ctx7.events, str(ctx7.events)[:100])
+    check("无模型：状态没有被改动", s7.current_scene == start, s7.current_scene)
     check("无模型：不经过 provider.chat", not isinstance(n7.provider, FakeProvider) and n7.provider is None, str(n7.provider))
 
-    # --- 8. 模型不支持工具调用 → 自动降级为单轮 JSON 协议 ---
+    # --- 8. 模型不支持工具调用 → 改用单轮 JSON 协议（仍是真的跑了模型，source=llm）---
     s8 = GameState(store, start)
     s8.add_player("A", {"cls": "战士"})
     no_tools = FakeProvider(
@@ -610,9 +615,9 @@ async def run_unit_agents():
 
     no_tools.replies = [_json_reply]
     r8 = await NarratorAgent(store, no_tools).run(NarratorContext(state=s8, player_name="A"), "进去看看")
-    check("降级：模型不支持工具 → 单轮 JSON 生效", s8.current_scene == first_exit, s8.current_scene)
-    check("降级：旁白取自 JSON", "环顾四周" in r8.text, r8.text)
-    check("降级：stopped=no_tools / source=degraded", r8.stopped == "no_tools" and r8.source == "degraded", f"{r8.stopped}/{r8.source}")
+    check("单轮 JSON：模型不支持工具 → 协议生效", s8.current_scene == first_exit, s8.current_scene)
+    check("单轮 JSON：旁白取自 JSON", "环顾四周" in r8.text, r8.text)
+    check("单轮 JSON：stopped=no_tools / source=llm", r8.stopped == "no_tools" and r8.source == "llm", f"{r8.stopped}/{r8.source}")
 
     # --- 9. Provider 槽位矩阵 ---
     check("provider：kind=off → None", build_provider({"kind": "off"}) is None, "")
@@ -662,9 +667,9 @@ async def run_unit_agents():
     check("对外状态：不含明文密钥内容", "sk-secret" not in blob, blob[:110])
     check("对外状态：只暴露 has_api_key 布尔", pub["dm"].get("has_api_key") is True, str(pub["dm"]))
     check("对外状态：云 API 齐活即 ready", pub["dm"].get("ready") is True and pub["dm"].get("mode") == "model", str(pub["dm"]))
-    check("对外状态：留空即 scripted", pub["advisor"].get("ready") is False and pub["advisor"].get("mode") == "scripted", str(pub["advisor"]))
+    check("对外状态：留空即 off", pub["advisor"].get("ready") is False and pub["advisor"].get("mode") == "off", str(pub["advisor"]))
 
-    # --- 12. 通用任务引擎：单轮 JSON 任务（无工具）走「校验 → 兜底」 ---
+    # --- 12. 通用任务引擎：单轮 JSON 任务（无工具）走「校验 → 失败」 ---
     class _DummyTaskAgent(ToolAgent):
         def __init__(self, provider=None):
             super().__init__(store=None, provider=provider)
@@ -675,15 +680,14 @@ async def run_unit_agents():
                     system=lambda a, c: "你是测试任务。",
                     user=lambda a, c: "给点东西",
                     json_hint='只输出 JSON：{"items":["..."]}',
-                    fallback=lambda a, c: {"items": ["兜底"]},
                     validate=lambda a, d, c: {"items": [str(x) for x in (d.get("items") or [])][:3]},
                 )
             )
 
     r_none = await _DummyTaskAgent(None).run_task("dummy", None)
     check(
-        "引擎：无模型的任务 → 兜底数据 + scripted",
-        r_none.data.get("items") == ["兜底"] and r_none.source == "scripted",
+        "引擎：无模型的任务 → 显式失败，不产兜底数据",
+        not r_none.data and r_none.source == "failed",
         f"{r_none.data}/{r_none.source}",
     )
     fake_single = FakeProvider([json.dumps({"items": ["甲", "乙"], "extra": 1}, ensure_ascii=False)])
@@ -697,8 +701,8 @@ async def run_unit_agents():
     )
     r_bad = await _DummyTaskAgent(FakeProvider(["这不是 JSON"])).run_task("dummy", None)
     check(
-        "引擎：模型输出不合规 → 回落兜底并标 degraded",
-        r_bad.data.get("items") == ["兜底"] and r_bad.source == "degraded",
+        "引擎：模型输出不合规 → 显式失败（不再回落兜底）",
+        not r_bad.data and r_bad.source == "failed",
         f"{r_bad.data}/{r_bad.source}",
     )
     check(
@@ -880,12 +884,15 @@ async def run_unit_chronicle():
     ch4 = Chronicle(jsonl)
     check("档案：摘要随元数据持久化", ch4.summary.startswith("队伍已进入") and ch4.summary_upto == 3, ch4.summary)
 
-    # --- 7. summarize 任务：无模型走确定性兜底，有模型用模型输出 ---
+    # --- 7. summarize 任务：有模型用模型输出，无模型显式失败（取消脚本化兜底）---
     a_np = AssistantAgent(store, None)
     check("摘要任务：已注册", a_np.has_task("summarize"), "")
     res_np = await a_np.run_task("summarize", SummaryCtx(previous="旧概要。", items=["甲打了乙", "乙跑掉了"]))
-    check("摘要任务：无模型仍产出摘要", bool((res_np.data or {}).get("summary")), str(res_np.data)[:120])
-    check("摘要任务：无模型走脚本化兜底", res_np.source == "scripted", res_np.source)
+    check(
+        "摘要任务：无模型不产摘要、标 failed",
+        not (res_np.data or {}).get("summary") and res_np.source == "failed",
+        f"{str(res_np.data)[:80]}/{res_np.source}",
+    )
 
     good = json.dumps({"summary": "队伍打了乙一顿，乙逃走了。", "key_characters": ["乙"], "open_threads": ["乙的去向"]},
                       ensure_ascii=False)
@@ -894,8 +901,9 @@ async def run_unit_chronicle():
     check("摘要任务：模型输出被采纳", (res_m.data or {}).get("summary", "").startswith("队伍打了乙"), str(res_m.data)[:120])
     bad = AssistantAgent(store, FakeProvider(["{}"]))
     res_bad = await bad.run_task("summarize", SummaryCtx(previous="旧", items=["新"]))
-    check("摘要任务：空摘要被校验拦下 → 回落兜底", res_bad.source == "degraded" and bool(res_bad.data.get("summary")),
-          res_bad.source)
+    check("摘要任务：空摘要被校验拦下 → 显式失败（不回落兜底）",
+          res_bad.source == "failed" and not (res_bad.data or {}).get("summary"),
+          f"{res_bad.source}/{str(res_bad.data)[:60]}")
     longsum = json.dumps({"summary": "啊" * 2000}, ensure_ascii=False)
     a_long = AssistantAgent(store, FakeProvider([longsum]))
     res_long = await a_long.run_task("summarize", SummaryCtx(items=["x"]))
@@ -1220,7 +1228,7 @@ async def run_live_configure():
             all("api_key" not in (agents.get(k) or {}) for k in ("dm", "advisor")),
             str(agents)[:90],
         )
-        check("联机：默认留空即脚本化", agents.get("dm", {}).get("ready") is False, str(agents.get("dm"))[:90])
+        check("联机：默认留空即没有模型可用", agents.get("dm", {}).get("ready") is False, str(agents.get("dm"))[:90])
 
         # 房主把自己的小助手接到本地模型（本地不需要 key）
         await a.send(

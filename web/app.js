@@ -502,7 +502,9 @@
   var SETTINGS_KEY = "rpgbar.models";
   // 内置引擎（RPGBarEngine）的界面开关。与三个槽位分开存：它是「同一份引擎、
   // 三个 Agent 共用」的全局设置，不属于任何一个槽位。think 默认 **false** ——
-  // 关掉每轮 4-6 秒，打开约 35-50 秒（裁定质量略好），默认选快的那个。
+  // 关掉每次生成 4-6 秒，打开约 35-50 秒（裁定质量略好），默认选快的那个。
+  // 「每次生成」= 一次引擎调用；玩家点一次行动要跑好几轮（DM 工具循环 + NPC 预备），
+  // 实测一整轮：CPU 109-199 秒 / GPU 21-38 秒。
   // backend（cpu / gpu）决定加载哪一份库：cpu = rpg_engine.dll，
   // gpu = rpg_engine_cuda.dll（同一份 ABI 的另一份实现）。默认 cpu —— 与这个
   // 下拉框出现之前的行为完全一致。
@@ -699,7 +701,7 @@
     ));
     card.appendChild(engineCheck(
       "think", "让模型先思考再回答（think）",
-      "关闭（推荐）：实测每轮约 4–6 秒。开启：约 35–50 秒，裁定质量略好。",
+      "关闭（推荐）：实测每次生成约 4–6 秒。开启：约 35–50 秒，裁定质量略好。（每次生成 = 一次引擎调用；一次行动要跑好几轮，总计 CPU 约 109–199 秒 / GPU 约 21–38 秒。）",
       locked || !engineState.enabled
     ));
     if (engineState.enabled) {

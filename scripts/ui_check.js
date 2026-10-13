@@ -260,6 +260,21 @@ function startFakeLLM() {
   check("启用后 think 开关可点", engBoxes()[1].disabled === false);
   check("think 仍是默认关（启用不会自动打开思考）", engBoxes()[1].checked === false);
 
+  // ---- 推理后端下拉（CPU / GPU）----
+  const beSel = $("card-engine").querySelector(".field select");
+  check("启用后有推理后端下拉", !!beSel, String($("card-engine").querySelectorAll(".field select").length));
+  check("后端下拉在 context 之前（先选后端再调参数）",
+        beSel === $("card-engine").querySelector(".field select"),
+        beSel && beSel.parentNode.textContent.slice(0, 12));
+  check("后端默认 CPU", beSel.value === "cpu", beSel.value);
+  check("后端只有 CPU / GPU 两项", beSel.querySelectorAll("option").length === 2,
+        String(beSel.querySelectorAll("option").length));
+  check("后端不是复选框（不该被当成能同时勾两个）",
+        beSel.tagName === "SELECT", beSel.tagName);
+  beSel.value = "gpu";
+  beSel.dispatchEvent(new w.Event("change", { bubbles: true }));
+  check("切换后端不会重建卡片（只是状态）", $("card-engine").querySelector(".field select").value === "gpu");
+
   // ---- 切到本地模型 ----
   const dmSeg = $("card-dm").querySelectorAll(".seg button");
   check("模式切换有三个选项", dmSeg.length === 3, String(dmSeg.length));
@@ -361,8 +376,12 @@ function startFakeLLM() {
   check("configure 带上主机小助手槽位（房主）", !!cfg && cfg.assistant && cfg.assistant.kind === "local" && cfg.assistant.model === "assistant-model", JSON.stringify(cfg && cfg.assistant));
   check("configure 带上内置引擎段（房主）", !!cfg && !!cfg.engine && cfg.engine.enabled === true, JSON.stringify(cfg && cfg.engine));
   check("引擎段 think === false（默认关）", !!cfg && !!cfg.engine && cfg.engine.think === false, JSON.stringify(cfg && cfg.engine));
+  check("引擎段带上推理后端（上面选了 GPU）", !!cfg && !!cfg.engine && cfg.engine.backend === "gpu", JSON.stringify(cfg && cfg.engine));
   check("本机保存了设置（localStorage）", !!w.localStorage.getItem("rpgbar.models"), String(w.localStorage.getItem("rpgbar.models")).slice(0, 60));
   check("本机保存了引擎设置", !!w.localStorage.getItem("rpgbar.engine"), String(w.localStorage.getItem("rpgbar.engine")));
+  check("引擎设置里存了后端（重开页面还记得）",
+        JSON.parse(w.localStorage.getItem("rpgbar.engine")).backend === "gpu",
+        String(w.localStorage.getItem("rpgbar.engine")));
 
   // ---- 服务端回执后徽标/胶囊刷新 ----
   ws.deliver({
@@ -378,6 +397,36 @@ function startFakeLLM() {
   check("DM 徽标变为已连接", $("badge-dm").className.indexOf("on") >= 0 && $("badge-dm").textContent.indexOf("已连接") === 0, $("badge-dm").textContent);
   check("主机小助手徽标变为已连接", $("badge-assistant").className.indexOf("on") >= 0 && $("badge-assistant").textContent.indexOf("已连接") === 0, $("badge-assistant").textContent);
   check("顶栏胶囊显示 DM+助手", $("model-pill").textContent === "模型：DM + 助手", $("model-pill").textContent);
+
+  // ---- 后端回落时徽标必须说实话 ----
+  // 服务端报的是"请求 gpu、实际加载的是 CPU 版产物"（CUDA 版没接上）。徽标要说
+  // "实际 CPU"，否则玩家会以为自己在用 GPU，然后去别处找"为什么还是这么慢"。
+  // 槽位与上面那次一模一样，只多一个 `engine` 键 —— 这条只验引擎徽标。
+  const engineStatus = (eng) => ({
+    type: "agent_status",
+    changed: ["engine"],
+    agents: {
+      owner: "亚瑟",
+      dm: { kind: "local", base_url: "http://127.0.0.1:8123/v1", model: "fake-model", has_api_key: false, ready: true, mode: "model" },
+      assistant: { kind: "local", base_url: "http://127.0.0.1:8123/v1", model: "assistant-model", has_api_key: false, ready: true, mode: "model" },
+      advisor: { kind: "cloud", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: true, ready: true, mode: "model" },
+      engine: eng,
+    },
+  });
+  ws.deliver(engineStatus({
+    enabled: true, backend: "gpu", lib_backend: "cpu", backend_fallback: true,
+    ready: true, model: "Qwen3-1.7B-Q4_K_M.gguf", think: false, lib_name: "rpg_engine.dll",
+  }));
+  check("引擎徽标标出「实际 CPU（GPU 库缺失）」",
+        $("badge-engine").textContent.indexOf("实际 CPU") > 0, $("badge-engine").textContent);
+  check("引擎徽标不谎报跑在 GPU 上（没有「· GPU ·」那段）",
+        $("badge-engine").textContent.indexOf("· GPU ·") < 0, $("badge-engine").textContent);
+  ws.deliver(engineStatus({
+    enabled: true, backend: "gpu", lib_backend: "gpu", backend_fallback: false,
+    ready: true, model: "Qwen3-1.7B-Q4_K_M.gguf", think: false, lib_name: "rpg_engine_cuda.dll",
+  }));
+  check("真跑在 GPU 上时徽标显示 GPU",
+        $("badge-engine").textContent.indexOf("· GPU ·") > 0, $("badge-engine").textContent);
 
   // ---- 非房主：DM 锁死 ----
   ws.deliver({
@@ -401,6 +450,7 @@ function startFakeLLM() {
   check("非房主时玩家小助手仍可编辑", !$("card-advisor").classList.contains("locked"), $("card-advisor").className);
   check("非房主时内置引擎卡片被锁", $("card-engine").classList.contains("locked"), $("card-engine").className);
   check("非房主时引擎开关不可点", $("card-engine").querySelectorAll(".check-field input[type=checkbox]")[0].disabled === true);
+  check("非房主时后端下拉也不可点", $("card-engine").querySelector(".field select").disabled === true);
   const scriptBtns = $("script-card").querySelectorAll(".slot-actions .btn");
   check("非房主时剧本卡片也被锁", $("script-card").querySelector(".lock-note").textContent.indexOf("房主") >= 0, "");
   check("非房主不能「设为活动剧本」", scriptBtns[1].disabled === true, "disabled=" + scriptBtns[1].disabled);

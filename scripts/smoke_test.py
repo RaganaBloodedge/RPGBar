@@ -1551,6 +1551,59 @@ async def run_unit_engine():
     check("引擎：kind=off 仍然返回 None（老行为不变）",
           build_provider({"kind": "off"}) is None and build_provider(None) is None)
 
+    # 1.5 推理后端（CPU / GPU）：在文件层面就是"找哪一份库"。
+    #     卡片上那个下拉框只能在这张**枚举好的名单**里挑（客户端指不了任意 dll），
+    #     所以判据是两条：名字表对不对、找不到 GPU 库时的退回规则对不对。
+    import tempfile
+
+    check("引擎：后端只有 cpu / gpu 两个值", engine_mod.BACKENDS == ("cpu", "gpu"))
+    check("引擎：GPU 版产物名带 _cuda（文件名即后端）",
+          all("_cuda" in n for n in engine_mod._lib_filenames("gpu"))
+          and not any("_cuda" in n for n in engine_mod._lib_filenames("cpu")),
+          str(engine_mod._lib_filenames("gpu")))
+    check("引擎：后端别名收敛（cuda→gpu / host→cpu / 认不出→默认）",
+          engine_mod.normalize_backend("cuda") == "gpu"
+          and engine_mod.normalize_backend("GPU") == "gpu"
+          and engine_mod.normalize_backend("host") == "cpu"
+          and engine_mod.normalize_backend("amd") == "cpu"
+          and engine_mod.normalize_backend("", default="") == "")
+
+    # 找库的顺序用一个临时目录验（不依赖本机装了哪个后端）
+    with tempfile.TemporaryDirectory() as _td:
+        _d = Path(_td)
+        _cpu_name = engine_mod._lib_filenames("cpu")[0]
+        _gpu_name = engine_mod._lib_filenames("gpu")[0]
+        _real_dirs = engine_mod._search_dirs
+        engine_mod._search_dirs = lambda: [_d]
+        try:
+            (_d / _cpu_name).write_bytes(b"fake")
+            check("引擎：只要 CPU 时不去碰 CUDA 产物",
+                  engine_mod.find_lib("", "cpu") == _d / _cpu_name)
+            check("引擎：**GPU 库缺失时退回 CPU**（不是退化成没引擎）",
+                  engine_mod.find_lib("", "gpu") == _d / _cpu_name
+                  and engine_mod.lib_backend_hint(engine_mod.find_lib("", "gpu")) == "cpu")
+            (_d / _gpu_name).write_bytes(b"fake")
+            check("引擎：有 CUDA 产物时 gpu 选它",
+                  engine_mod.find_lib("", "gpu") == _d / _gpu_name
+                  and engine_mod.lib_backend_hint(engine_mod.find_lib("", "gpu")) == "gpu")
+            check("引擎：cpu 仍然只认 CPU 产物（有 CUDA 库也不换）",
+                  engine_mod.find_lib("", "cpu") == _d / _cpu_name)
+        finally:
+            engine_mod._search_dirs = _real_dirs
+    check("引擎：显式写了库路径就不按后端换（指错了就是没有）",
+          engine_mod.find_lib("Z:/nope/rpg_engine_cuda.dll", "gpu") is None
+          and engine_mod.find_lib("Z:/nope/rpg_engine.dll", "cpu") is None)
+
+    # 实际后端以引擎自己报的为准（CUDA 版多返回 engine / backend 两个键 —— 不改 ABI）
+    from server.engine import backend_from_info
+
+    check("引擎：实际后端以 model_info 为准（CUDA 版多两个键）",
+          backend_from_info({"engine": "rpg_engine_cuda", "backend": "cuda"}) == "gpu"
+          and backend_from_info({"backend": "host-only"}) == "host-only"
+          and backend_from_info({"arch": "qwen3", "vocab": 151936}) == "cpu"
+          and backend_from_info(None) == "",
+          str(backend_from_info({"engine": "rpg_engine_cuda"})))
+
     # 2. 配置：engine.enabled=false 时，kind=engine 的槽位退化为 off
     cfg = json.loads(json.dumps(DEFAULTS))
     cfg["models"]["assistant"]["kind"] = "engine"
@@ -1570,6 +1623,13 @@ async def run_unit_engine():
     _apply_engine_slots(cfg)
     check("引擎：槽位自己写了的字段优先于 engine 段",
           cfg["models"]["advisor"]["context"] == 512)
+
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg["engine"].update({"enabled": True, "backend": "gpu"})
+    cfg["models"]["dm"]["kind"] = "engine"
+    _apply_engine_slots(cfg)
+    check("引擎：engine.backend 也供货给槽位（界面那个下拉的落点）",
+          cfg["models"]["dm"]["backend"] == "gpu", repr(cfg["models"]["dm"].get("backend")))
 
     # 2.5 槽位 `model` 的供货（README 推荐写法的实现处）
     # 槽位 DEFAULTS 里的 model 是云 / 本地通道的**模型名**（deepseek-chat 等），
@@ -1614,17 +1674,26 @@ async def run_unit_engine():
           dirty["context"] == 32768 and dirty["max_tokens"] == 16, str(dirty))
     check("引擎：界面补丁接受布尔开关",
           dirty["enabled"] is True and dirty["think"] is True, str(dirty))
+    check("引擎：界面补丁只收 cpu / gpu 两个后端值",
+          clean_engine_patch({"backend": "gpu"}) == {"backend": "gpu"}
+          and clean_engine_patch({"backend": "cuda"}) == {"backend": "gpu"}
+          and clean_engine_patch({"backend": "amd"}) == {}
+          and clean_engine_patch({"backend": 3}) == {},
+          str(clean_engine_patch({"backend": "amd"})))
     check("引擎：界面补丁对垃圾输入返回空",
           clean_engine_patch(None) == {} and clean_engine_patch("x") == {})
 
     # 合并语义：engine_slot 覆盖槽位同名项、但**不改动原槽位**（它还要下发前端）
     room = Room.__new__(Room)   # 绕过 __init__：这条断言只碰 _effective_slot
-    room.engine_slot = {"enabled": True, "think": True, "context": 8192, "max_tokens": 256}
+    room.engine_slot = {"enabled": True, "think": True, "context": 8192,
+                        "max_tokens": 256, "backend": "gpu"}
     dm = {"kind": "engine", "think": False, "context": 1024, "model": "D:/w.gguf"}
     eff = room._effective_slot(dm)
     check("引擎：界面设置覆盖槽位里的同名字段",
           eff["think"] is True and eff["context"] == 8192 and eff["max_tokens"] == 256,
           str(eff))
+    check("引擎：界面选的后端也并进槽位（跟着走到 build_provider）",
+          eff["backend"] == "gpu", repr(eff.get("backend")))
     check("引擎：合并不改动原槽位",
           dm["think"] is False and dm["context"] == 1024, str(dm))
     check("引擎：非 engine 槽位原样返回",
@@ -1640,6 +1709,18 @@ async def run_unit_engine():
     check("引擎：公开状态带 engine 详情",
           isinstance(pub.get("engine"), dict) and "lib_ok" in pub["engine"]
           and "ready" in pub["engine"])
+    check("引擎：公开状态报出请求后端 / 实际库 / 是否退回",
+          pub["engine"]["backend"] == "cpu"
+          and "lib_backend" in pub["engine"]
+          and isinstance(pub["engine"]["backend_fallback"], bool),
+          json.dumps(pub["engine"], ensure_ascii=False))
+    _pub_gpu = describe_agents(
+        {"kind": "off"}, {"kind": "engine", "backend": "gpu", "model": "Q.gguf"}
+    )["advisor"]["engine"]
+    check("引擎：公开状态带得动 gpu 请求（界面据此标'实际 CPU'）",
+          _pub_gpu["backend"] == "gpu"
+          and _pub_gpu["backend_fallback"] == (_pub_gpu["lib_backend"] == "cpu"),
+          json.dumps(_pub_gpu, ensure_ascii=False))
     check("引擎：公开状态只给权重文件名，不给本机路径",
           pub["model"] == "Qwen3-1.7B.gguf", str(pub.get("model")))
 
@@ -1731,6 +1812,15 @@ async def run_unit_engine():
     check("引擎：温度每轮随请求传（设置里改完即时生效）",
           fake.request.get("temperature") == 0.9 and "temperature" not in fake.session_cfg,
           str(fake.request))
+
+    # 后端：Provider 把"请求的"与"实际的"都记下来（假 lib 没有 path / model_backend，
+    # 那条日志必须**静默跳过**而不是把一次生成搞挂 —— 这正是下面这条在守的）。
+    _pd = EngineProvider(fake, "Z:/fake.gguf", backend="gpu")
+    check("引擎：Provider 描述带上请求的后端",
+          _pd.describe()["backend"] == "gpu" and _pd.describe()["lib_backend"] == "",
+          json.dumps(_pd.describe(), ensure_ascii=False))
+    check("引擎：没有 path / model_backend 的库不会把后端日志搞崩",
+          _pd._ensure() == 2 and _pd.actual_backend == "")
 
     fake2 = _FakeLib()
     EngineProvider(fake2, "Z:/f.gguf")._ensure()

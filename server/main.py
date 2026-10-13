@@ -233,8 +233,10 @@ print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 
 # 否则下一句就是"我明明有卡，怎么灰了"（判据见 engine.probe_gpu）。
 _gpu = gpu_probe()
 if _gpu["available"]:
-    print(f"[RPGBar] GPU 后端可用：{_gpu['devices']} 个 CUDA 设备 · "
-          f"{_gpu['lib']} + {_gpu['cudart']}")
+    # 算力可能查不到（老驱动没有 cuDeviceComputeCapability）—— 那就只说设备数，
+    # 不编一个"未知"出来（查不到 ≠ 有问题）。
+    _cap = f" · 算力 {_gpu['compute_cap']}" if _gpu.get("compute_cap") else ""
+    print(f"[RPGBar] GPU 后端可用：{_gpu['devices']} 个 CUDA 设备{_cap} · {_gpu['lib']}")
 else:
     print(f"[RPGBar] GPU 后端不可用（{_gpu['reason']}）"
           "—— 界面上的「GPU」选项会置灰，只能选 CPU。")
@@ -453,6 +455,7 @@ class Room:
             "gpu_available": bool(gpu.get("available")),
             "gpu_reason": str(gpu.get("reason") or ""),
             "gpu_devices": int(gpu.get("devices") or 0),
+            "gpu_compute_cap": str(gpu.get("compute_cap") or ""),
         }
 
     def advisor_slot_for(self, name):

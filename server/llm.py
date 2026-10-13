@@ -249,7 +249,10 @@ class EngineProvider(LLMProvider):
 
     def _close_sync(self) -> None:
         """销毁会话。**不卸载权重** —— 同一份权重通常被多个 Provider 共用（DM 与
-        小助手同进程），谁先 close 谁就会把别人的会话一起带走。权重交给进程退出回收。
+        小助手同进程），谁先 close 谁就会把别人的会话一起带走。权重的卸载交给
+        `engine.unload_all()`（已挂在 `atexit` 上）：它按**库**遍历登记过的模型，
+        只在"所有人都不再需要"之后才动手，也因此不会在退出时刷一屏
+        `cudaFree 失败：driver shutting down`。
 
         销毁也要在生成锁里：`session_destroy` 与另一个会话正在跑的 `generate` 并发
         同样会让引擎崩。

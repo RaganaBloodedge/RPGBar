@@ -21,8 +21,11 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
   侧就只是"**加载哪一个文件**"（`find_lib(backend=...)`）。选谁由配置 / 游戏内
   设置决定，见下面的「后端」一节。
 - **GPU 能不能用要探测，不能靠文件名**：CUDA 版产物随包分发（没独显的机器上
-  文件也在），所以 `probe_gpu()` 走"产物在 → 运行时在 → 运行时报得出设备"三道门，
+  文件也在），所以 `probe_gpu()` 走"产物在 → 能不能加载 → 驱动报得出设备"三道门，
   给界面一个可置灰的判据 —— 见下面的「GPU 可用性探测」一节。
+- **退出前要把权重卸干净**（`unload_all()` 已挂到 `atexit`）：引擎里模型是命名空间
+  级静态对象，拖到进程退出才析构时 CUDA 上下文往往已经没了，每次退出刷一屏
+  `cudaFree 失败：driver shutting down`。
 
 本模块的定位是"**任何一台机器上都能静默缺席**"：库或权重找不到时
 `build_provider()` 直接返回 None，游戏退回脚本化兜底（与"引擎加载失败 → 视为 off"
@@ -30,6 +33,7 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
 """
 from __future__ import annotations
 
+import atexit
 import ctypes
 import hashlib
 import json
@@ -203,51 +207,114 @@ def find_model(explicit: str = "") -> Path | None:
 # ⚠️ 探测**刻意不碰 C ABI**（那 10 个函数是契约，见 `backend_from_info` 的说明）。
 # `model_info` 里其实有 `device_available`，但它要**先有模型句柄** —— 而
 # `load_model` 在有卡的机器上要 6.6–8.9 秒（把 1.03 GiB 权重搬上卡），拿它做
-# "面板一打开就判定"太慢。所以改由宿主直接问 CUDA 运行时。
-# 代价：宿主多知道一个运行时产物名（见 `_CUDART_GLOBS`）。
+# "面板一打开就判定"太慢。
+#
+# 🔴 **实测（2026-10-13，Windows 侧第一次真编出 `.dll` 之后）**：CUDA 版产物把
+# cudart **静态链接**进去了 —— `dumpbin /dependents rpg_engine_cuda.dll` 的依赖表里
+# 只有 KERNEL32 + VC 运行库 + 几个 `api-ms-win-crt-*`：
+#
+#     * **没有 cudart** ⇒ 宿主侧拿不到 `cudaGetDeviceCount`（它根本没被导出），
+#       原来那版"找 `cudart64_*.dll` 再问它"的探测**会永远判不可用**；
+#     * **没有 nvcuda** ⇒ 驱动是**延迟加载**的，所以在没装 N 卡的机器上
+#       `LoadLibrary(rpg_engine_cuda.dll)` **不会失败** ——
+#       "库能不能加载"与"有没有驱动"是**两件事**，探测里必须分开判。
+#
+# 所以第 ①③ 道门改问**驱动**（驱动 API 是纯 C 接口，`nvcuda.dll` / `libcuda.so.1`
+# 随驱动安装）。
+#
+# 顺带一个好处：cudart 静态链接 ⇒ 分发时**不用再带 `cudart64_*.dll`**，
+# 分发包里 CUDA 相关只有 `rpg_engine_cuda.dll` 一个文件。
 
-# CUDA 运行时产物名。用通配匹配，CUDA 升版（12→13→…）不用改代码。
-_CUDART_GLOBS = ("cudart64_*.dll", "libcudart.so.*", "libcudart.*.dylib")
+# CUDA 驱动库名（驱动 API 的入口；Windows 随驱动装在 System32，Linux 是 .so.1）
+_DRIVER_LIBS = {
+    "win32": ("nvcuda.dll",),
+    "linux": ("libcuda.so.1", "libcuda.so"),
+    "darwin": (),
+}
+
+# CUDA 13 的**算力地板**：它删掉了 sm<7.5 的离线编译（Turing = 7.5 是下限）。
+# 低于它的卡（Pascal 6.x、Volta 7.0）没有可用的 SASS，只能走 CPU。
+_MIN_COMPUTE_CAP = 7.5
 
 
-def find_cudart() -> Path | None:
-    """找 CUDA 运行时（cudart）。找不到 ⇒ 这台机器用不了 GPU 后端。
-
-    只在自己那几个搜索目录里找 —— 不碰系统目录：我们走的是"随包分发"，
-    包里的那份才是**确定与 CUDA 版引擎配套**的那份。
-    """
-    for d in _search_dirs():
-        if not d.is_dir():
-            continue
-        for pattern in _CUDART_GLOBS:
-            hits = sorted(d.glob(pattern))
-            if hits:
-                return hits[0]
-    return None
+def _driver_lib_names() -> tuple[str, ...]:
+    """这台平台上要找的驱动库名（找不到就说明没有 NVIDIA 驱动）。"""
+    if sys.platform.startswith("win"):
+        return _DRIVER_LIBS["win32"]
+    if sys.platform.startswith("linux"):
+        return _DRIVER_LIBS["linux"]
+    return _DRIVER_LIBS["darwin"]
 
 
-def _cudart_device_count(cudart_path) -> tuple[int, str]:
-    """加载 CUDA 运行时并问设备数。返回 `(设备数, 失败原因)`。
+def _load_gpu_lib(lib_path) -> tuple[bool, str]:
+    """试着把 CUDA 版产物加载起来。返回 `(ok, 失败原因)`。
 
-    拆出来单独一个函数是为了**能被测试猴补**：真机上的返回值取决于有没有卡，
-    没法在单元测试里断言（`smoke_test.py` 就是替换这个函数来跑正/负两条路）。
+    这一步本身就是一道有用的判据：产物如果缺 VC 运行库（`MSVCP140.dll` /
+    `VCRUNTIME140.dll` —— 它是**动态依赖**，不像 cudart 那样静态链进去了），
+    会在这里失败，而"缺 VC 运行库"比"第一次生成时莫名其妙崩掉"具体得多。
+
+    ⚠️ 加载成功**不代表有显卡驱动**：`nvcuda.dll` 是延迟加载的（见上面的实测）。
     """
     try:
-        lib = ctypes.CDLL(str(cudart_path))
+        loader = ctypes.WinDLL if sys.platform.startswith("win") else ctypes.CDLL
+        loader(str(lib_path))
     except OSError as e:
-        return 0, f"CUDA 运行时加载失败：{e}"
-    get_count = getattr(lib, "cudaGetDeviceCount", None)
-    if get_count is None:
-        return 0, "这份库里没有 cudaGetDeviceCount —— 它不像是 cudart"
-    get_count.restype = ctypes.c_int
-    get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
-    n = ctypes.c_int(0)
-    rc = int(get_count(ctypes.byref(n)))
-    if rc != 0:
-        # 常见 rc：100 = cudaErrorNoDevice、35 = cudaErrorInsufficientDriver。
-        # 不硬编码数值 —— 换驱动版本就可能变，把原始码带出来让人去查即可。
-        return 0, f"CUDA 运行时查不到设备（cudaError {rc}，多半是驱动缺失或过旧）"
-    return int(n.value), ""
+        return False, f"CUDA 版产物加载失败：{e}（缺 VC 运行库？）"
+    return True, ""
+
+
+def _device_compute_cap(drv, index: int) -> str:
+    """查第 `index` 块卡的算力，形如 `"12.0"`。
+
+    查不到返回 `""` —— **不算失败**（`cuDeviceComputeCapability` 在老驱动上可能
+    没有；不能因为它缺席就把有卡的机器拦在门外）。
+    """
+    fn = getattr(drv, "cuDeviceComputeCapability", None)
+    if fn is None:
+        return ""
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+                   ctypes.c_int]
+    major, minor = ctypes.c_int(0), ctypes.c_int(0)
+    if int(fn(ctypes.byref(major), ctypes.byref(minor), index)) != 0:
+        return ""
+    return f"{major.value}.{minor.value}"
+
+
+def _driver_devices() -> tuple[int, str, str]:
+    """问 CUDA 驱动要设备。返回 `(设备数, 主卡算力, 失败原因)`。
+
+    拆出来单独一个函数是为了**能被测试猴补**：真机上的返回值取决于有没有卡，
+    单元测试里没法断言（`smoke_test.py` 就是替换它来跑正/负两条路）。
+    """
+    names = _driver_lib_names()
+    last = ""
+    for name in names:
+        try:
+            drv = ctypes.CDLL(name)
+        except OSError as e:
+            last = str(e)
+            continue
+        init = getattr(drv, "cuInit", None)
+        count = getattr(drv, "cuDeviceGetCount", None)
+        if init is None or count is None:
+            last = f"{name} 里没有 cuInit / cuDeviceGetCount"
+            continue
+        init.restype = ctypes.c_int
+        init.argtypes = [ctypes.c_uint]
+        count.restype = ctypes.c_int
+        count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        rc = int(init(0))
+        if rc != 0:
+            return 0, "", f"CUDA 驱动初始化失败（cuInit 返回 {rc}）"
+        n = ctypes.c_int(0)
+        rc = int(count(ctypes.byref(n)))
+        if rc != 0:
+            return 0, "", f"CUDA 驱动报不出设备（cuDeviceGetCount 返回 {rc}）"
+        if n.value <= 0:
+            return 0, "", "驱动没有报出任何 CUDA 设备"
+        return int(n.value), _device_compute_cap(drv, 0), ""
+    return 0, "", f"没找到 CUDA 驱动（{' / '.join(names)}）：{last}"
 
 
 def probe_gpu() -> dict:
@@ -256,16 +323,18 @@ def probe_gpu() -> dict:
     三道门，**从便宜到贵**，全过才算可用：
 
     1. **CUDA 版产物在不在**（`rpg_engine_cuda.dll`）—— 不在就不可能用 GPU。
-    2. **CUDA 运行时在不在**（`cudart64_*.dll`）—— CUDA 版引擎动态依赖它；
-       没有它连库都加载不起来。这一条让错误信息比"加载失败"具体得多。
-    3. **运行时能不能报出设备**（`cudaGetDeviceCount > 0`）—— 有卡没驱动、
-       驱动过旧，都会在这里挂掉。
+    2. **它能不能被加载** —— 缺 VC 运行库在这里就暴露（比"第一次生成时崩"具体）。
+       ⚠️ 这一道**过不了不代表**没驱动：`nvcuda.dll` 是延迟加载的，
+       没驱动的机器上库照样能加载（见上面那段实测）。
+    3. **驱动能不能报出设备**（`cuInit` + `cuDeviceGetCount > 0`）—— 没 N 卡、
+       没装驱动、驱动过旧，都在这里挂掉；顺带查主卡算力，低于 CUDA 13 的地板
+       （7.5 / Turing）时给出更具体的原因。
 
-    返回 `{available, lib, cudart, devices, reason}`；`reason` 是给界面看的
+    返回 `{available, lib, devices, compute_cap, reason}`；`reason` 是给界面看的
     人话（不可用时才非空）。
     """
-    out: dict = {"available": False, "lib": "", "cudart": "", "devices": 0,
-                 "reason": ""}
+    out: dict = {"available": False, "lib": "", "devices": 0,
+                 "compute_cap": "", "reason": ""}
 
     lib = find_lib(backend="gpu")
     if lib is None or lib_backend_hint(lib) != "gpu":
@@ -273,18 +342,28 @@ def probe_gpu() -> dict:
         return out
     out["lib"] = Path(lib).name
 
-    cudart = find_cudart()
-    if cudart is None:
-        out["reason"] = "没找到 CUDA 运行时（cudart64_*.dll）"
+    ok, why = _load_gpu_lib(lib)
+    if not ok:
+        out["reason"] = why
         return out
-    out["cudart"] = Path(cudart).name
 
-    devices, why = _cudart_device_count(cudart)
+    devices, cap, why = _driver_devices()
     if devices <= 0:
         out["reason"] = why or "没有可用的 CUDA 设备"
         return out
-
     out["devices"] = devices
+    out["compute_cap"] = cap
+
+    if cap:
+        try:
+            too_old = float(cap) < _MIN_COMPUTE_CAP
+        except ValueError:
+            too_old = False
+        if too_old:
+            out["reason"] = (f"显卡算力 {cap} 低于 CUDA 13 的下限 "
+                             f"{_MIN_COMPUTE_CAP}（Turing）")
+            return out
+
     out["available"] = True
     return out
 
@@ -483,6 +562,37 @@ def open_lib(lib_path: str | Path) -> EngineLib:
             lib = EngineLib(key)
             _libs[key] = lib
         return lib
+
+
+def unload_all() -> int:
+    """把这个进程**已经加载的权重**全部卸掉，返回卸掉了几份。
+
+    🔴 为什么非要有这一步（RPGBarEngineCUDA 的 `docs/DESIGN.md` §9）：引擎里模型/
+    会话是**命名空间级静态对象**，它们的 `DeviceBuffer` 析构会调 `cudaFree`。拖到
+    进程退出才析构的话，那时 CUDA 上下文往往**已经销毁**，于是每次退出都刷一屏：
+
+        [rpg_engine warn] cudaFree 失败：... driver shutting down
+
+    （Windows 侧实测：一次 `engine_probe.py` 退出刷了 100+ 行。）所以退出前主动卸
+    干净 —— 本函数已经挂在 `atexit` 上，正常运行不用手动调。
+
+    ⚠️ **不能挪到 `EngineProvider.close()` 里**：同一份权重通常被多个 Provider 共用
+    （DM 与助手同进程），谁先 close 谁就会把别人的会话一起带走 —— 这是
+    `EngineProvider._close_sync` 的注释里写明的事。这里按**库**遍历它登记过的模型，
+    天然只卸一次、且卸载时机在所有人都不再用它之后。
+    """
+    n = 0
+    for lib in list(_libs.values()):
+        try:
+            for m in lib.loaded_models():
+                lib.unload_model(m)
+                n += 1
+        except Exception:  # noqa: BLE001  退出路径，任何异常都不该再往外冒
+            pass
+    return n
+
+
+atexit.register(unload_all)
 
 
 # ---------------------------------------------------------------- 生成锁

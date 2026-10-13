@@ -1726,12 +1726,14 @@ async def run_unit_engine():
 
     # 1.6 GPU 可用性探测：**"产物在" ≠ "能用"** —— CUDA 版要随包分发（对方机器
     #     没独显也得有文件），所以界面上的「GPU」置灰必须看探测结果，不能看文件名。
+    #     三道门：产物在 → 能不能加载 → 驱动报得出设备（**不是**问 cudart：
+    #     实测 CUDA 版把 cudart 静态链进去了，宿主侧根本没有 cudaGetDeviceCount）。
     with tempfile.TemporaryDirectory() as _td:
         _d = Path(_td)
         _gpu_name = engine_mod._lib_filenames("gpu")[0]
-        _cudart_name = engine_mod._CUDART_GLOBS[0].replace("*", "13")
         _real_dirs = engine_mod._search_dirs
-        _real_count = engine_mod._cudart_device_count
+        _real_load = engine_mod._load_gpu_lib
+        _real_dev = engine_mod._driver_devices
         engine_mod._search_dirs = lambda: [_d]
         try:
             _p = engine_mod.probe_gpu()
@@ -1739,27 +1741,36 @@ async def run_unit_engine():
                   _p["available"] is False and "产物" in _p["reason"],
                   json.dumps(_p, ensure_ascii=False))
 
-            (_d / _gpu_name).write_bytes(b"fake")
+            # 写几个字节的假产物：**真加载会失败**（不是合法 PE）—— 这一条不猴补，
+            # 走的是真路径，正好验"缺 VC 运行库 / 产物损坏"那个诊断。
+            (_d / _gpu_name).write_bytes(b"not a real dll")
             _p = engine_mod.probe_gpu()
-            check("GPU 探测：产物在、但缺 CUDA 运行时 ⇒ 仍不可用（原因不同）",
-                  _p["available"] is False and "运行时" in _p["reason"],
+            check("GPU 探测：产物在但加载不起来 ⇒ 不可用，原因是加载失败",
+                  _p["available"] is False and "加载失败" in _p["reason"],
                   json.dumps(_p, ensure_ascii=False))
 
-            (_d / _cudart_name).write_bytes(b"fake")
-            engine_mod._cudart_device_count = lambda p: (0, "假的：没设备")
-            check("GPU 探测：运行时在、但报不出设备 ⇒ 不可用，且原因一路带出来",
+            engine_mod._load_gpu_lib = lambda p: (True, "")
+            engine_mod._driver_devices = lambda: (0, "", "假的：没有驱动")
+            check("GPU 探测：能加载但驱动报不出设备 ⇒ 不可用，且原因一路带出来",
                   engine_mod.probe_gpu()["available"] is False
-                  and engine_mod.probe_gpu()["reason"] == "假的：没设备")
+                  and engine_mod.probe_gpu()["reason"] == "假的：没有驱动")
 
-            engine_mod._cudart_device_count = lambda p: (2, "")
+            engine_mod._driver_devices = lambda: (1, "6.1", "")
             _p = engine_mod.probe_gpu()
-            check("GPU 探测：三道门全过 ⇒ 可用，并报出设备数与两个产物名",
+            check("GPU 探测：算力低于 CUDA 13 的地板（7.5）⇒ 不可用",
+                  _p["available"] is False and "6.1" in _p["reason"],
+                  json.dumps(_p, ensure_ascii=False))
+
+            engine_mod._driver_devices = lambda: (2, "12.0", "")
+            _p = engine_mod.probe_gpu()
+            check("GPU 探测：三道门全过 ⇒ 可用，并报出设备数与算力",
                   _p["available"] is True and _p["devices"] == 2
-                  and _p["lib"] == _gpu_name and _p["cudart"] == _cudart_name,
+                  and _p["compute_cap"] == "12.0" and _p["lib"] == _gpu_name,
                   json.dumps(_p, ensure_ascii=False))
         finally:
             engine_mod._search_dirs = _real_dirs
-            engine_mod._cudart_device_count = _real_count
+            engine_mod._load_gpu_lib = _real_load
+            engine_mod._driver_devices = _real_dev
 
     # 探测结果**进进程内缓存**（用户拍板"游戏启动时检查一次就好"）——
     # 每开一次设置抽屉就 LoadLibrary 一遍纯属浪费。
@@ -1767,7 +1778,8 @@ async def run_unit_engine():
     _real_probe = engine_mod.probe_gpu
     engine_mod.probe_gpu = lambda: (
         _calls.append(1)
-        or {"available": True, "devices": 1, "lib": "x", "cudart": "y", "reason": ""}
+        or {"available": True, "devices": 1, "lib": "x", "compute_cap": "12.0",
+            "reason": ""}
     )
     try:
         engine_mod.gpu_probe(refresh=True)

@@ -445,7 +445,7 @@
         if (ag.source && ag.source !== "llm") {
           var tag = document.createElement("span");
           tag.className = "suggest-src warn";
-          tag.textContent = ag.source === "degraded" ? "已降级 · 非模型输出" : "脚本化兜底";
+          tag.textContent = "本轮未生成";
           suggestionsEl.appendChild(tag);
         } else if (ag.source) {
           var tag2 = document.createElement("span");
@@ -476,19 +476,18 @@
     }
   }
 
-  // 把「这一轮其实没有跑到模型」摆到聊天框里。之前退化是静默的：DM 报错 → 悄悄
-  // 换成剧本化兜底 → 玩家以为"DM 敷衍了一句"，而剧情其实原地没动。
+  // 把「这一轮其实没有产出」摆到聊天框里。
+  //
+  // 2026-10-13 起不再有"脚本化兜底"这条路（用户拍板取消）：以前 DM 报错后会悄悄
+  // 换成剧本化文案，玩家以为"DM 敷衍了一句"，而剧情其实原地没动。现在没有产出
+  // 就是没有产出，界面必须明说。
   function renderAgentNote(msg) {
     if (!msg || msg.source === "llm") return; // 正常走模型，不必刷屏
     var who = msg.who === "advisor" ? "助手" : "DM";
-    var tag = msg.source === "degraded" ? "降级" : "脚本化兜底";
     var reason = msg.stopped ? "（" + msg.stopped + "）" : "";
     var detail = msg.error ? "：" + msg.error : "";
-    var tips = msg.source === "degraded"
-      ? "这一轮界面上的旁白/建议是剧本化文案，不是模型生成，剧情可能没有推进。"
-      : "这一轮没有接入模型，用的是剧本化文案。";
-    addEntry("system warn", "⚠ " + who + " " + tag + reason,
-      tips + detail + (msg.hint ? "　" + msg.hint : ""));
+    addEntry("system warn", "⚠ " + who + " 本轮没有生成" + reason,
+      "这一轮没有产出任何内容，剧情不会推进。" + detail + (msg.hint ? "　" + msg.hint : ""));
   }
 
   function send(obj) {
@@ -696,7 +695,7 @@
 
     card.appendChild(engineCheck(
       "enabled", "启用内置引擎",
-      "三个 Agent 都改走进程内引擎（覆盖上面的云 / 本地接线）。关掉则回到脚本化兜底。",
+      "三个 Agent 都改走进程内引擎（覆盖上面的云 / 本地接线）。关掉则没有模型可用 —— 游戏将无法生成任何内容。",
       locked
     ));
     card.appendChild(engineCheck(
@@ -754,7 +753,7 @@
     } else if (engineState.enabled) {
       badgeEl.textContent = "待保存";
     } else {
-      badgeEl.textContent = "未启用（脚本化）";
+      badgeEl.textContent = "未启用";
     }
   }
 
@@ -819,7 +818,7 @@
     card.appendChild(seg);
 
     if (s.kind === "off") {
-      card.appendChild(el("p", "slot-role", "未接入 —— 该 Agent 走脚本化兜底，玩法完整可玩。"));
+      card.appendChild(el("p", "slot-role", "未接入 —— 该 Agent 无法生成内容（必须有模型：本地引擎或云 API）。"));
       return card;
     }
 
@@ -905,7 +904,7 @@
     if (info && info.ready) {
       return { on: true, text: "已连接" + (info.model ? " · " + info.model : "") };
     }
-    if (slotState[key].kind === "off") return { on: false, text: "未接入（脚本化）" };
+    if (slotState[key].kind === "off") return { on: false, text: "未接入" };
     return { on: false, text: "待保存" };
   }
 
@@ -928,7 +927,8 @@
     if (dmOn && advOn) pill.textContent = "模型：DM + 助手";
     else if (dmOn) pill.textContent = "模型：仅 DM";
     else if (advOn) pill.textContent = "模型：仅助手";
-    else pill.textContent = "模型：脚本化";
+    // 一个模型都没接 = 这局玩不了（2026-10-13 起没有脚本化兜底）。胶囊也照这个说。
+    else pill.textContent = "模型：未接入";
     pill.className = "chip model-pill" + (dmOn ? " on" : "");
   }
 
@@ -1048,7 +1048,7 @@
           out.className = "slot-result ok";
           var extra = "";
           if (d.tool_calling === true) extra = " · 支持工具调用（走标准 Agent 循环）";
-          else if (d.tool_calling === false) extra = " · 不支持工具调用（自动降级为单轮 JSON）";
+          else if (d.tool_calling === false) extra = " · 不支持工具调用（改用单轮 JSON 协议）";
           out.textContent = "连接成功（" + d.elapsed_ms + "ms）：" + (d.reply || "就绪") + extra;
         } else {
           out.className = "slot-result err";
@@ -1359,10 +1359,10 @@
       slotState.dm = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.8 };
       slotState.assistant = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.6 };
       slotState.advisor = { kind: "off", base_url: "", model: "", api_key: "", temperature: 0.7 };
-      sendConfigure(); // 通知服务端回到脚本化，但不再写回本机
+      sendConfigure(); // 通知服务端清空槽位（没有模型就没有产出，不再有脚本化兜底）
       renderSlots();
       renderEngineCard();
-      showMsg("已清除本机设置，两个 Agent 回到脚本化兜底。", "ok");
+      showMsg("已清除本机设置 —— 两个 Agent 现在没有模型可用。", "ok");
     };
     loadSaved();
   })();

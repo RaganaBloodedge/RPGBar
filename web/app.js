@@ -646,6 +646,10 @@
       var opt = document.createElement("option");
       opt.value = o.value;
       opt.textContent = o.label;
+      // **单项置灰**：后端不是偏好问题，而是"这台机器能不能用"。CUDA 版产物
+      // 随包分发（没独显的机器上文件也在），所以"能不能选 GPU"必须看服务端
+      // 的探测结果，而不是"文件在不在"（判据见 server/engine.py::probe_gpu）。
+      if (o.disabled) opt.disabled = true;
       sel.appendChild(opt);
     });
     sel.value = engineState[prop] || options[0].value;
@@ -653,6 +657,20 @@
     wrap.appendChild(sel);
     if (hint) wrap.appendChild(el("span", "field-hint", hint));
     return wrap;
+  }
+
+  // 服务端报的 GPU 可用性（`{known, ok, reason}`）。`known=false` 表示还没拿到
+  // 服务端状态 —— 那时**什么都不拦**（拿不到信息就把人拦在外面，比不拦更糟）。
+  function engineGpuInfo() {
+    var eng = serverAgents && serverAgents.engine;
+    if (!eng || typeof eng.gpu_available !== "boolean") {
+      return { known: false, ok: true, reason: "" };
+    }
+    return {
+      known: true,
+      ok: !!eng.gpu_available,
+      reason: eng.gpu_reason || ""
+    };
   }
 
   function buildEngineCard() {
@@ -685,11 +703,24 @@
       locked || !engineState.enabled
     ));
     if (engineState.enabled) {
+      var gpu = engineGpuInfo();
+      // 本机用不了 GPU 时，把存着的 gpu 拉回 cpu：服务端本来也会在加载时退回
+      // CPU，界面若不跟着回，就会出现"显示选的是 GPU、实际跑的是 CPU"。
+      if (gpu.known && !gpu.ok && engineState.backend === "gpu") {
+        engineState.backend = "cpu";
+      }
       card.appendChild(engineSelect("backend", "推理后端", [
         { value: "cpu", label: "CPU（rpg_engine.dll）" },
-        { value: "gpu", label: "GPU · CUDA（rpg_engine_cuda.dll）" }
-      ], "GPU 需要先跑 scripts/sync_engine.py --backend gpu 把 CUDA 版产物接到 models/；"
-        + "找不到时会自动退回 CPU，徽标会标出实际用的是哪个。", locked));
+        {
+          value: "gpu",
+          label: "GPU · CUDA（rpg_engine_cuda.dll）",
+          disabled: gpu.known && !gpu.ok
+        }
+      ], gpu.known && !gpu.ok
+        ? ("这台机器用不了 GPU 后端 —— " + (gpu.reason || "没检测到可用的 CUDA 设备")
+           + "。所以 GPU 这一项是灰的，只能选 CPU。")
+        : "GPU 走 CUDA 版产物（需 NVIDIA 卡）。检测不到可用设备时这一项会置灰。"
+          + "实际用的是哪个后端以徽标为准。", locked));
       card.appendChild(engineField("context", "上下文长度（KV Cache 容量）", "4096", locked, "number"));
       card.appendChild(engineField("max_tokens", "单轮最多生成 token", "512", locked, "number"));
     }

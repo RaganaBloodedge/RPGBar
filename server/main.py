@@ -65,7 +65,7 @@ from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
 from .dm import DM
 from .embedding import get_embedder
-from .engine import BACKENDS, derive_seed, normalize_backend
+from .engine import BACKENDS, derive_seed, gpu_probe, normalize_backend
 from .llm import ToolCallingUnsupported, build_provider
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .rag import ScriptStore
@@ -227,6 +227,17 @@ for key in ("dm", "advisor", "assistant"):
     else:
         print(f"[RPGBar] {a['label']}：未接模型（留空），走脚本化兜底")
 print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 API 或本地模型）。")
+
+# GPU 可用性**在启动时探一次**（用户拍板；结果进进程内缓存，界面复用同一份）。
+# 显式打出来是因为"没有独显的机器上 GPU 选项是灰的"这件事必须**有据可查** ——
+# 否则下一句就是"我明明有卡，怎么灰了"（判据见 engine.probe_gpu）。
+_gpu = gpu_probe()
+if _gpu["available"]:
+    print(f"[RPGBar] GPU 后端可用：{_gpu['devices']} 个 CUDA 设备 · "
+          f"{_gpu['lib']} + {_gpu['cudart']}")
+else:
+    print(f"[RPGBar] GPU 后端不可用（{_gpu['reason']}）"
+          "—— 界面上的「GPU」选项会置灰，只能选 CPU。")
 
 
 # ---- 模型槽位的清洗与合并 ----
@@ -424,6 +435,7 @@ class Room:
         req_backend = normalize_backend(
             detail.get("backend") or eng.get("backend")
         )
+        gpu = gpu_probe()
         return {
             "enabled": bool(eng.get("enabled")),
             "think": bool(eng.get("think")),
@@ -435,6 +447,12 @@ class Room:
             "lib_backend": str(detail.get("lib_backend") or ""),
             "backend_fallback": bool(detail.get("backend_fallback")),
             "lib_name": str(detail.get("lib_name") or ""),
+            # GPU 可用性：**这台机器**能不能真的跑 GPU 后端（探测见
+            # engine.probe_gpu）。界面据此把「GPU」那一项置灰 —— CUDA 版产物
+            # 随包分发，所以"文件在"不代表"能用"。
+            "gpu_available": bool(gpu.get("available")),
+            "gpu_reason": str(gpu.get("reason") or ""),
+            "gpu_devices": int(gpu.get("devices") or 0),
         }
 
     def advisor_slot_for(self, name):

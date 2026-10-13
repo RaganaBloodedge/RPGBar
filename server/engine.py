@@ -20,6 +20,9 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
   （`rpg_engine_cuda.dll`）是同一份 C 接口的两份实现，所以"用哪个后端"在宿主
   侧就只是"**加载哪一个文件**"（`find_lib(backend=...)`）。选谁由配置 / 游戏内
   设置决定，见下面的「后端」一节。
+- **GPU 能不能用要探测，不能靠文件名**：CUDA 版产物随包分发（没独显的机器上
+  文件也在），所以 `probe_gpu()` 走"产物在 → 运行时在 → 运行时报得出设备"三道门，
+  给界面一个可置灰的判据 —— 见下面的「GPU 可用性探测」一节。
 
 本模块的定位是"**任何一台机器上都能静默缺席**"：库或权重找不到时
 `build_provider()` 直接返回 None，游戏退回脚本化兜底（与"引擎加载失败 → 视为 off"
@@ -189,6 +192,117 @@ def find_model(explicit: str = "") -> Path | None:
             if hits:
                 return hits[0]
     return None
+
+
+# ---------------------------------------------------------------- GPU 可用性探测
+#
+# 为什么需要它：CUDA 版产物**随包分发**（哪怕对方机器没独显，文件也在），所以
+# "文件在不在"不能代表"能不能用 GPU"。界面上的「GPU」选项要据此**置灰**，
+# 而不是让玩家选了之后再静默退回 CPU（用户 2026-10-13 拍板）。
+#
+# ⚠️ 探测**刻意不碰 C ABI**（那 10 个函数是契约，见 `backend_from_info` 的说明）。
+# `model_info` 里其实有 `device_available`，但它要**先有模型句柄** —— 而
+# `load_model` 在有卡的机器上要 6.6–8.9 秒（把 1.03 GiB 权重搬上卡），拿它做
+# "面板一打开就判定"太慢。所以改由宿主直接问 CUDA 运行时。
+# 代价：宿主多知道一个运行时产物名（见 `_CUDART_GLOBS`）。
+
+# CUDA 运行时产物名。用通配匹配，CUDA 升版（12→13→…）不用改代码。
+_CUDART_GLOBS = ("cudart64_*.dll", "libcudart.so.*", "libcudart.*.dylib")
+
+
+def find_cudart() -> Path | None:
+    """找 CUDA 运行时（cudart）。找不到 ⇒ 这台机器用不了 GPU 后端。
+
+    只在自己那几个搜索目录里找 —— 不碰系统目录：我们走的是"随包分发"，
+    包里的那份才是**确定与 CUDA 版引擎配套**的那份。
+    """
+    for d in _search_dirs():
+        if not d.is_dir():
+            continue
+        for pattern in _CUDART_GLOBS:
+            hits = sorted(d.glob(pattern))
+            if hits:
+                return hits[0]
+    return None
+
+
+def _cudart_device_count(cudart_path) -> tuple[int, str]:
+    """加载 CUDA 运行时并问设备数。返回 `(设备数, 失败原因)`。
+
+    拆出来单独一个函数是为了**能被测试猴补**：真机上的返回值取决于有没有卡，
+    没法在单元测试里断言（`smoke_test.py` 就是替换这个函数来跑正/负两条路）。
+    """
+    try:
+        lib = ctypes.CDLL(str(cudart_path))
+    except OSError as e:
+        return 0, f"CUDA 运行时加载失败：{e}"
+    get_count = getattr(lib, "cudaGetDeviceCount", None)
+    if get_count is None:
+        return 0, "这份库里没有 cudaGetDeviceCount —— 它不像是 cudart"
+    get_count.restype = ctypes.c_int
+    get_count.argtypes = [ctypes.POINTER(ctypes.c_int)]
+    n = ctypes.c_int(0)
+    rc = int(get_count(ctypes.byref(n)))
+    if rc != 0:
+        # 常见 rc：100 = cudaErrorNoDevice、35 = cudaErrorInsufficientDriver。
+        # 不硬编码数值 —— 换驱动版本就可能变，把原始码带出来让人去查即可。
+        return 0, f"CUDA 运行时查不到设备（cudaError {rc}，多半是驱动缺失或过旧）"
+    return int(n.value), ""
+
+
+def probe_gpu() -> dict:
+    """探测这台机器现在能不能真的跑 GPU 后端。
+
+    三道门，**从便宜到贵**，全过才算可用：
+
+    1. **CUDA 版产物在不在**（`rpg_engine_cuda.dll`）—— 不在就不可能用 GPU。
+    2. **CUDA 运行时在不在**（`cudart64_*.dll`）—— CUDA 版引擎动态依赖它；
+       没有它连库都加载不起来。这一条让错误信息比"加载失败"具体得多。
+    3. **运行时能不能报出设备**（`cudaGetDeviceCount > 0`）—— 有卡没驱动、
+       驱动过旧，都会在这里挂掉。
+
+    返回 `{available, lib, cudart, devices, reason}`；`reason` 是给界面看的
+    人话（不可用时才非空）。
+    """
+    out: dict = {"available": False, "lib": "", "cudart": "", "devices": 0,
+                 "reason": ""}
+
+    lib = find_lib(backend="gpu")
+    if lib is None or lib_backend_hint(lib) != "gpu":
+        out["reason"] = "没找到 CUDA 版产物（rpg_engine_cuda）"
+        return out
+    out["lib"] = Path(lib).name
+
+    cudart = find_cudart()
+    if cudart is None:
+        out["reason"] = "没找到 CUDA 运行时（cudart64_*.dll）"
+        return out
+    out["cudart"] = Path(cudart).name
+
+    devices, why = _cudart_device_count(cudart)
+    if devices <= 0:
+        out["reason"] = why or "没有可用的 CUDA 设备"
+        return out
+
+    out["devices"] = devices
+    out["available"] = True
+    return out
+
+
+_gpu_probe_cache: dict | None = None
+
+
+def gpu_probe(refresh: bool = False) -> dict:
+    """探测结果（**进程内缓存**）。
+
+    用户拍板"游戏启动时自动检查一下就好"，所以默认只探一次、之后一直用缓存 ——
+    每次打开设置抽屉都去 `LoadLibrary` 一遍既没必要，也会让界面有多余延迟。
+    想强制重探（诊断用）传 `refresh=True`。
+    """
+    global _gpu_probe_cache
+    if _gpu_probe_cache is None or refresh:
+        _gpu_probe_cache = probe_gpu()
+    return _gpu_probe_cache
 
 
 # ---------------------------------------------------------------- 库句柄

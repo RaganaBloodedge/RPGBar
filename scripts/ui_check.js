@@ -428,6 +428,54 @@ function startFakeLLM() {
   check("真跑在 GPU 上时徽标显示 GPU",
         $("badge-engine").textContent.indexOf("· GPU ·") > 0, $("badge-engine").textContent);
 
+  // ---- 没有可用显卡时「GPU」那一项必须**置灰** ----
+  // CUDA 版产物是随包分发的（对方机器没独显也带着文件），所以"文件在不在"不能
+  // 决定能不能选 —— 判据由服务端探测后下发（`gpu_available` / `gpu_reason`，
+  // 见 server/engine.py::probe_gpu）。这里**注入**状态来验规则，于是这条断言
+  // 不依赖"跑测试的这台机器有没有卡"。
+  const gpuOption = (sel) => {
+    const opts = sel.querySelectorAll("option");
+    for (let i = 0; i < opts.length; i++) if (opts[i].value === "gpu") return opts[i];
+    return null;
+  };
+  // 重建卡片：引擎卡片在「启用」开关变化时会重画（与勾选时立刻出现 context 输入框同理）
+  const rebuildEngineCard = () => {
+    for (const on of [false, true]) {
+      const box = $("card-engine").querySelector(".check-field input[type=checkbox]");
+      box.checked = on;
+      box.dispatchEvent(new w.Event("change", { bubbles: true }));
+    }
+  };
+
+  ws.deliver(engineStatus({
+    enabled: true, backend: "gpu", lib_backend: "gpu", backend_fallback: false,
+    ready: true, model: "Qwen3-1.7B-Q4_K_M.gguf", think: false, lib_name: "rpg_engine_cuda.dll",
+    gpu_available: false, gpu_reason: "没找到 CUDA 运行时（cudart64_*.dll）", gpu_devices: 0,
+  }));
+  rebuildEngineCard();
+  const beSelNoGpu = $("card-engine").querySelector(".field select");
+  const noGpuOpt = gpuOption(beSelNoGpu);
+  check("没有可用显卡时 GPU 选项置灰", !!noGpuOpt && noGpuOpt.disabled === true,
+        noGpuOpt ? String(noGpuOpt.disabled) : "找不到 gpu 项");
+  check("置灰时把服务端探测的原因带到界面上",
+        noGpuOpt && beSelNoGpu.parentNode.textContent.indexOf("cudart64_*.dll") > 0,
+        beSelNoGpu.parentNode.textContent);
+  check("置灰时选中项被拉回 CPU（不出现「选着 GPU、实际跑 CPU」）",
+        beSelNoGpu.value === "cpu", beSelNoGpu.value);
+  check("CPU 那一项不受影响（没有卡也能玩）",
+        (gpuOption(beSelNoGpu) && beSelNoGpu.value === "cpu") && !beSelNoGpu.disabled,
+        noGpuOpt ? String(noGpuOpt.disabled) : "");
+
+  ws.deliver(engineStatus({
+    enabled: true, backend: "cpu", lib_backend: "cpu", backend_fallback: false,
+    ready: true, model: "Qwen3-1.7B-Q4_K_M.gguf", think: false, lib_name: "rpg_engine.dll",
+    gpu_available: true, gpu_reason: "", gpu_devices: 1,
+  }));
+  rebuildEngineCard();
+  const yesGpuOpt = gpuOption($("card-engine").querySelector(".field select"));
+  check("有可用显卡时 GPU 选项恢复可选", !!yesGpuOpt && yesGpuOpt.disabled === false,
+        yesGpuOpt ? String(yesGpuOpt.disabled) : "找不到 gpu 项");
+
   // ---- 非房主：DM 锁死 ----
   ws.deliver({
     type: "agent_status",

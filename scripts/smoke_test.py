@@ -1724,6 +1724,62 @@ async def run_unit_engine():
     check("引擎：公开状态只给权重文件名，不给本机路径",
           pub["model"] == "Qwen3-1.7B.gguf", str(pub.get("model")))
 
+    # 1.6 GPU 可用性探测：**"产物在" ≠ "能用"** —— CUDA 版要随包分发（对方机器
+    #     没独显也得有文件），所以界面上的「GPU」置灰必须看探测结果，不能看文件名。
+    with tempfile.TemporaryDirectory() as _td:
+        _d = Path(_td)
+        _gpu_name = engine_mod._lib_filenames("gpu")[0]
+        _cudart_name = engine_mod._CUDART_GLOBS[0].replace("*", "13")
+        _real_dirs = engine_mod._search_dirs
+        _real_count = engine_mod._cudart_device_count
+        engine_mod._search_dirs = lambda: [_d]
+        try:
+            _p = engine_mod.probe_gpu()
+            check("GPU 探测：没有 CUDA 版产物 ⇒ 不可用",
+                  _p["available"] is False and "产物" in _p["reason"],
+                  json.dumps(_p, ensure_ascii=False))
+
+            (_d / _gpu_name).write_bytes(b"fake")
+            _p = engine_mod.probe_gpu()
+            check("GPU 探测：产物在、但缺 CUDA 运行时 ⇒ 仍不可用（原因不同）",
+                  _p["available"] is False and "运行时" in _p["reason"],
+                  json.dumps(_p, ensure_ascii=False))
+
+            (_d / _cudart_name).write_bytes(b"fake")
+            engine_mod._cudart_device_count = lambda p: (0, "假的：没设备")
+            check("GPU 探测：运行时在、但报不出设备 ⇒ 不可用，且原因一路带出来",
+                  engine_mod.probe_gpu()["available"] is False
+                  and engine_mod.probe_gpu()["reason"] == "假的：没设备")
+
+            engine_mod._cudart_device_count = lambda p: (2, "")
+            _p = engine_mod.probe_gpu()
+            check("GPU 探测：三道门全过 ⇒ 可用，并报出设备数与两个产物名",
+                  _p["available"] is True and _p["devices"] == 2
+                  and _p["lib"] == _gpu_name and _p["cudart"] == _cudart_name,
+                  json.dumps(_p, ensure_ascii=False))
+        finally:
+            engine_mod._search_dirs = _real_dirs
+            engine_mod._cudart_device_count = _real_count
+
+    # 探测结果**进进程内缓存**（用户拍板"游戏启动时检查一次就好"）——
+    # 每开一次设置抽屉就 LoadLibrary 一遍纯属浪费。
+    _calls = []
+    _real_probe = engine_mod.probe_gpu
+    engine_mod.probe_gpu = lambda: (
+        _calls.append(1)
+        or {"available": True, "devices": 1, "lib": "x", "cudart": "y", "reason": ""}
+    )
+    try:
+        engine_mod.gpu_probe(refresh=True)
+        engine_mod.gpu_probe()
+        engine_mod.gpu_probe()
+        check("GPU 探测：结果进进程内缓存，只探一次", len(_calls) == 1, str(len(_calls)))
+        engine_mod.gpu_probe(refresh=True)
+        check("GPU 探测：refresh=True 能强制重探（诊断用）", len(_calls) == 2, str(len(_calls)))
+    finally:
+        engine_mod.probe_gpu = _real_probe
+        engine_mod.gpu_probe(refresh=True)
+
     # 4. 工具调用形状（Agent 层按 OpenAI 形状消费，见 agents/base.py）
     calls = _to_openai_calls([
         {"name": "read_scene", "arguments": {"scene": "大厅"}},

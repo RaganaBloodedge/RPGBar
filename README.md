@@ -146,6 +146,12 @@ python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直
 > 首次生成后还会打一行"请求后端 gpu · 实际后端 cpu"。反过来，真跑在 GPU 上时
 > 徽标显示 "· GPU ·"。**权威判据是引擎自己报的**（CUDA 版的 `model_info` 多返回
 > `engine` / `backend` 两个键，CPU 版没有 —— 所以不需要动 ABI）。
+>
+> 🚫 **「GPU」那一项会按本机实际情况置灰**：CUDA 版产物是随包分发的（别人机器上
+> 没独显，文件也照样在），所以"文件在不在"不能代表"能不能用"。服务端**启动时自动
+> 探一次**（三道门：CUDA 版产物在 → CUDA 运行时 `cudart64_*.dll` 在 →
+> `cudaGetDeviceCount > 0`），任何一道不过就把这一项变成灰色、**把原因写在下面**，
+> 启动日志里也会打一行。CPU 不受影响，没有独显的机器照样能玩。
 
 > 槽位**只需要写 `kind`** —— `lib` / `model` / `threads` / `context` 由 `engine` 段
 > 统一供货。想让某个槽位用**另一份权重**（比如 DM 用 4B、小助手用 1.7B），在那个槽位里

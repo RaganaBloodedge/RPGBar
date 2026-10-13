@@ -80,9 +80,32 @@
   次级 prompt + 本轮上下文 + 十几个工具的 JSON Schema）实测就要 2400+ token，2048
   根本装不下 → 引擎报「序列超长」→ DM 静默退化成脚本兜底、剧情不动。代价是每个
   会话的 KV Cache 约 448 → 896 MiB（引擎自报实测值）。
+- **两个后端靠文件名区分**：CPU 版仍是 `models/rpg_engine.dll`（与以前完全一致），
+  CUDA 版是 `models/rpg_engine_cuda.dll` —— 由 `sync_engine.py` 同步时改名，**另一个
+  仓库的构建产物名不动**（那边的"同一个 ABI"故事也就不用改）。`engine.lib` 写了
+  绝对路径时**只看那个路径**，不管后端。
 
 ### 新增
 
+- **内置引擎可以选 CPU 还是 GPU 了**（游戏内「设置 → 内置引擎 → 推理后端」）：
+  内置引擎有了第二份实现 —— CUDA 版（`RPGBarEngineCUDA`，C 接口一个函数不差），
+  所以"用哪个后端"在游戏里就是一个下拉框：**CPU**（默认，`models/rpg_engine.dll`）/
+  **GPU**（`models/rpg_engine_cuda.dll`）。由房主设置、全房间共用；本机存的设置会
+  覆盖 `config.json` 里的 `engine.backend`。
+  - 选了 GPU 而机器上没有 CUDA 版产物时**自动退回 CPU**（游戏照常能玩），并且
+    **退没退看得见**：徽标显示「实际 CPU（GPU 库缺失）」、启动日志写「实际 CPU」、
+    第一轮生成后还会打一行「请求后端 gpu · 实际后端 cpu」。**真跑在 GPU 上**时
+    徽标显示「· GPU ·」——"我明明选了 GPU 怎么还这么慢"这类问题不用猜。
+  - **实际后端以引擎自己报的为准**：CUDA 版的 `model_info` 多返回 `engine` /
+    `backend` 两个键（`rpg_engine_cuda` / `cuda` 或 `host-only`），CPU 版 0.4.1 没有。
+    所以这条功能**没有动 C ABI 一个字节**（那 10 个函数是契约）。
+  - 客户端只能在下拉框那两个值里选，指不了任意 dll —— 与「界面不许改
+    `lib` / `model`」是同一条边界。
+- `scripts/engine_probe.py --backend cpu|gpu`：自检时能指定验哪个后端，并报出
+  「请求的 / 按文件名找到的 / **实际**」三个后端，三者不一致时明确说出来；
+  CUDA 仓库如果只编出了宿主-only 产物（没有 CUDA 后端），会被直接点出来。
+- `scripts/sync_engine.py` 新增 `--backend cpu|gpu|both`、`--cuda-repo`、`--lib`
+  （GPU 库直接指路径 —— WSL 里构建的产物在 `~/cuda-build`，不在仓库的 `build/` 里）。
 - **游戏内「设置 → 内置引擎」能开关模型思考了（`think`，默认关）**：以前只能去改
   `config.json`。同一个面板里还能调上下文长度（KV Cache 容量）和单轮最多生成的
   token；由房主设置、全房间共用。`think` 默认**关** —— 实测每轮 4–6 秒，打开要

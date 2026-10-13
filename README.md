@@ -91,15 +91,30 @@ cp config.example.json config.json
 它**进程内直连 `rpg_engine.dll`**，不用起 llama.cpp / Ollama，也不占任何端口，
 不用管版本兼容、不用管端口冲突；权重就是一份 GGUF。
 
+**两个后端，同一个 ABI**：CPU 版（`RPGBarEngine`）与 CUDA 版（`RPGBarEngineCUDA`）
+是同一份 C 接口的两份实现，所以在宿主侧"用哪个后端"就只是**加载哪一个文件**：
+
+| 后端 | 产物 | 何时用 |
+|---|---|---|
+| `cpu`（默认） | `models/rpg_engine.dll` | 任何机器都能跑，1.7B 约 10–14 tok/s |
+| `gpu` | `models/rpg_engine_cuda.dll` | 有 NVIDIA 卡且编出了 CUDA 版产物时，快得多 |
+
 **第一步：把引擎产物接到本项目**（动态库 + 权重，二者都在引擎仓库里）：
 
 ```bash
-python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
+python scripts/sync_engine.py                  # 两个后端都接（默认；找不到的那个会提示）
+python scripts/sync_engine.py --backend gpu    # 只接 CUDA 版
+python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直接指路径
 ```
 
 默认用**硬链接**（同一磁盘卷内零额外空间 —— 权重 1 GB 量级，复制一份纯属浪费），
-跨盘或文件系统不支持时自动回退为复制。`models/` 下出现 `rpg_engine.dll` 与
+跨盘或文件系统不支持时自动回退为复制。`models/` 下出现 `rpg_engine.dll`（CPU 版）
+与 `rpg_engine_cuda.dll`（CUDA 版，同步时按后缀改名 —— **文件名即后端**）与
 `Qwen3-*.gguf` 即可。也可以跳过这一步，直接在下面把 `lib` / `model` 写成绝对路径。
+
+> ⚠️ CUDA 版的 **Windows `.dll` 目前还没有**（nvcc 在 Windows 上只认 `cl.exe`，得装
+> MSVC）；WSL / Linux 下用 `bash build_wsl.sh` 出的 `librpg_engine.so` 是能用的那份
+> （产物在 `~/cuda-build`，构建目录刻意放在 ext4 上），用 `--lib` 指过去即可。
 
 **第二步：改一处开关**，把想用它的槽位 `kind` 改成 `engine`：
 
@@ -107,9 +122,10 @@ python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
 {
   "engine": {
     "enabled": true,
-    "lib": "",        // 留空 = 自动找 models/rpg_engine.dll
+    "backend": "cpu", // cpu（默认）/ gpu —— 选 gpu 而机器上没有 CUDA 版产物时会退回 CPU
+    "lib": "",        // 留空 = 按 backend 自动找 models/rpg_engine[_cuda].dll
     "model": "",      // 留空 = 自动找 models/Qwen3-*.gguf
-    "threads": 0,     // 0 = 引擎按 CPU 核数自己定
+    "threads": 0,     // 0 = 引擎按 CPU 核数自己定（gpu 后端忽略它）
     "context": 4096,  // 每个会话的 KV Cache 容量（@4096≈896 MiB/会话）；别调到 4096 以下
     "max_tokens": 768,
     "think": false    // Qwen3 思考模式，默认关；打开 = 每轮 35-50 秒、质量略好（见下）
@@ -120,6 +136,16 @@ python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
   }
 }
 ```
+
+> 🎛️ **后端也能在游戏里选**：「⚙ 设置 → 内置引擎 → 推理后端」下拉框（房主可改，
+> 全房间共用）。客户端只能在这个枚举里挑，指不了任意 dll —— 与"界面不许改
+> `lib` / `model`"是同一条边界。
+>
+> 选了 `gpu` 而机器上没有 CUDA 版产物时会**自动退回 CPU**（游戏照常能玩），
+> 而且**退没退看得见**：徽标与启动日志会显示"实际 CPU（GPU 库缺失）"，
+> 首次生成后还会打一行"请求后端 gpu · 实际后端 cpu"。反过来，真跑在 GPU 上时
+> 徽标显示 "· GPU ·"。**权威判据是引擎自己报的**（CUDA 版的 `model_info` 多返回
+> `engine` / `backend` 两个键，CPU 版没有 —— 所以不需要动 ABI）。
 
 > 槽位**只需要写 `kind`** —— `lib` / `model` / `threads` / `context` 由 `engine` 段
 > 统一供货。想让某个槽位用**另一份权重**（比如 DM 用 4B、小助手用 1.7B），在那个槽位里
@@ -139,12 +165,19 @@ python scripts/sync_engine.py        # 自动找同级的 ../RPGBarEngine
 **先自检这台机器能不能用**（不启动服务器，也不写任何文件）：
 
 ```bash
-python scripts/engine_probe.py
+python scripts/engine_probe.py                  # 验 CPU 后端
+python scripts/engine_probe.py --backend gpu    # 验 CUDA 后端
 ```
 
 它会把「库 → 权重 → 单轮对话 → 工具调用」挨个跑一遍，并报出引擎版本与实测
-tok/s。**引擎没启用、或库与权重找不到时，`kind=engine` 的槽位会自动退化为
+tok/s，还会报出**三个**后端：你请求的、按文件名找到的那份库、以及**实际跑在
+哪个后端**（读引擎的 `model_info` —— 这个才是权威）。三者不一致时会明确说出来，
+"选了 GPU 其实是 CPU"在这条路上最容易让人白排查半天。
+
+**引擎没启用、或库与权重找不到时，`kind=engine` 的槽位会自动退化为
 `off`** —— 不报错，游戏照常可玩（与"三个槽位默认留空"是同一条不变量）。
+（例外只有一处：请求 `gpu` 但只有 CPU 版产物 —— 那时**退回 CPU 版**而不是退化成
+`off`，因为"能玩 + 说实话"优于"诚实但玩不了"。）
 
 > 代价要提前知道：4B 权重在只有 CPU 的机器上约 7–10 tok/s，DM 一轮 25–35 秒。
 > 这是"全离线、不依赖任何外部服务"的固有代价，不是缺陷。

@@ -28,6 +28,28 @@
 
 ### 修复
 
+- **GPU 后端退出时会刷一屏显存报错**：用 GPU 跑完关服务器，控制台会打出上百行
+  `cudaFree 失败：driver shutting down`。根因是宿主的每个 Provider 只在 `close()` 里
+  清自己的句柄，而**同一份权重是被多个槽位共用的** —— "谁先退出谁卸"是错的：
+  先退出的那个一卸，别人还在用时库已经没了；拖到进程退出才析构，CUDA 上下文又已经销毁。
+  现在卸载改成**按库遍历**（`engine.unload_all()`，挂在进程 `atexit` 上），只在
+  "所有人都不再需要之后"才动手。实测退出时的 `cudaFree` 警告 **100+ 行 → 0 行**。
+  > 记一句：**资源生命周期的正确归属是"拥有者"，不是"最后一个使用者"。**
+  > 这条的症状（一屏警告）离原因（权重是共享的）很远，值得单独说一句。
+- **Windows 上现在能编出宿主直接加载的 CUDA 产物了**（GPU 后端不再只有 Linux 版）：
+  在 `RPGBarEngineCUDA` 仓库里跑 `build_win.ps1` 即得 `build-win/rpg_engine.dll`
+  （要 CUDA Toolkit + VS Build Tools，不必装整装 Visual Studio），
+  `python scripts/sync_engine.py --backend gpu --lib <那个文件>` 接进来就能在游戏里选 GPU。
+  - **默认按 `75;86;89;120` 四档出码**（Turing / Ampere / Ada / Blackwell），所以发给
+    别人不会出现"选项亮着、一生成就失败"。旧写法 `-DCMAKE_CUDA_ARCHITECTURES=native`
+    只出本机 SASS，**别拿它当分发产物**。
+  - ⚠️ **源码里的 `.cu` / `.cuh` / `.h` 必须带 UTF-8 BOM**，这是 Windows 侧 nvcc 的硬前提
+    （它按本地代码页读源文件，不带 BOM 的中文会让 nvcc 报 `missing closing quote`，
+    错误还连锁几十行）。`tests/check_sync.py` 现在有一条 BOM 自检盯着这件事。
+  - ⚠️ 已知缺陷（**未修，见 CUDA 仓库 DESIGN §9 第 7 条**）：`.cu` 里的中文字符串编进产物
+    会变成 GBK 而 `.cc` 里的是 UTF-8，所以 **GPU 后端的引擎日志**在 UTF-8 终端上部分乱码
+    （**游戏本体不受影响**，那是 web 界面，不经过 stdout）。
+
 - **「助手建议」会让整个服务器进程消失（内置引擎）**：点一次「助手建议」，十几秒后
   连接断开（code 1006）**且服务器进程一起消失**，日志里一个字都没有。用
   `python -X faulthandler` 才看到是引擎写坏了宿主进程的堆（Windows `0xc0000374`）。
@@ -106,17 +128,28 @@
   自动探一次**（结果进进程内缓存，不必每次开设置抽屉都去 `LoadLibrary`），
   走三道门、从便宜到贵：
   1. CUDA 版产物在不在（`rpg_engine_cuda`）；
-  2. CUDA 运行时在不在（`cudart64_*.dll` —— CUDA 版引擎动态依赖它）；
-  3. 运行时能不能报出设备（`cudaGetDeviceCount > 0`）。
+  2. **它能不能被加载**（缺 VC 运行库在这一步就暴露，比"第一次生成时崩"具体）；
+  3. **驱动能不能报出设备**（`cuInit` + `cuDeviceGetCount > 0`），顺带查主卡算力、
+     低于 CUDA 13 的地板 **7.5（Turing）** 时给出具体原因。
   任何一道不过，「推理后端」里的 **GPU 就是灰的**（CPU 不受影响，照样能玩），
-  并且把**原因**写在下方（如「没找到 CUDA 运行时」），启动日志也会打一行；
+  并且把**原因**写在下方，启动日志也会打一行；
   本机存着 `gpu` 时会被拉回 `cpu`，避免"显示选的是 GPU、实际跑的是 CPU"。
+  > ⚠️ 第一版把第 2 道门写成"找 `cudart64_*.dll`"、第 3 道写成 `cudaGetDeviceCount`，
+  > 两条都站不住，是编出 Windows CUDA 产物之后才发现的：
+  > **① CUDA 运行库是静态链进产物里的**（`dumpbin /dependents` 里只有系统库），
+  > 所以"找 `cudart64_*.dll`"在正常情况下**永远不通过** —— 那是把"能用的机器"判成不能用；
+  > **② `nvcuda.dll` 是延迟加载的**，没装驱动的机器上 `LoadLibrary` 照样成功，
+  > 所以"库加载得起来"不能代替"有可用 GPU"。⇒ 现在改成"加载"与"问驱动"**两道分开的门**，
+  > 而驱动接口是纯 C 的 `cuInit` / `cuDeviceGetCount`，宿主直接 `ctypes` 问它，
+  > 不经过引擎、也不动 C ABI。
   - 探测**不动 C ABI**（那 10 个函数是契约）：`model_info` 里虽然有
     `device_available`，但它要**先有模型句柄** —— 而 `load_model` 在有卡的机器上
     要 6.6–8.9 秒（把 1.03 GiB 权重搬上卡），拿它做"面板一打开就判定"太慢。
-    所以改由**宿主直接问 CUDA 运行时**；代价是宿主多知道一个运行时产物名。
+    所以改由**宿主直接问驱动**。
   - 配置文件里手写 `"backend": "gpu"` 时**仍保留退回 CPU**作为兜底 ——
     正常路径下界面已经拦住了，不会出现"选了才发现用不了"。
+  - **分发时不用再带 `cudart64_*.dll`**：CUDA 运行库已经在产物里。目标机器需要的是
+    **NVIDIA 驱动 + 算力 ≥ 7.5 的卡**，这两条正是上面第 3 道门查的。
 - `scripts/engine_probe.py --backend cpu|gpu`：自检时能指定验哪个后端，并报出
   「请求的 / 按文件名找到的 / **实际**」三个后端，三者不一致时明确说出来；
   CUDA 仓库如果只编出了宿主-only 产物（没有 CUDA 后端），会被直接点出来。

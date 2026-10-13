@@ -112,9 +112,16 @@ python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直
 与 `rpg_engine_cuda.dll`（CUDA 版，同步时按后缀改名 —— **文件名即后端**）与
 `Qwen3-*.gguf` 即可。也可以跳过这一步，直接在下面把 `lib` / `model` 写成绝对路径。
 
-> ⚠️ CUDA 版的 **Windows `.dll` 目前还没有**（nvcc 在 Windows 上只认 `cl.exe`，得装
-> MSVC）；WSL / Linux 下用 `bash build_wsl.sh` 出的 `librpg_engine.so` 是能用的那份
-> （产物在 `~/cuda-build`，构建目录刻意放在 ext4 上），用 `--lib` 指过去即可。
+> ⚠️ CUDA 版的 **Windows `.dll` 已经编出来了** —— 在 `RPGBarEngineCUDA` 仓库里跑
+> `build_win.ps1`（要 **CUDA Toolkit + VS Build Tools**，不必装整装 VS）就会得到
+> `build-win/rpg_engine.dll`，它是**宿主真正加载的那一份**，本项目的同步脚本会自动
+> 按后缀改名为 `models/rpg_engine_cuda.dll`。WSL / Linux 下 `bash build_wsl.sh` 出的
+> `librpg_engine.so` 同样能用（产物在 `~/cuda-build`，构建目录刻意放在 ext4 上），
+> 用 `--lib` 指过去即可。
+>
+> 💡 **不发 CUDA 版产物时不用带 `cudart64_*.dll`**：CUDA 运行库已经**静态链进**
+> `.dll` 里了。目标机器需要的只有 **NVIDIA 驱动 + 算力 ≥ 7.5（Turing 起）的卡**，
+> 这两条都在下面的探测里查。
 
 **第二步：改一处开关**，把想用它的槽位 `kind` 改成 `engine`：
 
@@ -149,9 +156,17 @@ python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直
 >
 > 🚫 **「GPU」那一项会按本机实际情况置灰**：CUDA 版产物是随包分发的（别人机器上
 > 没独显，文件也照样在），所以"文件在不在"不能代表"能不能用"。服务端**启动时自动
-> 探一次**（三道门：CUDA 版产物在 → CUDA 运行时 `cudart64_*.dll` 在 →
-> `cudaGetDeviceCount > 0`），任何一道不过就把这一项变成灰色、**把原因写在下面**，
-> 启动日志里也会打一行。CPU 不受影响，没有独显的机器照样能玩。
+> 探一次**（结果缓存），依次看三件事 ——
+> ① CUDA 版产物在不在；② **它能不能被加载**（缺 VC 运行库在这一步就暴露，比"第一次
+> 生成时崩"具体）；③ **驱动能不能报出设备**（`cuInit` + `cuDeviceGetCount > 0`，
+> 顺带查主卡算力，低于 CUDA 13 的地板 **7.5 / Turing** 时给出具体原因）。
+> 任何一道不过就把这一项变成灰色、**把原因写在下面**，启动日志里也会打一行。
+> CPU 不受影响，没有独显的机器照样能玩。
+>
+> ⚠️ **② 与 ③ 必须分开**：`nvcuda.dll` 是**延迟加载**的 —— 没装驱动的机器上
+> `LoadLibrary` 照样成功。所以"库能不能加载"与"有没有可用 GPU"是两件事，
+> 用前者代替后者会得到"能用"的假结论。反过来，**不要再去找 `cudart64_*.dll`** ——
+> CUDA 运行库已经静态链进产物里了，去找它只会永远判不可用。
 
 > 槽位**只需要写 `kind`** —— `lib` / `model` / `threads` / `context` 由 `engine` 段
 > 统一供货。想让某个槽位用**另一份权重**（比如 DM 用 4B、小助手用 1.7B），在那个槽位里

@@ -1,4 +1,4 @@
-"""标准 Agent 骨架：工具注册 + 工具调用循环 + 降级路径。
+"""标准 Agent 骨架：工具注册 + 工具调用循环 + 失败路径。
 
 一个 Agent = 提示词 + 一组工具 + 循环。循环是标准写法：
 
@@ -15,12 +15,16 @@
 - **次级 prompt**（`secondary_prompt()`）：排在 System prompt 之后的第二条 system 消息，
   由 `script_loader` 从剧本文件自动切片生成——换剧本只换这一层，Agent 人格与护栏不动。
 
-两条降级路径（保证"没接模型也能玩"）：
+只有两种结局：**跑到了模型**（`source="llm"`），或**这一轮没有产出**
+（`source="failed"`，`error` 里带上原因）。
 
-1. **没有 provider**（kind=off，即用户留空 API）→ 走 `fallback_text()`，
-   由各 Agent 用剧本原文拼出确定性输出。
-2. **模型不支持工具调用**（小模型/老服务常见）→ 收到 `ToolCallingUnsupported`
-   后切到 `single_shot()`，用单轮 JSON 协议完成同样的事。
+2026-10-13 用户拍板**取消脚本化兜底**：接不到模型、模型报错、或模型没给出可用
+内容时，一律不再"用剧本原文拼一段旁白冒充 DM"。编出来的内容会把真实故障盖住——
+玩家只看到"DM 敷衍了一句"，剧情其实原地没动。要玩就必须有一个模型（本地引擎或
+云 API）；没有模型就把失败明确摆到界面上（见 `main.py` 的 `agent_note` 广播）。
+
+另一条路是**单轮 JSON 协议**（`single_shot()`）：模型不支持工具调用时改用一次 JSON
+完成同样的事。这**不是兜底** —— 它仍然真的调了模型，所以 `source` 依旧是 `llm`。
 
 每次工具调用都会记进 `AgentResult.steps`，便于在界面上展示、也便于测试断言。
 """
@@ -67,7 +71,7 @@ class AgentResult:
     text: str = ""
     data: dict = field(default_factory=dict)
     steps: list = field(default_factory=list)
-    source: str = "scripted"  # llm / scripted / degraded
+    source: str = "failed"  # llm / failed
     stopped: str = "final"  # final / max_steps / no_provider / no_tools / error
     error: str = ""
 
@@ -140,10 +144,6 @@ class Agent:
         messages.append({"role": "user", "content": self.build_user_message(ctx, user_input)})
         return messages
 
-    def fallback_text(self, ctx, user_input: str) -> str:
-        """无 provider 时的确定性输出。"""
-        return ""
-
     async def single_shot(self, ctx, user_input: str, tools: list) -> str:
         """模型不支持工具调用时的单轮 JSON 协议（子类可覆写）。"""
         return ""
@@ -156,10 +156,17 @@ class Agent:
     async def run(self, ctx, user_input: str = "") -> AgentResult:
         tools = self.build_tools(ctx)
         if self.provider is None:
+            # 没有模型 → 显式失败。
+            #
+            # 这里以前回退到脚本化文案（"（DM）……你可以：……"）。2026-10-13 用户
+            # 拍板取消这条兜底：编造出来的旁白会把真实故障盖住 —— 玩家分不清
+            # "DM 敷衍了一句"和"模型根本没跑"，剧情原地没动却看不出来。宁可让
+            # 失败摆到界面上。**要玩就必须有一个模型**（本地引擎，或云 API）。
             return AgentResult(
-                text=self.fallback_text(ctx, user_input),
-                source="scripted",
+                text="",
+                source="failed",
                 stopped="no_provider",
+                error="未配置模型",
             )
 
         by_name = {t.name: t for t in tools}
@@ -182,11 +189,11 @@ class Agent:
                     return self._degraded(ctx, user_input, steps, str(e))
             except Exception as e:  # noqa: BLE001
                 if steps:
-                    # 已经动过手了，之前的工具效果保留；补一段兜底旁白
+                    # 工具效果已经落进状态（骰子投过了、场景推进了），不回滚；
+                    # 但**不补任何替代文本** —— 这一轮就是没有产出。
                     return AgentResult(
-                        text=self.fallback_text(ctx, user_input),
                         steps=steps,
-                        source="degraded",
+                        source="failed",
                         stopped="error",
                         error=str(e),
                     )
@@ -204,15 +211,15 @@ class Agent:
                         text=text,
                         data=parsed if isinstance(parsed, dict) else {},
                         steps=steps,
-                        source="degraded" if no_tools else "llm",
+                        source="llm",
                         stopped="no_tools" if no_tools else "final",
                     )
-                # 既没工具调用也没内容 → 兜底
+                # 既没工具调用也没内容 → 这一轮没有产出
                 return AgentResult(
-                    text=self.fallback_text(ctx, user_input),
                     steps=steps,
-                    source="degraded",
+                    source="failed",
                     stopped="no_tools" if no_tools else "final",
+                    error="模型没有产出任何内容",
                 )
 
             messages.append(
@@ -245,7 +252,7 @@ class Agent:
                         text=data.get("narration") or data.get("text") or "",
                         data=data,
                         steps=steps,
-                        source="degraded" if no_tools else "llm",
+                        source="llm",
                         stopped="no_tools" if no_tools else "final",
                     )
 
@@ -270,7 +277,12 @@ class Agent:
         except Exception as e:  # noqa: BLE001
             return self._degraded(ctx, user_input, steps, str(e))
         if not text:
-            text = self.fallback_text(ctx, user_input)
+            return AgentResult(
+                steps=steps,
+                source="failed",
+                stopped="max_steps",
+                error="模型在工具调用上限内没有收敛出结果",
+            )
         parsed = self.parse_final(text, ctx)
         return AgentResult(
             text=text,
@@ -286,13 +298,13 @@ class Agent:
         return await self.provider.chat(msgs, json_mode=True)
 
     def _degraded(self, ctx, user_input, steps, err) -> AgentResult:
-        return AgentResult(
-            text=self.fallback_text(ctx, user_input),
-            steps=steps,
-            source="scripted",
-            stopped="error",
-            error=err,
-        )
+        """模型不可用 / 这一轮没能产出 → **显式失败**。
+
+        2026-10-13 用户拍板：不再回退到脚本化兜底。编出来的旁白会把真实故障盖住，
+        玩家只看到"DM 敷衍了一句"，而剧情其实原地没动；失败摆到台面上，反而一眼
+        就能看出问题在哪。要玩就必须有一个模型（本地引擎或云 API）。
+        """
+        return AgentResult(text="", steps=steps, source="failed", stopped="error", error=err)
 
 
 def _parse_args(raw) -> dict:

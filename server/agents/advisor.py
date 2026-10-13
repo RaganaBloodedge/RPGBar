@@ -67,7 +67,6 @@ ADVISE_TASK = Task(
     user=_advise_user,
     tools=lambda agent, ctx: agent._advisor_tools(ctx),
     json_hint=ADVISOR_JSON_HINT,
-    fallback=lambda agent, ctx: {"options": agent.fallback_options(ctx)},
     validate=_advise_validate,
     parse_final=lambda agent, text, ctx: _advise_validate(agent, parse_json(text), ctx),
     max_steps=4,
@@ -159,22 +158,20 @@ class AdvisorAgent(ToolAgent):
         opts = [str(o).strip() for o in (options or []) if str(o).strip()]
         return {"options": opts[:4]}
 
-    # ---- 降级 ----
-    def fallback_options(self, ctx) -> list:
-        """无模型时的建议：直接取剧本里的出口与检定关键词。"""
-        scene = ctx.state.current()
-        opts = [e["label"] for e in scene.get("exits", [])]
-        opts += [(c.get("keywords") or [c["id"]])[0] for c in scene.get("checks", [])]
-        return opts[:4]
-
     async def suggest(self, ctx) -> AgentResult:
-        """对外入口：返回 AgentResult，建议列表在 data['options']。"""
+        """对外入口：返回 AgentResult，建议列表在 data['options']。
+
+        没有建议就是**没有建议**（2026-10-13 用户拍板取消脚本化兜底）。以前模型
+        没按协议给列表时会退回 `fallback_options()` —— 从剧本里抄出口与检定关键词，
+        看着像助手给了建议，其实是把当前场景的信息换个地方又念了一遍。现在直接
+        标 failed，界面会说明这一轮助手没有产出。
+        """
         res = await self.run_task("action_advice", ctx)
-        opts = list(res.data.get("options") or [])
+        opts = [str(o).strip() for o in (res.data.get("options") or []) if str(o).strip()]
         if not opts:
-            # 模型没按协议给列表 → 兜底，但保留 trace
-            opts = self.fallback_options(ctx)
-            if not res.text:
-                res.source = "degraded"
+            res.source = "failed"
+            res.error = res.error or "模型没有给出建议列表"
+            res.data = {"options": []}
+            return res
         res.data = {"options": opts[:4]}
         return res

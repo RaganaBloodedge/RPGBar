@@ -28,8 +28,8 @@ Provider 形态在 `llm.py` 的 `EngineProvider`，Agent 语义在 `agents/`。
   `cudaFree 失败：driver shutting down`。
 
 本模块的定位是"**任何一台机器上都能静默缺席**"：库或权重找不到时
-`build_provider()` 直接返回 None，游戏退回脚本化兜底（与"引擎加载失败 → 视为 off"
-是同一条降级链）。
+`build_provider()` 直接返回 None，也就是说这个槽位**没有模型**（与"引擎加载失败
+→ 视为 off"是同一条路）—— 没有模型就没有产出，2026-10-13 起不再有任何脚本化兜底。
 """
 from __future__ import annotations
 

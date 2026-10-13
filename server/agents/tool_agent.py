@@ -6,7 +6,7 @@
 它要干的活（给行动建议、生成人物小传、算 NPC 反应权重、滚动摘要……）都是**固定流程**，
 只是职责不同。于是统一成「一个引擎 + 若干任务模板」：
 
-- 每个任务 = 一条固定 CoT：职责 system prompt + 次级 prompt（剧本内容）+ 输出 schema + 校验/兜底。
+- 每个任务 = 一条固定 CoT：职责 system prompt + 次级 prompt（剧本内容）+ 输出 schema + 结果校验。
 - 任务的**执行方式**分两类：
   - 带工具的（如 action_advice）→ 走标准工具循环（工具全只读，结构上改不了剧情）；
   - 不带工具的（如 persona / react_weights）→ 单轮 JSON，一次调用拿到结构化结果。
@@ -62,8 +62,7 @@ class Task:
     - user：本轮上下文（user 消息）
     - tools：返回 Tool 列表；非空则走工具循环，否则走单轮 JSON
     - json_hint：追加的「请只输出这个 JSON」提示（单轮 JSON 用）
-    - fallback：无模型 / 解析失败时的确定性兜底数据
-    - validate：护栏。把模型给的 raw dict 清洗成合法数据；返回空 dict 视为不合格 → 走兜底
+    - validate：护栏。把模型给的 raw dict 清洗成合法数据；返回空 dict 视为不合格 → 这一轮失败
     - parse_final：工具循环结束、模型只给了文本时，从中解析结构化数据
     """
 
@@ -73,7 +72,6 @@ class Task:
     user: Any = ""
     tools: Any = None
     json_hint: str = ""
-    fallback: Callable[[Any, Any], dict] | None = None
     validate: Callable[[Any, dict, Any], dict] | None = None
     parse_final: Callable[[Any, str, Any], dict] | None = None
     max_steps: int = 4
@@ -130,9 +128,10 @@ class ToolAgent:
     async def run_task(self, name: str, ctx) -> AgentResult:
         task = self.tasks.get(name)
         if task is None:
-            return AgentResult(data={}, source="scripted", stopped="error", error=f"未知任务：{name}")
+            return AgentResult(data={}, source="failed", stopped="error", error=f"未知任务：{name}")
         if self.provider is None:
-            return AgentResult(data=self._fallback(task, ctx), source="scripted", stopped="no_provider")
+            # 取消脚本化兜底（2026-10-13）：没有模型就直接失败，不拿确定性数据顶替。
+            return AgentResult(data={}, source="failed", stopped="no_provider", error="未配置模型")
         tools = list(_resolve(task.tools, self, ctx) or [])
         if tools:
             return await self._run_tools(task, ctx, tools)
@@ -146,14 +145,6 @@ class ToolAgent:
             messages.append({"role": "system", "content": secondary})
         messages.append({"role": "user", "content": str(_resolve(task.user, self, ctx) or "")})
         return messages
-
-    def _fallback(self, task: Task, ctx) -> dict:
-        if task.fallback is None:
-            return {}
-        try:
-            return task.fallback(self, ctx) or {}
-        except Exception:  # noqa: BLE001
-            return {}
 
     def _validate(self, task: Task, raw: dict, ctx) -> dict:
         if not isinstance(raw, dict) or not raw:
@@ -175,12 +166,14 @@ class ToolAgent:
         try:
             raw = await self.provider.chat(messages, json_mode=True)
         except Exception as e:  # noqa: BLE001
-            return AgentResult(
-                data=self._fallback(task, ctx), source="scripted", stopped="error", error=str(e)
-            )
+            return AgentResult(data={}, source="failed", stopped="error", error=str(e))
         data = self._validate(task, parse_json(raw), ctx)
         if not data:
-            return AgentResult(data=self._fallback(task, ctx), source="degraded", stopped="final")
+            # 取消脚本化兜底（2026-10-13）：不再拿确定性数据顶替模型的输出。
+            return AgentResult(
+                data={}, source="failed", stopped="final",
+                error="模型给出的结果没通过校验",
+            )
         return AgentResult(data=data, source="llm", stopped="final")
 
     # ---- 工具循环（带工具任务，与 base.Agent 同一套写法）----
@@ -211,12 +204,18 @@ class ToolAgent:
                 text = (reply.get("content") or "").strip()
                 data = self._final_from_text(task, text, ctx)
                 if not data:
-                    data = self._fallback(task, ctx)
+                    return AgentResult(
+                        text=text,
+                        steps=steps,
+                        source="failed",
+                        stopped="no_tools" if no_tools else "final",
+                        error="模型没有给出可用的结果",
+                    )
                 return AgentResult(
                     text=text,
                     data=data,
                     steps=steps,
-                    source="degraded" if no_tools else "llm",
+                    source="llm",
                     stopped="no_tools" if no_tools else "final",
                 )
 
@@ -249,7 +248,7 @@ class ToolAgent:
                         text=data.get("narration") or data.get("text") or "",
                         data=data,
                         steps=steps,
-                        source="degraded" if no_tools else "llm",
+                        source="llm",
                         stopped="no_tools" if no_tools else "final",
                     )
 
@@ -273,7 +272,14 @@ class ToolAgent:
             text = (reply.get("content") or "").strip()
         except Exception as e:  # noqa: BLE001
             return self._degraded(task, ctx, steps, e)
-        data = self._final_from_text(task, text, ctx) or self._fallback(task, ctx)
+        data = self._final_from_text(task, text, ctx)
+        if not data:
+            return AgentResult(
+                steps=steps,
+                source="failed",
+                stopped="max_steps",
+                error="模型在工具调用上限内没有收敛出结果",
+            )
         return AgentResult(text=text, data=data, steps=steps, source="llm", stopped="max_steps")
 
     def _final_from_text(self, task: Task, text: str, ctx) -> dict:
@@ -295,10 +301,15 @@ class ToolAgent:
         return await self.provider.chat(msgs, json_mode=True)
 
     def _degraded(self, task: Task, ctx, steps, err) -> AgentResult:
+        """模型不可用 / 这一轮没能产出 → **显式失败**（2026-10-13 取消脚本化兜底）。
+
+        以前这里会拿 `task.fallback` 的确定性数据顶替模型的输出 —— 界面上看起来
+        一切正常，其实模型一个字都没产出。现在带上 error 直接失败，好让问题可见。
+        """
         return AgentResult(
-            data=self._fallback(task, ctx),
+            data={},
             steps=steps,
-            source="scripted",
+            source="failed",
             stopped="error",
             error=str(err),
         )

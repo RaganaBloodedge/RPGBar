@@ -326,18 +326,20 @@ class EngineProvider(LLMProvider):
 
 
 def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
-    """由一个「模型槽位」配置构建 Provider；返回 None 表示走脚本化兜底。
+    """由一个「模型槽位」配置构建 Provider；返回 None 表示**这个槽位没有模型**。
 
     槽位字段：kind + 各自的连接参数。
-    - kind=off（默认，即"留空"）：不接模型，全部走脚本化兜底。
+    - kind=off（默认，即"留空"）：不接模型。**没有模型就没有产出** ——
+      2026-10-13 用户拍板取消脚本化兜底，Agent 会显式失败（`source=failed`），
+      界面直接标出「本轮没有生成 + 原因」，不再拿编出来的文字盖住故障。
     - kind=cloud：必须有 api_key。
     - kind=local：不要求 api_key（本地服务一般不需要）。
     - kind=engine：内置引擎，需要 `lib`（动态库）与 `model`（权重文件），二者在
-      `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（静默退化，
-      与"引擎加载失败 → 视为 off"是同一条降级链）。
+      `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（＝当这个
+      槽位没接模型）。
       `backend`（cpu / gpu）决定找**哪一份**库：gpu 先找 CUDA 版产物
-      （`rpg_engine_cuda.dll`），找不到退回 CPU 版（不返回 None —— 那样 DM 会变成
-      脚本化，玩家看到的是"游戏坏了"，见 `engine.find_lib`）。
+      （`rpg_engine_cuda.dll`），找不到退回 CPU 版（不返回 None —— 那样就成了
+      "没模型＝玩不了"，而 CPU 版其实能跑，见 `engine.find_lib`）。
 
     `seed` 是**运行时状态**而非配置，所以走形参而不是槽位字段 —— 槽位会原样下发
     给前端，种子只该进服务端日志。目前只有 `kind=engine` 用它（引擎是纯函数，

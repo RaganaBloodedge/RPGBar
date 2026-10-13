@@ -68,7 +68,6 @@ PERSONA_TASK = Task(
     secondary=_world,
     user=_persona_user,
     json_hint=PERSONA_JSON_HINT,
-    fallback=lambda agent, ctx: {},
     validate=_persona_validate,
 )
 
@@ -127,7 +126,6 @@ REACT_TASK = Task(
     secondary=_world,
     user=_react_user,
     json_hint=REACT_JSON_HINT,
-    fallback=lambda agent, ctx: {},
     validate=_react_validate,
 )
 
@@ -186,19 +184,6 @@ def _summarize_validate(agent, data, ctx) -> dict:
     return out
 
 
-def _summarize_fallback(agent, ctx) -> dict:
-    """没有模型时的确定性摘要：保留旧概要，把新条目压缩成短句续在后面。"""
-    tail = []
-    for it in ctx.items:
-        t = " ".join(str(it).split())
-        if not t:
-            continue
-        tail.append(t[:40] + ("…" if len(t) > 40 else ""))
-    merged = "；".join(tail)
-    parts = [p for p in (ctx.previous.strip(), merged) if p]
-    return {"summary": "；".join(parts)[-1200:]}
-
-
 SUMMARIZE_TASK = Task(
     name="summarize",
     label="剧情滚动摘要",
@@ -206,7 +191,6 @@ SUMMARIZE_TASK = Task(
     secondary=_world,
     user=_summarize_user,
     json_hint=SUMMARIZE_JSON_HINT,
-    fallback=_summarize_fallback,
     validate=_summarize_validate,
 )
 

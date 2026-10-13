@@ -4,7 +4,8 @@
 1. 匹配检定（check）→ 服务端投骰、应用结果；
 2. 匹配出口（exit）→ 校验条件：满足则推进场景，不满足则返回「被锁」提示；
 3. 自由发挥 → 交给 LLM（带 RAG 上下文）叙事，LLM 可提案 move_to / set_flags，
-   但必须落在剧本已知的出口与 flag 白名单内；无 LLM 时走脚本化兜底。
+   但必须落在剧本已知的出口与 flag 白名单内；没有 LLM 就没有这段旁白
+   （2026-10-13 起不再有脚本化兜底）。
 
 匹配采用「命中关键词数 + 最长命中长度」打分，避免「进入/进去」这类泛化词误配。
 """
@@ -26,7 +27,7 @@ FLAG_WHITELIST = {
 class DM:
     def __init__(self, store, provider):
         self.store = store
-        self.provider = provider  # None 表示脚本化兜底
+        self.provider = provider  # None = 没有模型（这一轮就没有旁白，不编）
 
     def _flag_whitelist(self):
         """优先用剧本里真实存在的 flag（剧本驱动），否则退回内置白名单。"""
@@ -119,7 +120,8 @@ class DM:
             return self._run_exit(state, exit_, events)
 
         narration = await self._freeform(state, action)
-        events.append({"type": "narration", "author": "DM", "text": narration})
+        if narration:
+            events.append({"type": "narration", "author": "DM", "text": narration})
         return events
 
     def _run_check(self, state, player_name, check, events):
@@ -155,22 +157,26 @@ class DM:
         events.append({"type": "narration", "author": "DM", "text": target.get("public_text", "")})
         return events
 
-    # ---- 自由发挥（LLM / 兜底）----
+    # ---- 自由发挥（LLM）----
     async def _freeform(self, state, action):
+        """没有模型 / 调用失败 → 返回空串。
+
+        2026-10-13 用户拍板取消脚本化兜底：这里以前会拼一段「（DM）……你可以：……」
+        冒充 DM 说话。现在宁可不产出 —— 配上 `handle_action` 里"空旁白不广播"
+        的处理，这一轮就是没有 DM 的话，而不是一句编出来的敷衍。
+        """
         if self.provider is None:
-            return self._scripted_narration(state.current(), action)
+            return ""
         context = self.store.build_context(state.current_scene, action)
         messages = self._build_messages(state, context, action)
         try:
             raw = await self.provider.chat(messages, json_mode=True)
             obj = _parse_json(raw)
             narration = (obj.get("narration") or "").strip()
-            if not narration:
-                narration = self._scripted_narration(state.current(), action)
             self._apply_proposal(state, obj)
             return narration
-        except Exception:
-            return self._scripted_narration(state.current(), action)
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _build_messages(self, state, context, action):
         """确定性流水线里的自由发挥：同样是「System 职责 + 次级 prompt（剧本）」两层。"""
@@ -211,22 +217,13 @@ class DM:
             if f in self._flag_whitelist():
                 state.set_flag(f)
 
-    def _scripted_narration(self, scene, action):
-        exits = "；".join(e["label"] for e in scene.get("exits", []))
-        checks = "；".join(f"{c['skill']}检定({c['id']})" for c in scene.get("checks", []))
-        hints = []
-        if exits:
-            hints.append(f"你可以：{exits}")
-        if checks:
-            hints.append(f"可以尝试：{checks}")
-        return f"（DM）{action}——" + " ".join(hints)
-
     # ---- 中途加入：给新玩家补剧情 ----
     async def introduce(self, state, name, character):
         """新玩家中途加入时，生成一段把他带入当前剧情的旁白。"""
         recap = state.recap()
         if self.provider is None:
-            return self._scripted_intro(state, name, character, recap)
+            # 取消脚本化兜底（2026-10-13）：没有模型就不编这段"新玩家登场"。
+            return ""
         try:
             scene = state.current()
             sys_msg = (
@@ -251,48 +248,17 @@ class DM:
                 messages.append({"role": "system", "content": secondary})
             messages.append({"role": "user", "content": user_msg})
             raw = await self.provider.chat(messages, json_mode=True)
-            text = (_parse_json(raw).get("narration") or "").strip()
-            return text or self._scripted_intro(state, name, character, recap)
-        except Exception:
-            return self._scripted_intro(state, name, character, recap)
-
-    def _scripted_intro(self, state, name, character, recap):
-        """无 LLM 时的兜底引导：拼接行程 + 线索 + 当前场景。"""
-        cls = (character or {}).get("cls", "冒险者")
-        scene = state.current()
-        path = recap["scene_path"]
-        journey = f"此前你们已经走过：{' → '.join(path[:-1])}。" if len(path) > 1 else ""
-        labels = "；".join(f["label"] for f in recap["flags"])
-        clue = f"目前掌握的线索：{labels}。" if labels else ""
-        return (
-            f"（DM）脚步声由远及近——{name}（{cls}）赶上了队伍，出现在{scene.get('location', '此地')}。"
-            f"{journey}{clue}此刻：{scene.get('public_text', '')}"
-        )
+            return (_parse_json(raw).get("narration") or "").strip()
+        except Exception:  # noqa: BLE001
+            return ""
 
     # ---- 小助手建议 ----
-    async def suggest(self, state):
-        scene = state.current()
-        if self.provider is None:
-            opts = [e["label"] for e in scene.get("exits", [])]
-            opts += [c.get("keywords", [c["id"]])[0] for c in scene.get("checks", [])]
-            return opts[:4]
-        try:
-            sys_msg = (
-                "你是玩家的跑团小助手（不是主持人）。根据当前场景，给出 3 个简短、具体、可执行的行动建议。"
-                "你只能读不能改剧情，只能建议剧本中真实存在的行动。"
-                "只输出 JSON：{\"options\":[\"...\",\"...\",\"...\"]}，每条不超过 15 字。"
-            )
-            user_msg = self.store.build_context(state.current_scene, "")
-            messages = [{"role": "system", "content": sys_msg}]
-            secondary = getattr(self.store, "script_prompt_public", "") or ""
-            if secondary.strip():
-                messages.append({"role": "system", "content": secondary})
-            messages.append({"role": "user", "content": user_msg})
-            raw = await self.provider.chat(messages, json_mode=True)
-            obj = _parse_json(raw)
-            return (obj.get("options") or [])[:4]
-        except Exception:
-            return [e["label"] for e in scene.get("exits", [])][:4]
+    #
+    # 这里原本还有两样东西，2026-10-13 随「取消脚本化兜底」一起删掉了：
+    #   - `_scripted_intro()`：无模型时拼一段「新玩家登场」的旁白；
+    #   - `suggest()`：脚本化的小助手建议（DM 侧的旧实现，已被 AdvisorAgent 取代）。
+    # 中途加入现在走 `introduce()`（有模型才产出，没有就返回空串）；
+    # 小助手建议走 `server/agents/advisor.py`。
 
 
 def _parse_json(raw):

@@ -20,12 +20,14 @@
       # 几分钟，界面靠它显示「DM 正在推理剧情…」，否则玩家只看到一片静止
     {"type":"busy","who":"dm|advisor","message":"..."}
       # 上一条请求还没跑完，本次被拒（之前是静默丢弃，玩家点了没反应、以为卡死）
-    {"type":"agent_note","who":"dm|advisor","source":"llm|scripted|degraded",
+    {"type":"agent_note","who":"dm|advisor","source":"llm|failed",
       "stopped":"final|error|no_provider|no_tools|max_steps","error":"...","tools":[...]}
-      # 本轮是否真的跑了模型；source 非 llm 时界面要把「退化」明确摆出来
+      # 本轮到底有没有产出，只有两种：llm（真跑到模型了）/ failed（这一轮没有产出，
+      # 原因在 error 里）。2026-10-13 用户拍板取消脚本化兜底后，不再"用剧本拼一段
+      # 旁白冒充模型"，所以 source != llm 时界面必须把失败明说出来。
     {"type":"narration","author":"DM","text":"..."}
     {"type":"dice","player":"...","skill":"...","dc":n,"roll":n,"success":bool|null,"flag":str|null}
-    {"type":"suggestions","options":[...],"agent":{"source":"llm|scripted","tools":[...]}}
+    {"type":"suggestions","options":[...],"agent":{"source":"llm|failed","tools":[...]}}
     {"type":"recap","recap":{"scene_path":[...],"flags":[...],"recent":[...],...}}  # 仅发给中途加入者
     {"type":"state","state":{...}}   # state.flag_details=[{id,label}]；state.npcs=[人物卡摘要]；state.memory=档案状态
     {"type":"error","message":"..."}
@@ -225,7 +227,7 @@ for key in ("dm", "advisor", "assistant"):
             where = a["base_url"]
         print(f"[RPGBar] {a['label']}：{a['kind']} · {where} · {a['model']}")
     else:
-        print(f"[RPGBar] {a['label']}：未接模型（留空），走脚本化兜底")
+        print(f"[RPGBar] {a['label']}：未接模型（留空）—— 该 Agent 不产出内容")
 print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 API 或本地模型）。")
 
 # GPU 可用性**在启动时探一次**（用户拍板；结果进进程内缓存，界面复用同一份）。
@@ -359,7 +361,7 @@ class Room:
 
         并入**只发生在内存里的一次拷贝上**：槽位本身不动（它还要原样描述给前端），
         引擎段里的本机路径也不会因此流出去。引擎被界面关掉时返回 None —— 调用方
-        按「这个槽位没有模型」处理，自然落到脚本化兜底。
+        按「这个槽位没有模型」处理（然后就显式失败，没有脚本化兜底）。
         """
         if (slot.get("kind") or "off").lower() != "engine":
             return slot
@@ -570,8 +572,18 @@ class Room:
                     intro = await DM(self.store, self.narrator().provider).introduce(self.state, name, character)
                 finally:
                     await self.broadcast({"type": "thinking", "active": False, "who": "dm"})
-                await self.broadcast({"type": "narration", "author": "DM", "text": intro})
-                self._chronicle_add(intro, kind="narration")
+                if intro and intro.strip():
+                    await self.broadcast({"type": "narration", "author": "DM", "text": intro})
+                    self._chronicle_add(intro, kind="narration")
+                else:
+                    # 取消脚本化兜底（2026-10-13）：没有模型就不再编一段「新玩家登场」
+                    # 的旁白，直接告诉界面这一轮没产出。
+                    await self.broadcast({
+                        "type": "agent_note", "who": "dm", "source": "failed",
+                        "stopped": "no_provider",
+                        "error": "没有可用的模型，生成不了带你入场的旁白",
+                        "tools": [],
+                    })
                 # 只发给新玩家：结构化「故事回顾」
                 await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
             await self.send_state()
@@ -781,9 +793,9 @@ class Room:
     def _agent_note(who: str, res) -> dict:
         """把「这一轮到底有没有真跑到模型」整理成一条可下发的事件。
 
-        `AgentResult.source`：llm（走了模型）/ scripted（压根没配模型）/ degraded
-        （配了模型但这轮报错、退回脚本兜底）。后两者界面上必须说清楚，否则玩家
-        只会觉得"DM 敷衍了一句"，而剧情其实原地没动。
+        `AgentResult.source` 只有两种：llm（真的跑到了模型）/ failed（这一轮没有
+        产出，原因在 `error` 里）。2026-10-13 用户拍板取消脚本化兜底之后，不再有
+        "用剧本拼一段旁白冒充模型"这条路 —— 所以非 llm 时界面必须把失败明说出来。
         """
         return {
             "type": "agent_note",

@@ -73,7 +73,7 @@ def _slot_public(slot, label) -> dict:
         "model": model,
         "has_api_key": has_key,
         "ready": ready,
-        "mode": "model" if ready else "scripted",
+        "mode": "model" if ready else "off",
     }
     if engine_detail is not None:
         out["engine"] = engine_detail

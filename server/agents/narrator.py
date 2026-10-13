@@ -10,13 +10,14 @@
   - roll_check 由服务端投骰，模型拿不到骰子，也就编不出结果
 - finish：模型显式收尾
 
-没有模型（用户留空 API）时，整个 Agent 退化成 dm.py 的确定性流水线，
-玩法不变——**有模型走工具循环，没模型走剧本化编排，两者共用同一套状态机**。
+**没有模型就没有产出**（2026-10-13 用户拍板取消脚本化兜底）：不再退化成
+`dm.py` 的确定性流水线去拼一段旁白冒充 DM，而是**直接失败** —— 界面会明说
+这一轮没有生成。要玩就必须有一个模型（本地引擎或云 API）。
 """
 from dataclasses import dataclass, field
 
 from .. import dice
-from ..dm import DM
+from ..dm import DM  # 只为 DM._exit_ok（出口门控判定）；不再用它的脚本化流水线
 from .base import Agent, AgentResult, Tool, _obj, int_prop, str_prop
 
 
@@ -49,7 +50,6 @@ class NarratorAgent(Agent):
     def __init__(self, store, provider=None, npc=None, chronicle=None):
         super().__init__(provider)
         self.store = store
-        self.dm = DM(store, provider)
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
         self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
 
@@ -353,15 +353,9 @@ class NarratorAgent(Agent):
                 ctx.state.set_flag(f)
         return obj
 
-    # ---- 无 provider：交给确定性流水线 ----
-    async def run(self, ctx, user_input: str = "") -> AgentResult:
-        if self.provider is None:
-            ctx.events.extend(await self.dm.handle_action(ctx.state, ctx.player_name, user_input))
-            return AgentResult(text="", source="scripted", stopped="no_provider")
-        return await super().run(ctx, user_input)
-
-    def fallback_text(self, ctx, user_input: str) -> str:
-        return self.dm._scripted_narration(ctx.state.current(), user_input)
+    # 这里原本有一个 `run()` override：没有 provider 时走 `dm.py` 的确定性流水线，
+    # 用剧本原文拼一段旁白冒充 DM。2026-10-13 用户拍板取消脚本化兜底后它被删掉了，
+    # 行为完全等于基类：provider is None → source="failed" / stopped="no_provider"。
 
 
 def _parse_json(raw):

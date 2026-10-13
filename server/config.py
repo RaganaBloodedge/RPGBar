@@ -35,12 +35,12 @@ EXAMPLE_PATH = RESOURCE_DIR / "config.example.json"
 
 DEFAULTS = {
     # 内置推理引擎（RPGBarEngine）：进程内直连 rpg_engine.dll，不需要任何外部服务。
-    # enabled=false（默认）时，任何 kind=engine 的槽位都自动退化为 off —— 没装引擎
-    # 的机器照常可玩（与"三个槽位默认留空"是同一条不变量）。
+    # enabled=false（默认）时，任何 kind=engine 的槽位都等价于 off —— 那个 Agent
+    # 就没有模型可用（2026-10-13 起不再有脚本化兜底，没模型＝没产出）。
     # lib / model 留空 = 自动探测：models/rpg_engine.dll 与 models/Qwen3-*.gguf。
     # context 是每个会话的 KV Cache 容量。**默认 4096**：DM 的第一轮 prompt
     # （职责 + 剧本次级 prompt + 本轮上下文 + 十几个工具的 JSON Schema）实测就要
-    # 2400+ token，2048 装不下 → 引擎报「序列超长」→ DM 静默退化成脚本兜底。
+    # 2400+ token，2048 装不下 → 引擎报「序列超长」→ 那次生成直接失败。
     # 代价（引擎自报实测）：KV Cache @2048≈448 MiB、@4096≈896 MiB / 会话。
     "engine": {
         "enabled": False,
@@ -63,9 +63,10 @@ DEFAULTS = {
         # 游戏内「设置 → 内置引擎」有开关，改这里就是改那个开关的默认值。
         "think": False,
     },
-    # 模型槽位。kind: off（留空，走脚本化兜底）/ cloud（云 API，需 api_key）/
+    # 模型槽位。kind: off（留空）/ cloud（云 API，需 api_key）/
     # local（本地服务）/ engine（内置引擎，由上面的 engine 段供货）。
-    # 默认全部留空 —— 游戏照常可玩，配好任意一个即自动启用对应 Agent。
+    # 默认全部留空 —— 但留空就等于这个 Agent 不干活：**游戏必须有模型才能跑**
+    # （2026-10-13 起取消脚本化兜底）。配好任意一个即自动启用对应 Agent。
     # - dm：主机端 DM 大模型（推进剧情）。
     # - advisor：玩家端小助手小模型（只读，给行动建议）。
     # - assistant：主机端小助手小模型（生成 NPC 人物卡、算反应权重、滚动摘要）——
@@ -96,7 +97,8 @@ DEFAULTS = {
     # NPC 子系统：是否允许用模型为次要 NPC 生成人物小传（关掉则走原型兜底表）
     "npc": {"auto_persona": True},
     # 剧情档案：把已输出的主线全文落到本地只增 JSONL，并提供 BM25 + 向量混合检索。
-    # summary_every：每积累这么多条新记录，就让主机小助手滚动摘要一次（不接模型时用确定性兜底）。
+    # summary_every：每积累这么多条新记录，就让主机小助手滚动摘要一次（需要模型；
+    # 没模型就不摘要 —— 2026-10-13 起不再有确定性兜底）。
     # 嵌入模型（bge-small-zh-v1.5）缺失时自动退化成纯 BM25，不影响游玩。
     "memory": {"chronicle": True, "summary_every": 8},
     "server": {"host": "0.0.0.0", "port": 8000},

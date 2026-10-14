@@ -52,6 +52,8 @@ class ScriptStore:
         self.premise = doc.premise
         self.start_scene = doc.start_scene
         self.fmt = doc.fmt
+        # 剧本声明的「人数」（可选段，已在 script_loader 规范化）——大厅建房时拿它当容量默认值
+        self.players = dict(doc.players)
         self.warnings = list(doc.warnings)
         self.scenes = {s["id"]: s for s in self.data.get("scenes", [])}
         # flag 中文描述（剧本可选提供，用于给玩家复述线索）

@@ -30,6 +30,12 @@ MAX_CHUNK_CHARS = 900  # 无结构文本单片上限
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(\S.*)$")
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？；!?;])")
 
+# ---- 剧本声明的「人数」（可选段，供大厅建房时定房间容量）----
+# 不写这个段不是笔误：缺省按 1–4 人（正好对应界面上的战士/法师/游侠/盗贼四个职业），
+# 且**不产生告警**。写了但写坏（类型不对 / 区间反了 / 超过硬上限）才告警。
+DEFAULT_PLAYERS = {"min": 1, "max": 4, "recommended": 4}
+MAX_PLAYERS_LIMIT = 12  # 硬上限：房间容量最多这么多人（再多人一起跑一轮没有意义，也压不住显存）
+
 
 @dataclass
 class Chunk:
@@ -73,6 +79,7 @@ class ScriptDoc:
     data: dict = field(default_factory=dict)
     chunks: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    players: dict = field(default_factory=lambda: dict(DEFAULT_PLAYERS))
 
     @property
     def structured(self) -> bool:
@@ -98,6 +105,7 @@ class ScriptDoc:
             "start_scene": self.start_scene,
             "scenes": len(self.scenes),
             "flags": len(self.data.get("flags") or {}),
+            "players": dict(self.players),
             "chunks": [c.to_dict(preview) for c in self.chunks],
             "warnings": list(self.warnings),
         }
@@ -136,6 +144,76 @@ def _try_json(raw: str):
 
 
 # ---------------------------------------------------------------- 结构化剧本
+
+
+def _as_int(v):
+    """把 JSON 里的数字宽容地取成 int（字符串 "4" 也认；布尔不是数字）。"""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str) and v.strip():
+        try:
+            return int(float(v.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_players(raw):
+    """剧本里可选的 `players` 段 → (规范化 dict, 告警列表)。
+
+    两种写法都收：
+
+        "players": {"min": 2, "max": 5, "recommended": 4}
+        "players": 4                      # 简写：只声明最大人数
+
+    一律补齐成 `{"min", "max", "recommended"}`。**没写（None）= 用缺省值且不告警**
+    —— 人数是可选段，不写不是笔误；写了但写坏（类型不对 / 区间反了 / 超硬上限）
+    才告警，并把不能用的部分换回缺省，保证后面一定能算出容量。
+    """
+    base = dict(DEFAULT_PLAYERS)
+    if raw is None or raw == "":
+        return base, []
+
+    warn = []
+
+    def clamp(name, val, lo, hi):
+        if val is None:
+            return None
+        if val < lo or val > hi:
+            warn.append(f"players.{name}={val} 超出范围 {lo}–{hi}，已按 {max(lo, min(hi, val))} 处理")
+            return max(lo, min(hi, val))
+        return val
+
+    if isinstance(raw, (int, float, str)) and not isinstance(raw, bool):
+        n = _as_int(raw)
+        if n is None:
+            warn.append(f"players 写法无法识别（{raw!r}），已按缺省 {base['max']} 人处理")
+            return base, warn
+        n = clamp("max", n, 1, MAX_PLAYERS_LIMIT)
+        warn.append(f"players 简写 {raw!r} 已按「最多 {n} 人」处理")
+        return {"min": 1, "max": n, "recommended": n}, warn
+
+    if not isinstance(raw, dict):
+        warn.append(f"players 应是对象或整数，收到 {type(raw).__name__}，已按缺省处理")
+        return base, warn
+
+    lo = clamp("min", _as_int(raw.get("min")), 1, MAX_PLAYERS_LIMIT)
+    hi = clamp("max", _as_int(raw.get("max")), 1, MAX_PLAYERS_LIMIT)
+    rec = clamp("recommended", _as_int(raw.get("recommended")), 1, MAX_PLAYERS_LIMIT)
+    lo = base["min"] if lo is None else lo
+    hi = base["max"] if hi is None else hi
+    if lo > hi:
+        warn.append(f"players.min={lo} 大于 players.max={hi}，已对调")
+        lo, hi = hi, lo
+    rec = hi if rec is None else rec
+    if rec < lo or rec > hi:
+        warn.append(f"players.recommended={rec} 不在 {lo}–{hi} 区间内，已夹到区间内")
+        rec = max(lo, min(hi, rec))
+    return {"min": lo, "max": hi, "recommended": rec}, warn
 
 
 def normalize_scene(s: dict, i: int = 0) -> dict:
@@ -180,6 +258,9 @@ def _from_structured(data: dict, source: str = "", name: str = "") -> ScriptDoc:
     scenes = [normalize_scene(s, i) for i, s in enumerate(data.get("scenes") or [])]
     data = dict(data)
     data["scenes"] = scenes
+    # 人数段在构造前就规范化好并写回 data —— 下游（ScriptStore）与切片看到的是同一份
+    players, player_warnings = normalize_players(data.get("players"))
+    data["players"] = players
 
     doc = ScriptDoc(
         title=str(data.get("title") or name or "未命名剧本"),
@@ -190,7 +271,9 @@ def _from_structured(data: dict, source: str = "", name: str = "") -> ScriptDoc:
         source=source,
         data=data,
         chunks=_slice_structured(data),
+        players=players,
     )
+    doc.warnings.extend(player_warnings)
 
     ids = [s["id"] for s in scenes]
     if doc.start_scene not in ids:
@@ -317,8 +400,10 @@ def _from_text(raw: str, source: str = "", name: str = "") -> ScriptDoc:
         start_scene="",
         fmt="text",
         source=source,
-        data={"title": title, "system": "", "start_scene": "", "flags": {}, "scenes": []},
+        data={"title": title, "system": "", "start_scene": "", "flags": {}, "scenes": [],
+              "players": dict(DEFAULT_PLAYERS)},
         chunks=chunks,
+        players=dict(DEFAULT_PLAYERS),
         warnings=[
             "无结构文本：切片用于次级 prompt 与 RAG 检索；已按切片顺序自动合成线性场景链（无检定、无线索），仅供试玩。"
         ],

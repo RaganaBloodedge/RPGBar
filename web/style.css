@@ -350,3 +350,136 @@ form input:focus, form select:focus { border-color: var(--accent); }
   cursor: pointer; font-size: 11px; color: var(--text-dim); margin-top: 8px; outline: none;
 }
 .script-warn { font-size: 11px; color: var(--red); line-height: 1.6; margin-top: 6px; }
+
+/* ==================== 大厅 ==================== */
+/* 加入页里的「用房间码直接加入」（折叠块） */
+.direct-join {
+  margin-top: 18px; padding: 10px 12px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.direct-join summary { cursor: pointer; color: var(--gold-soft); font-size: 12px; }
+.direct-join[open] summary { margin-bottom: 6px; }
+.direct-join .btn { width: 100%; margin-top: 10px; }
+#join-msg { color: var(--red); }
+
+.lobby-layout {
+  flex: 1; min-height: 0; display: flex; align-items: stretch;
+}
+.lobby-list-panel { flex: 1; min-width: 0; padding: 22px 24px; overflow-y: auto; }
+.lobby-list-panel h2 { font-size: 15px; color: var(--gold-soft); margin-bottom: 8px; }
+.lobby-list-panel h2 .count-num {
+  font-size: 12px; color: var(--text-dim); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 20px; padding: 2px 9px; margin-left: 6px;
+}
+.lobby-pass-label { display: block; font-size: 11px; color: var(--text-dim); margin: 14px 0 4px; }
+#lobby-pass {
+  width: 220px; padding: 8px 10px; font-size: 13px;
+  background: var(--bg-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; outline: none;
+}
+#lobby-pass:focus { border-color: var(--accent); }
+
+.room-list { list-style: none; margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
+.room-item {
+  display: flex; align-items: center; gap: 14px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-left: 3px solid var(--accent); border-radius: 10px; padding: 12px 16px;
+}
+.room-item.is-playing { border-left-color: var(--green); }
+.room-item .room-main { flex: 1; min-width: 0; }
+.room-item .room-title {
+  font-size: 15px; color: var(--text); font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.room-item .room-note {
+  font-size: 12px; color: var(--text-dim); margin-top: 3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.room-item .room-meta {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; align-items: center;
+}
+.room-tag {
+  font-size: 11px; color: var(--text-dim); background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px;
+}
+.room-tag.owner { color: var(--gold-soft); border-color: var(--accent); }
+.room-tag.waiting { color: var(--gold-soft); }
+.room-tag.playing { color: var(--green); border-color: var(--green); }
+.room-tag.locked { color: var(--red); border-color: var(--red); }
+.room-tag.full { color: var(--text-dim); }
+.room-item .room-join { flex-shrink: 0; }
+.lobby-msg {
+  margin-top: 16px; font-size: 13px; color: var(--red);
+  background: rgba(201, 123, 123, .12); border: 1px solid var(--red);
+  border-radius: 8px; padding: 10px 14px;
+}
+.lobby-msg.on { color: var(--green); background: rgba(127, 185, 138, .12); border-color: var(--green); }
+
+.lobby-create {
+  width: 340px; flex-shrink: 0; padding: 22px 22px 28px;
+  background: var(--bg-2); border-left: 1px solid var(--border); overflow-y: auto;
+}
+.lobby-create h2 { font-size: 15px; color: var(--gold-soft); margin-bottom: 6px; }
+.lobby-create form label { display: block; font-size: 12px; color: var(--text-dim); margin: 14px 0 6px; }
+.lobby-create form input, .lobby-create form select {
+  width: 100%; padding: 10px 11px; font-size: 14px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; outline: none;
+}
+.lobby-create form input:focus, .lobby-create form select:focus { border-color: var(--accent); }
+.lobby-create .btn.primary { width: 100%; margin-top: 20px; }
+
+/* ==================== 等待室 ==================== */
+#game-screen { position: relative; }
+.waiting {
+  position: absolute; inset: 0; z-index: 20;
+  background: rgba(20, 16, 14, .92);
+  display: flex; align-items: flex-start; justify-content: center;
+  overflow-y: auto; padding: 26px 20px 40px;
+}
+.waiting-card {
+  width: 560px; max-width: 94vw;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 24px 26px 26px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.5);
+}
+.waiting-head h2 { font-size: 20px; color: var(--gold-soft); font-weight: 600; }
+.wait-chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+.wait-note {
+  font-size: 13px; color: var(--text); margin-top: 12px; line-height: 1.7;
+  border-left: 3px solid var(--accent); padding-left: 10px;
+}
+.waiting-card h3 {
+  font-size: 12px; color: var(--text-dim); text-transform: uppercase;
+  letter-spacing: 1px; margin: 22px 0 10px;
+}
+.wait-players { list-style: none; }
+.wait-players li {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 14px; padding: 7px 0; border-bottom: 1px solid var(--border);
+}
+.wait-players .cls { color: var(--text-dim); font-size: 12px; }
+.wait-players .host-flag {
+  font-size: 10px; color: #1a1208; background: var(--gold);
+  border-radius: 10px; padding: 2px 8px; font-weight: 600;
+}
+.wait-host { border-top: 1px solid var(--border); margin-top: 22px; padding-top: 6px; }
+.wait-host-row { display: flex; gap: 10px; }
+.wait-host-row .btn { flex: 1; }
+.btn.danger { background: var(--panel); color: var(--red); border: 1px solid var(--red); }
+.wait-settings {
+  margin-top: 14px; padding: 10px 12px;
+  background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px;
+}
+.wait-settings summary { cursor: pointer; color: var(--gold-soft); font-size: 13px; }
+.wait-settings label { display: block; font-size: 12px; color: var(--text-dim); margin: 12px 0 4px; }
+.wait-settings label.inline { display: flex; align-items: center; gap: 6px; margin-top: 12px; }
+.wait-settings label.inline input { width: auto; }
+.wait-settings input, .wait-settings select {
+  width: 100%; padding: 9px 10px; font-size: 14px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; outline: none;
+}
+.wait-settings input:focus, .wait-settings select:focus { border-color: var(--accent); }
+.wait-settings .btn { width: 100%; margin-top: 16px; }
+#wait-hint { margin-top: 18px; }

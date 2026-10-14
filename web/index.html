@@ -8,7 +8,7 @@
 </head>
 <body>
 
-<!-- 加入画面 -->
+<!-- ① 自我介绍（只收名字与职业，不进房间） -->
 <section id="join-screen" class="screen">
   <div class="join-card">
     <div class="logo">
@@ -28,16 +28,20 @@
         <option value="盗贼">盗贼 · 巧手型</option>
       </select>
 
-      <label>房间码（留空自动建房，也可输入朋友的房间码加入）</label>
-      <input id="join-room" type="text" placeholder="留空新建，或输入如 ABC12" autocomplete="off">
-
-      <label id="join-script-label">开局剧本（新建房间时生效）</label>
-      <select id="join-script"></select>
-
-      <button type="submit" class="btn primary">进入游戏</button>
+      <button type="submit" class="btn primary">进入大厅</button>
     </form>
-    <p class="hint">开多个标签页、或让朋友用同一局域网 / 虚拟局域网地址打开，输入同一房间码即可联机。</p>
-    <p class="hint small">中途加入也没问题：填上朋友的房间码，DM 会为你补上之前的剧情。</p>
+
+    <details class="direct-join">
+      <summary>用房间码直接加入（朋友已经开好房）</summary>
+      <label>房间码</label>
+      <input id="join-room" type="text" placeholder="例如 ABC12" autocomplete="off">
+      <label>密码（房间设了才填）</label>
+      <input id="join-password" type="password" placeholder="没有密码就留空" autocomplete="off">
+      <button id="join-direct" class="btn" type="button">直接进入</button>
+      <p class="hint small">房号不存在时会按默认设置给你开一间新房（公开 · 剧本默认人数），你就成了房主。</p>
+    </details>
+
+    <p class="hint small" id="join-msg"></p>
     <details id="share-box" class="share-box hidden">
       <summary>联机地址（发给朋友）</summary>
       <ul id="share-list" class="share-list"></ul>
@@ -47,7 +51,68 @@
   </div>
 </section>
 
-<!-- 游戏画面 -->
+<!-- ② 大厅：看房间列表 / 开新房 -->
+<section id="lobby-screen" class="screen hidden">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-die">⚄</span>
+      <span class="brand-name">RPGBar</span>
+    </div>
+    <div class="room-info">
+      <span class="chip">大厅</span>
+      <span class="chip">活动剧本 <b id="lobby-active">—</b></span>
+      <button id="lobby-refresh" class="btn ghost">刷新列表</button>
+      <button id="lobby-back" class="btn ghost">改名字</button>
+      <span id="lobby-me" class="chip"></span>
+    </div>
+  </header>
+
+  <main class="lobby-layout">
+    <section class="lobby-list-panel">
+      <h2>公开房间 <span id="lobby-count" class="count-num">0</span></h2>
+      <p class="hint small">
+        「等待中」的房间进去一起等房主开始；「进行中」的可以<b>中途加入</b>，DM 会给你补上之前的剧情。
+        私密房间不上这个列表，只能凭房间码进。
+      </p>
+      <label class="lobby-pass-label">进房密码（只有设了密码的房间要填）</label>
+      <input id="lobby-pass" type="password" placeholder="没有就留空" autocomplete="off">
+      <ul id="lobby-rooms" class="room-list"></ul>
+      <p id="lobby-empty" class="hint">还没有公开房间 —— 用右边「创建房间」开一间吧。</p>
+      <p id="lobby-msg" class="lobby-msg hidden"></p>
+    </section>
+
+    <aside class="lobby-create">
+      <h2>创建房间</h2>
+      <form id="create-form">
+        <label>房间名（留空用剧本名）</label>
+        <input id="create-name" type="text" placeholder="例如：今晚八点蛇王墓" autocomplete="off" maxlength="24">
+
+        <label>剧本</label>
+        <select id="create-script"></select>
+        <p id="create-players-hint" class="hint small">—</p>
+
+        <label>人数上限</label>
+        <input id="create-max" type="number" min="1" max="12" value="4">
+
+        <label>备注（给陌生人看的）</label>
+        <input id="create-note" type="text" placeholder="例如：新手局，慢慢玩，不催" autocomplete="off" maxlength="80">
+
+        <label>谁能看见</label>
+        <select id="create-visibility">
+          <option value="public">公开 · 进大厅列表，陌生人可以直接进</option>
+          <option value="private">私密 · 不上列表，只凭房间码进</option>
+        </select>
+
+        <label>密码（可留空）</label>
+        <input id="create-password" type="password" placeholder="留空 = 不要密码" autocomplete="off" maxlength="32">
+
+        <button type="submit" class="btn primary">创建并进入</button>
+      </form>
+    </aside>
+  </main>
+</section>
+
+<!-- ③ 游戏画面（等待室是它上面的一层覆盖） -->
 <section id="game-screen" class="screen hidden">
   <header class="topbar">
     <div class="brand">
@@ -56,6 +121,8 @@
     </div>
     <div class="room-info">
       <span class="chip">房间 <b id="room-code">—</b></span>
+      <span class="chip" id="room-name-chip">房名 <b id="room-name">—</b></span>
+      <span class="chip">人数 <b id="room-players">0/0</b></span>
       <span class="chip">场景 <b id="scene-title">—</b></span>
       <span class="chip">地点 <b id="scene-location">—</b></span>
       <span class="chip" title="RPGBar 版本"><b id="app-version-top">—</b></span>
@@ -97,6 +164,59 @@
       <button id="send-btn" class="btn primary">行动</button>
     </div>
   </footer>
+
+  <!-- 等待室：房主点「开始」之前盖在游戏画面上 -->
+  <div id="waiting-room" class="waiting hidden">
+    <div class="waiting-card">
+      <div class="waiting-head">
+        <h2 id="wait-title">—</h2>
+        <p class="wait-chips">
+          <span class="chip">房间 <b id="wait-code">—</b></span>
+          <button id="wait-copy" class="btn ghost" title="复制房间码">复制房间码</button>
+          <span class="chip" id="wait-phase">等待中</span>
+          <span class="chip" id="wait-vis" title="可见性">公开</span>
+        </p>
+        <p id="wait-note" class="wait-note"></p>
+        <p class="hint small">
+          剧本：<b id="wait-script">—</b> ·
+          人数 <b id="wait-count">0/0</b> ·
+          房主 <b id="wait-owner">—</b> ·
+          进房密码 <b id="wait-pass">—</b>
+        </p>
+      </div>
+
+      <h3>队伍</h3>
+      <ul id="wait-players" class="wait-players"></ul>
+
+      <div id="wait-host" class="wait-host hidden">
+        <h3>房主操作</h3>
+        <div class="wait-host-row">
+          <button id="wait-start" class="btn primary">开始游戏</button>
+          <button id="wait-close" class="btn danger">解散房间</button>
+        </div>
+        <details class="wait-settings">
+          <summary>修改房间设置</summary>
+          <label>房间名</label>
+          <input id="set-name" type="text" maxlength="24" autocomplete="off">
+          <label>备注</label>
+          <input id="set-note" type="text" maxlength="80" autocomplete="off">
+          <label>人数上限</label>
+          <input id="set-max" type="number" min="1" max="12">
+          <label>谁能看见</label>
+          <select id="set-visibility">
+            <option value="public">公开 · 进大厅列表</option>
+            <option value="private">私密 · 只凭房间码</option>
+          </select>
+          <label>新密码（留空 = 不改）</label>
+          <input id="set-password" type="password" maxlength="32" placeholder="不改就别填" autocomplete="off">
+          <label class="inline"><input id="set-clear-password" type="checkbox"> 清除密码（谁都能进）</label>
+          <button id="set-save" class="btn" type="button">保存设置</button>
+        </details>
+      </div>
+
+      <p id="wait-hint" class="hint">等房主点「开始」。开局前还不能行动。</p>
+    </div>
+  </div>
 </section>
 
 <!-- 设置抽屉：模型接线 + 剧本读取 -->

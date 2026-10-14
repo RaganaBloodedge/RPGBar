@@ -2,8 +2,10 @@
   "use strict";
 
   var joinScreen = document.getElementById("join-screen");
+  var lobbyScreen = document.getElementById("lobby-screen");
   var gameScreen = document.getElementById("game-screen");
   var joinForm = document.getElementById("join-form");
+  var joinMsgEl = document.getElementById("join-msg");
   var logEl = document.getElementById("log");
   var playersEl = document.getElementById("players");
   var flagsEl = document.getElementById("flags");
@@ -15,6 +17,7 @@
   var suggestBtn = document.getElementById("suggest-btn");
   var rollBtn = document.getElementById("roll-d20");
   var copyBtn = document.getElementById("copy-room");
+  var waitingRoom = document.getElementById("waiting-room");
 
   var roomCode = document.getElementById("room-code");
   var sceneTitle = document.getElementById("scene-title");
@@ -23,6 +26,19 @@
   var ws = null;
   var you = "";
   var currentScript = "";
+
+  // ---- 大厅 / 房间状态 ----
+  // me：自我介绍（名字 + 职业），进大厅前填一次，之后大厅与建房都用它。
+  // roomInfo：服务端最后一次下发的房间快照（welcome 的 room_info 与 room 事件同形状）。
+  // playersCache：最近一次 state 里的玩家列表（等待室要拿它显示队伍，房间快照里只有人数）。
+  var me = { name: "", cls: "" };
+  var roomInfo = null;
+  var playersCache = [];
+  var lobbyTimer = null;
+  var lobbyScripts = [];
+  var lastJoin = null;
+  var joinDeny = null;
+  var closedNotice = null;
 
   // 剧本名由服务端提供（/api/version 与 welcome），界面各处跟随它，不再写死。
   function setScript(name) {
@@ -95,16 +111,38 @@
   loadNet();
 
   // 加入页的「开局剧本」下拉：建房时可选，加入别人的房间时由房主决定（自动置灰）。
-  function loadJoinScripts() {
-    var sel = document.getElementById("join-script");
+  // 建房表单里的剧本下拉：由 /api/scripts 填充；并把该剧本**声明的人数**
+  // （剧本 JSON 里可选的 players 段）写进提示文案与「人数上限」的默认值。
+  function syncCreatePlayers() {
+    var sel = document.getElementById("create-script");
+    var maxEl = document.getElementById("create-max");
+    var hint = document.getElementById("create-players-hint");
+    var it = null;
+    for (var i = 0; i < lobbyScripts.length; i++) {
+      if (lobbyScripts[i].path === (sel && sel.value)) { it = lobbyScripts[i]; break; }
+    }
+    var p = (it && it.players) || { min: 1, max: 4, recommended: 4 };
+    if (hint) {
+      hint.textContent = "这个剧本建议 " + p.min + "–" + p.max + " 人（推荐 " + p.recommended +
+        "）—— 上面的人数上限可以自定，最多 " + (p.max || 4) + " 人。";
+    }
+    if (maxEl) {
+      maxEl.min = String(p.min || 1);
+      maxEl.max = String(p.max || 12);
+      // 只在玩家没手动改过时跟着剧本走，免得把人家填好的数字覆盖掉
+      if (!maxEl.dataset.touched) maxEl.value = String(p.recommended || p.max || 4);
+    }
+  }
+
+  function loadLobbyScripts() {
+    var sel = document.getElementById("create-script");
     if (!sel) return;
     fetch("/api/scripts")
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        var list = (d && d.scripts) || [];
+        lobbyScripts = ((d && d.scripts) || []).filter(function (s) { return !s.error; });
         sel.innerHTML = "";
-        list.forEach(function (s) {
-          if (s.error) return;
+        lobbyScripts.forEach(function (s) {
           var opt = document.createElement("option");
           opt.value = s.path;
           opt.textContent =
@@ -112,29 +150,17 @@
           if (d.active && s.path === d.active) opt.selected = true;
           sel.appendChild(opt);
         });
+        syncCreatePlayers();
       })
       .catch(function () {});
   }
 
-  function syncJoinScriptLock() {
-    var sel = document.getElementById("join-script");
-    var room = document.getElementById("join-room");
-    if (!sel) return;
-    var joining = !!(room && room.value.trim());
-    sel.disabled = joining;
-    var lbl = document.getElementById("join-script-label");
-    if (lbl) {
-      lbl.textContent = joining
-        ? "开局剧本（加入别人的房间，由房主决定）"
-        : "开局剧本（新建房间时生效）";
-    }
-  }
-
-  if (document.getElementById("join-room")) {
-    document.getElementById("join-room").addEventListener("input", syncJoinScriptLock);
-  }
-  loadJoinScripts();
-  syncJoinScriptLock();
+  (function initLobbyForm() {
+    var sel = document.getElementById("create-script");
+    var maxEl = document.getElementById("create-max");
+    if (sel) sel.addEventListener("change", syncCreatePlayers);
+    if (maxEl) maxEl.addEventListener("input", function () { maxEl.dataset.touched = "1"; });
+  })();
 
   // 「本房间」同步块：主机建房时选定的剧本 + 下发到本机的 Agent 次级 prompt。
   function renderRoomSync(msg) {
@@ -250,6 +276,9 @@
       li.textContent = p.name + " · " + (p.character && p.character.cls ? p.character.cls : "");
       playersEl.appendChild(li);
     });
+    // 等待室要显示同一份队伍名单（房间快照里只有人数，没有名单），先缓存起来
+    playersCache = state.players || [];
+    renderWaitPlayers();
 
     flagsEl.innerHTML = "";
     var details = state.flag_details;
@@ -397,14 +426,44 @@
         renderRoomSync(msg);
         renderNpcs(msg.npcs);
         renderMemory(msg.memory);
+        // 房间快照：等待室画什么、顶栏显示什么，全看它
+        renderRoomInfo(msg.room_info);
         addEntry(
           "system",
           "",
           msg.late
             ? "你中途加入了房间 " + msg.room + "（你是 " + you + "），DM 正在为你补上之前的剧情…"
-            : "你已加入房间 " + msg.room + "（你是 " + you + "）"
+            : (isOwner
+                ? "房间 " + msg.room + " 开好了（你是房主）—— 人齐了点「开始游戏」。"
+                : "你加入了房间 " + msg.room + "（你是 " + you + "）—— 等房主开始。")
         );
         pushSavedModels();
+        break;
+      case "room":
+        // 人数 / 房主 / 设置 / 阶段任一变化都会重发一次；等待室与顶栏跟着它刷新
+        renderRoomInfo(msg.room);
+        break;
+      case "room_sync":
+        // 房主换人时按人重发：新得的 DM 次级 prompt + 最新的房主是谁
+        isOwner = !!(msg.agents && msg.agents.owner === you);
+        applyAgents(msg.agents);
+        renderRoomSync(msg);
+        break;
+      case "not_started":
+        addEntry("system", "还不能行动", msg.message || "等房主开始这一局。");
+        break;
+      case "join_denied":
+        // 服务端马上会关连接，onclose 里统一退回大厅并显示原因
+        joinDeny = { code: msg.code, message: msg.message };
+        break;
+      case "kicked":
+        // 服务端也会主动断连接；这里自己先关一次，界面立刻退回大厅、不用等对端
+        closedNotice = { message: msg.message || "你被房主请出了房间。" };
+        if (ws) { try { ws.close(); } catch (err) {} }
+        break;
+      case "room_closed":
+        closedNotice = { message: msg.message || "房间已解散。" };
+        if (ws) { try { ws.close(); } catch (err) {} }
         break;
       case "agent_status":
         applyAgents(msg.agents);
@@ -1376,45 +1435,90 @@
     showThinking("dm"); // 乐观显示：不等服务端回 thinking，点完立刻有反馈
   }
 
+  // ---- 加入页：只收名字与职业，然后进大厅（不再直接建房/进房）----
   joinForm.addEventListener("submit", function (e) {
     e.preventDefault();
-    var name = document.getElementById("join-name").value.trim();
-    var cls = document.getElementById("join-class").value;
-    var room = document.getElementById("join-room").value.trim();
-    var scriptSel = document.getElementById("join-script");
-    var scriptRel = !room && scriptSel ? scriptSel.value : ""; // 只有建房时才带上剧本
+    me.name = document.getElementById("join-name").value.trim() || "冒险者";
+    me.cls = document.getElementById("join-class").value;
+    joinMsg("");
+    openLobby();
+  });
 
+  document.getElementById("join-direct").addEventListener("click", function () {
+    if (!me.name) {
+      joinMsg("先在下面填个名字（上面「进入大厅」那一栏）。");
+      return;
+    }
+    var code = document.getElementById("join-room").value.trim().toUpperCase();
+    if (!code) {
+      joinMsg("要先填房间码 —— 想开新房请点上面的「进入大厅」。");
+      return;
+    }
+    joinMsg("");
+    connectGame({ room: code, password: document.getElementById("join-password").value });
+  });
+
+  // ---- 连服务器并进房 ----
+  // 建房与加入走**同一条路**：都先连 /ws，再发一条 join —— 区别只在 join 里带不带
+  // create（建房参数）。认不认由服务端说了算（密码 / 容量 / 房号不存在都归它判）。
+  function connectGame(opts) {
+    opts = opts || {};
+    stopLobbyPolling();
+    joinDeny = null;
+    closedNotice = null;
+    lastJoin = {
+      room: opts.room || "",
+      password: opts.password || "",
+      create: opts.create || null,
+      script: opts.script || ""
+    };
     var proto = location.protocol === "https:" ? "wss" : "ws";
     ws = new WebSocket(proto + "://" + location.host + "/ws");
 
     ws.onopen = function () {
-      send({
+      var payload = {
         type: "join",
-        name: name,
-        room: room,
-        script: scriptRel,
-        character: { name: name, cls: cls, hp: 10, skills: {} }
-      });
+        name: me.name,
+        room: lastJoin.room,
+        password: lastJoin.password,
+        script: lastJoin.script,
+        character: { name: me.name, cls: me.cls, hp: 10, skills: {} }
+      };
+      if (lastJoin.create) payload.create = lastJoin.create;
+      send(payload);
     };
     ws.onmessage = function (ev) {
       try { handleMessage(JSON.parse(ev.data)); } catch (err) {}
     };
     ws.onclose = function () {
+      ws = null;
       clearThinking("dm");
       clearThinking("advisor");
       setBusy(false);
-      addEntry("system", "", "连接已断开，刷新页面重新加入");
+      if (joinDeny || closedNotice) {
+        // 被拒 / 被踢 / 房间被解散：退回大厅，把原因摆在显眼处
+        var why = joinDeny || closedNotice || {};
+        returnToLobby(why.message || "进不去这个房间。");
+        joinDeny = null;
+        closedNotice = null;
+        return;
+      }
+      if (!gameScreen.classList.contains("hidden")) {
+        returnToLobby("和服务器断开了 —— 重新挑个房间，或者自己开一间。");
+      }
     };
     ws.onerror = function () {
       clearThinking("dm");
       clearThinking("advisor");
-      addEntry("system", "错误", "无法连接服务器");
     };
 
+    // 先进游戏屏（等待室会盖在上面）：这样"进去了"立刻有反馈；真被拒的话
+    // 服务端马上关连接，onclose 会把人送回大厅并说明原因（闪一下而已）。
     joinScreen.classList.add("hidden");
+    lobbyScreen.classList.add("hidden");
     gameScreen.classList.remove("hidden");
     actionInput.focus();
-  });
+  }
 
   sendBtn.addEventListener("click", function () { sendAction(actionInput.value); });
   actionInput.addEventListener("keydown", function (e) {
@@ -1435,4 +1539,355 @@
       });
     }
   });
+
+  /* ==================== 大厅 ==================== */
+
+  function showScreen(which) {
+    joinScreen.classList.toggle("hidden", which !== "join");
+    lobbyScreen.classList.toggle("hidden", which !== "lobby");
+    gameScreen.classList.toggle("hidden", which !== "game");
+  }
+
+  function joinMsg(text) {
+    if (!joinMsgEl) return;
+    joinMsgEl.textContent = text || "";
+  }
+
+  function lobbyMsg(text, ok) {
+    var el = document.getElementById("lobby-msg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.toggle("hidden", !text);
+    el.classList.toggle("on", !!ok);
+  }
+
+  function openLobby() {
+    showScreen("lobby");
+    var chip = document.getElementById("lobby-me");
+    if (chip) chip.textContent = me.name ? (me.name + " · " + me.cls) : "";
+    loadLobbyScripts();
+    loadRooms();
+    startLobbyPolling();
+  }
+
+  function startLobbyPolling() {
+    stopLobbyPolling();
+    // 大厅列表 5 秒刷一次（别处开/关房间能很快反映出来）。进了房间就停 ——
+    // 进房之后房间信息走 WebSocket 推送，不用再轮询 HTTP。
+    lobbyTimer = setInterval(function () {
+      if (lobbyScreen.classList.contains("hidden")) return;
+      loadRooms();
+    }, 5000);
+  }
+
+  function stopLobbyPolling() {
+    if (lobbyTimer) { clearInterval(lobbyTimer); lobbyTimer = null; }
+  }
+
+  function loadRooms() {
+    return fetch("/api/rooms")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var list = (d && d.rooms) || [];
+        renderRooms(list);
+        var act = document.getElementById("lobby-active");
+        if (act && d && d.active_title) act.textContent = d.active_title;
+        var empty = document.getElementById("lobby-empty");
+        if (empty) empty.classList.toggle("hidden", list.length > 0);
+      })
+      .catch(function () {});
+  }
+
+  function roomTag(text, cls) {
+    var span = document.createElement("span");
+    span.className = "room-tag" + (cls ? " " + cls : "");
+    span.textContent = text;
+    return span;
+  }
+
+  function renderRooms(list) {
+    var ul = document.getElementById("lobby-rooms");
+    if (!ul) return;
+    var countEl = document.getElementById("lobby-count");
+    if (countEl) countEl.textContent = String(list.length);
+    ul.innerHTML = "";
+    list.forEach(function (r) {
+      var li = document.createElement("li");
+      li.className = "room-item" + (r.phase === "playing" ? " is-playing" : "");
+
+      var main = document.createElement("div");
+      main.className = "room-main";
+      var title = document.createElement("div");
+      title.className = "room-title";
+      title.textContent = r.name || r.script || r.code;
+      main.appendChild(title);
+
+      if (r.note) {
+        var note = document.createElement("div");
+        note.className = "room-note";
+        note.textContent = r.note;
+        main.appendChild(note);
+      }
+
+      var meta = document.createElement("div");
+      meta.className = "room-meta";
+      meta.appendChild(roomTag("剧本：" + (r.script || "—")));
+      meta.appendChild(roomTag("房主：" + (r.owner || "—"), "owner"));
+      meta.appendChild(roomTag(r.online + "/" + r.max_players + " 人"));
+      meta.appendChild(roomTag(r.phase_label || "等待中", r.phase === "playing" ? "playing" : "waiting"));
+      meta.appendChild(roomTag("房间码 " + r.code));
+      if (r.has_password) meta.appendChild(roomTag("需密码", "locked"));
+      var full = r.online >= r.max_players;
+      if (full) meta.appendChild(roomTag("已满", "full"));
+      main.appendChild(meta);
+      li.appendChild(main);
+
+      var join = document.createElement("button");
+      join.className = "btn primary room-join";
+      join.textContent = full ? "已满" : (r.phase === "playing" ? "中途加入" : "进入");
+      join.disabled = full;
+      join.onclick = function () { joinRoomFromLobby(r); };
+      li.appendChild(join);
+      ul.appendChild(li);
+    });
+  }
+
+  function joinRoomFromLobby(r) {
+    if (!me.name) { showScreen("join"); joinMsg("先填个名字。"); return; }
+    var passEl = document.getElementById("lobby-pass");
+    var pw = passEl ? passEl.value : "";
+    if (r.has_password && !pw) {
+      lobbyMsg("「" + (r.name || r.code) + "」设了密码 —— 在上面「进房密码」里填一下再点进入。");
+      if (passEl) passEl.focus();
+      return;
+    }
+    lobbyMsg("");
+    connectGame({ room: r.code, password: pw });
+  }
+
+  function createFromForm(e) {
+    e.preventDefault();
+    if (!me.name) { showScreen("join"); joinMsg("先填个名字。"); return; }
+    var val = function (id) { var el = document.getElementById(id); return el ? el.value : ""; };
+    var payload = {
+      name: val("create-name").trim(),
+      note: val("create-note").trim(),
+      max_players: val("create-max"),
+      visibility: val("create-visibility"),
+      password: val("create-password"),
+      script: val("create-script")
+    };
+    lobbyMsg("");
+    connectGame({ room: "", create: payload, script: payload.script });
+  }
+
+  // 从游戏屏退回大厅（被拒 / 被踢 / 房间解散 / 断线都会走这里）。
+  // 顺手把上一局的残留清干净，免得串到下一间房。
+  function returnToLobby(message) {
+    stopLobbyPolling();
+    if (ws) { try { ws.close(); } catch (err) {} ws = null; }
+    roomInfo = null;
+    playersCache = [];
+    waitingRoom.classList.add("hidden");
+    logEl.innerHTML = "";
+    playersEl.innerHTML = "";
+    flagsEl.innerHTML = "";
+    npcsEl.innerHTML = "";
+    suggestionsEl.innerHTML = "";
+    memoryEl.textContent = "（尚未开局）";
+    actionInput.value = "";
+    clearThinking("dm");
+    clearThinking("advisor");
+    setBusy(false);
+    showScreen("lobby");
+    if (message) lobbyMsg(message);
+    loadRooms();
+    startLobbyPolling();
+  }
+
+  /* ==================== 等待室 ==================== */
+
+  function renderRoomInfo(info) {
+    if (!info) return;
+    roomInfo = info;
+    roomCode.textContent = info.code || "—";
+
+    var set = function (id, text) {
+      var el = document.getElementById(id);
+      if (el) el.textContent = text;
+    };
+    set("room-name", info.name || "—");
+    set("room-players", (info.online || 0) + "/" + (info.max_players || 0));
+    set("wait-title", info.name || "—");
+    set("wait-code", info.code || "—");
+    set("wait-script", info.script || "—");
+    set("wait-count", (info.online || 0) + "/" + (info.max_players || 0));
+    set("wait-owner", info.owner || "—");
+    set("wait-pass", info.has_password ? "有" : "无");
+    set("wait-phase", info.phase_label || "等待中");
+    set("wait-vis", info.visibility === "private" ? "私密" : "公开");
+
+    var note = document.getElementById("wait-note");
+    if (note) {
+      note.textContent = info.note || "";
+      note.classList.toggle("hidden", !info.note);
+    }
+
+    var waiting = info.phase !== "playing";
+    // 开局前没有剧情，场景 / 地点两个胶囊没有意义，先收起来
+    [sceneTitle, sceneLocation].forEach(function (el) {
+      if (el && el.parentNode) el.parentNode.classList.toggle("hidden", waiting);
+    });
+
+    isOwner = !!(info.owner && info.owner === you);
+    var hostBox = document.getElementById("wait-host");
+    if (hostBox) hostBox.classList.toggle("hidden", !isOwner);
+
+    set("wait-hint", isOwner
+      ? "人都到齐了就点「开始游戏」。开局前谁都不能行动（可以先去「⚙ 设置」把模型接上）。"
+      : "等房主点「开始」。开局前谁都不能行动 —— 可以先去「⚙ 设置」把自己那份小助手模型接好。");
+
+    // 把设置表单的初值同步一次。仅在折叠着的时候填 —— 房主正打字时别冲掉。
+    if (isOwner) {
+      var box = document.querySelector(".wait-settings");
+      if (!box || !box.open) {
+        var fill = function (id, v) { var el = document.getElementById(id); if (el) el.value = v; };
+        fill("set-name", info.name || "");
+        fill("set-note", info.note || "");
+        fill("set-max", String(info.max_players || 4));
+        var vis = document.getElementById("set-visibility");
+        if (vis) vis.value = info.visibility || "public";
+      }
+    }
+
+    renderWaitPlayers();
+    waitingRoom.classList.toggle("hidden", !waiting);
+  }
+
+  function renderWaitPlayers() {
+    var ul = document.getElementById("wait-players");
+    if (!ul) return;
+    ul.innerHTML = "";
+    if (!playersCache.length) {
+      var empty = document.createElement("li");
+      empty.textContent = "（还没有人）";
+      ul.appendChild(empty);
+      return;
+    }
+    var owner = roomInfo ? roomInfo.owner : "";
+    playersCache.forEach(function (p) {
+      var row = document.createElement("li");
+      var name = document.createElement("span");
+      name.textContent = p.name;
+      row.appendChild(name);
+      if (p.character && p.character.cls) {
+        var cls = document.createElement("span");
+        cls.className = "cls";
+        cls.textContent = p.character.cls;
+        row.appendChild(cls);
+      }
+      if (p.name === owner) {
+        var flag = document.createElement("span");
+        flag.className = "host-flag";
+        flag.textContent = "房主";
+        row.appendChild(flag);
+      } else if (isOwner) {
+        // 房主对别人多两个动作：请出 / 设为房主（转让）
+        [["kick", "请出"], ["transfer", "设为房主"]].forEach(function (pair) {
+          var b = document.createElement("button");
+          b.className = "btn ghost";
+          b.style.fontSize = "12px";
+          b.style.padding = "4px 10px";
+          b.textContent = pair[1];
+          b.onclick = function () { send({ type: pair[0], target: p.name }); };
+          row.appendChild(b);
+        });
+      }
+      ul.appendChild(row);
+    });
+  }
+
+  function saveRoomSettings() {
+    var val = function (id) { var el = document.getElementById(id); return el ? el.value : ""; };
+    var payload = {
+      type: "room_settings",
+      name: val("set-name").trim(),
+      note: val("set-note").trim(),
+      max_players: val("set-max"),
+      visibility: val("set-visibility")
+    };
+    var pwEl = document.getElementById("set-password");
+    var clearEl = document.getElementById("set-clear-password");
+    var pw = pwEl ? pwEl.value : "";
+    if (clearEl && clearEl.checked) payload.clear_password = true;
+    else if (pw) payload.password = pw;
+    send(payload);
+    if (pwEl) pwEl.value = "";
+    if (clearEl) clearEl.checked = false;
+  }
+
+  (function initLobbyAndWaiting() {
+    var refreshBtn = document.getElementById("lobby-refresh");
+    if (refreshBtn) refreshBtn.onclick = function () { lobbyMsg(""); loadRooms(); };
+
+    var backBtn = document.getElementById("lobby-back");
+    if (backBtn) {
+      backBtn.onclick = function () {
+        stopLobbyPolling();
+        joinMsg("");
+        showScreen("join");
+      };
+    }
+
+    var createForm = document.getElementById("create-form");
+    if (createForm) createForm.addEventListener("submit", createFromForm);
+
+    var startBtn = document.getElementById("wait-start");
+    if (startBtn) startBtn.onclick = function () { send({ type: "start" }); };
+
+    // 「解散房间」用**两步点击**而不是 confirm 弹窗：弹窗在部分环境里会被拦掉，
+    // 而且误点一下就把整局解散的代价太大。第一次点变成「确认解散」，4 秒后自动还原。
+    var closeBtn = document.getElementById("wait-close");
+    if (closeBtn) {
+      var disarmed = null;
+      closeBtn.onclick = function () {
+        if (closeBtn.dataset.armed === "1") {
+          closeBtn.dataset.armed = "";
+          closeBtn.textContent = "解散房间";
+          if (disarmed) clearTimeout(disarmed);
+          send({ type: "close_room" });
+          return;
+        }
+        closeBtn.dataset.armed = "1";
+        closeBtn.textContent = "确认解散？再点一次";
+        disarmed = setTimeout(function () {
+          closeBtn.dataset.armed = "";
+          closeBtn.textContent = "解散房间";
+        }, 4000);
+      };
+    }
+
+    var setSave = document.getElementById("set-save");
+    if (setSave) setSave.onclick = saveRoomSettings;
+
+    var waitCopy = document.getElementById("wait-copy");
+    if (waitCopy) {
+      waitCopy.onclick = function () {
+        var code = roomInfo ? roomInfo.code : "";
+        if (code && navigator.clipboard) {
+          navigator.clipboard.writeText(code).then(function () {
+            waitCopy.textContent = "已复制";
+            setTimeout(function () { waitCopy.textContent = "复制房间码"; }, 1500);
+          });
+        }
+      };
+    }
+
+    // 关掉页面时告诉服务端一声（服务端也会自己发现断开，这只是让"离开"更快生效）
+    window.addEventListener("beforeunload", function () {
+      if (ws && ws.readyState === 1) {
+        try { ws.send(JSON.stringify({ type: "leave" })); } catch (err) {}
+      }
+    });
+  })();
 })();

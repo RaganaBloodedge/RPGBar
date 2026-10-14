@@ -92,7 +92,17 @@ function startFakeLLM() {
   const dom = new JSDOM(html, { url: BASE + "/", runScripts: "outside-only", pretendToBeVisual: true });
   const w = dom.window;
   w.WebSocket = FakeWS;
-  w.fetch = (url, opts) => fetch(url.startsWith("http") ? url : BASE + url, opts);
+  const realFetch = (url, opts) => fetch(url.startsWith("http") ? url : BASE + url, opts);
+  // 大厅列表走 /api/rooms 轮询 —— 真实结果取决于**当时**服务器上有没有人开着房，
+  // 拿它做断言就是"看运气"。这里只截这一条路径，喂一份固定数据；其余请求照旧
+  // 打真服务器（「测试连接」「读取切片」那些必须走真链路）。
+  let roomsPayload = { rooms: [], waiting: 0, active_title: "", defaults: {} };
+  w.fetch = (url, opts) => {
+    if (String(url).indexOf("/api/rooms") >= 0) {
+      return Promise.resolve({ json: () => Promise.resolve(roomsPayload) });
+    }
+    return realFetch(url, opts);
+  };
   w.addEventListener("error", (e) => jsErrors.push(String((e && e.error) || e.message || e)));
   w.onerror = (m) => jsErrors.push(String(m));
 
@@ -123,33 +133,141 @@ function startFakeLLM() {
     String(w.document.querySelectorAll("#share-list-drawer .share-addr").length)
   );
 
-  // ---- 建房选剧本：加入页下拉由 /api/scripts 填充；填了房号则由房主决定（置灰）----
-  for (let i = 0; i < 40 && (!$("join-script") || $("join-script").options.length === 0); i++) {
-    await sleep(50);
-  }
-  const joinScript = $("join-script");
-  check("加入页有「开局剧本」下拉", !!joinScript);
-  check("下拉已被剧本列表填充", !!joinScript && joinScript.options.length >= 1, joinScript ? String(joinScript.options.length) : "无");
-  const pickedScript = joinScript ? joinScript.value : "";
-  $("join-room").value = "ABC12";
-  $("join-room").dispatchEvent(new w.Event("input", { bubbles: true }));
-  check("填了房号后剧本下拉置灰（由房主决定）", !!joinScript && joinScript.disabled === true);
-  $("join-room").value = "";
-  $("join-room").dispatchEvent(new w.Event("input", { bubbles: true }));
-  check("清空房号后剧本下拉恢复可选", !!joinScript && joinScript.disabled === false);
+  // ---- 进大厅：填名字只到这里为止，**不建连接**；选房/建房才连 ----
+  roomsPayload = {
+    rooms: [
+      { code: "WAIT01", name: "今晚八点蛇王墓", note: "新手局，慢慢玩", script: "古堡秘宝",
+        owner: "老王", online: 2, max_players: 4, phase: "waiting", phase_label: "等待中",
+        visibility: "public", has_password: false, created_at: 1 },
+      { code: "LOCK03", name: "蛇王墓的局", note: "", script: "古堡秘宝",
+        owner: "老赵", online: 1, max_players: 4, phase: "waiting", phase_label: "等待中",
+        visibility: "public", has_password: true, created_at: 2 },
+      { code: "PLAY05", name: "老手局", note: "", script: "古堡秘宝",
+        owner: "小陈", online: 1, max_players: 4, phase: "playing", phase_label: "进行中",
+        visibility: "public", has_password: false, created_at: 3 },
+      { code: "FULL04", name: "老李的局", note: "", script: "古堡秘宝",
+        owner: "老李", online: 4, max_players: 4, phase: "playing", phase_label: "进行中",
+        visibility: "public", has_password: false, created_at: 4 },
+    ],
+    waiting: 2,
+    active_title: "古堡秘宝",
+    defaults: { script: "scripts/sample_script.json", script_title: "古堡秘宝",
+                players: { min: 2, max: 4, recommended: 4 } },
+  };
 
-  // ---- 模拟进入房间 ----
   $("join-name").value = "亚瑟";
   $("join-form").dispatchEvent(new w.Event("submit", { bubbles: true, cancelable: true }));
+  await sleep(30);
+  check("填名字后进入大厅屏（不直接连服务器）",
+    !$("lobby-screen").classList.contains("hidden") && $("join-screen").classList.contains("hidden"),
+    $("lobby-screen").className);
+  check("没选房之前不建 WebSocket", !FakeWS.last || sent.length === 0, JSON.stringify(sent));
+  check("大厅顶栏标出我是谁", ($("lobby-me").textContent || "").indexOf("亚瑟") === 0, $("lobby-me").textContent);
+
+  for (let i = 0; i < 40 && w.document.querySelectorAll("#lobby-rooms .room-item").length === 0; i++) {
+    await sleep(50);
+  }
+  const roomItems = w.document.querySelectorAll("#lobby-rooms .room-item");
+  const tagsOf = (li) => Array.from(li.querySelectorAll(".room-tag")).map((t) => t.textContent).join(" | ");
+  check("大厅列出公开房间", roomItems.length === 4, String(roomItems.length));
+  check("房间条目显示房名与备注（给陌生人看的）",
+    roomItems[0].querySelector(".room-title").textContent === "今晚八点蛇王墓" &&
+    roomItems[0].querySelector(".room-note").textContent === "新手局，慢慢玩",
+    roomItems[0].textContent);
+  check("房间条目带房主 / 人数 / 阶段 / 房间码",
+    tagsOf(roomItems[0]).indexOf("房主：老王") >= 0 && tagsOf(roomItems[0]).indexOf("2/4 人") >= 0 &&
+    tagsOf(roomItems[0]).indexOf("等待中") >= 0 && tagsOf(roomItems[0]).indexOf("房间码 WAIT01") >= 0,
+    tagsOf(roomItems[0]));
+  check("等待中的房间按钮是「进入」",
+    roomItems[0].querySelector(".room-join").textContent === "进入",
+    roomItems[0].querySelector(".room-join").textContent);
+  check("进行中且没满的房间按钮是「中途加入」",
+    roomItems[2].querySelector(".room-join").textContent === "中途加入",
+    roomItems[2].querySelector(".room-join").textContent);
+  check("设了密码的房间被标出来", tagsOf(roomItems[1]).indexOf("需密码") >= 0, tagsOf(roomItems[1]));
+  check("满员的房间按钮置灰并写「已满」",
+    roomItems[3].querySelector(".room-join").disabled === true &&
+    roomItems[3].querySelector(".room-join").textContent === "已满",
+    roomItems[3].querySelector(".room-join").textContent);
+  check("房间计数跟着列表走", $("lobby-count").textContent === "4", $("lobby-count").textContent);
+  check("有房间时不显示空态", $("lobby-empty").classList.contains("hidden"), $("lobby-empty").className);
+  check("大厅顶栏显示活动剧本",
+    ($("lobby-active").textContent || "").indexOf("古堡秘宝") >= 0, $("lobby-active").textContent);
+
+  // 剧本下拉与人数提示（建房表单）：由 /api/scripts 的 players 段算出来
+  for (let i = 0; i < 40 && $("create-script").options.length === 0; i++) {
+    await sleep(50);
+  }
+  check("建房表单的剧本下拉已被填充", $("create-script").options.length >= 1,
+    String($("create-script").options.length));
+  check("人数提示写出剧本建议的区间",
+    /建议\s*\d+–\d+\s*人/.test($("create-players-hint").textContent || ""),
+    $("create-players-hint").textContent);
+  check("人数上限初值落在剧本声明的区间内",
+    Number($("create-max").value) >= Number($("create-max").min) &&
+    Number($("create-max").value) <= Number($("create-max").max),
+    $("create-max").value + " ∈ [" + $("create-max").min + ", " + $("create-max").max + "]");
+
+  // ---- 私密房：没填密码时只提示、不发连接 ----
+  const beforeWs = FakeWS.last;
+  sent.length = 0;
+  roomItems[1].querySelector(".room-join").click();
+  await sleep(30);
+  check("点有密码的房间但没填密码 ⇒ 只提示、不建连接",
+    FakeWS.last === beforeWs && sent.length === 0, JSON.stringify(sent));
+  check("提示里点名是哪间房", ($("lobby-msg").textContent || "").indexOf("蛇王墓的局") >= 0,
+    $("lobby-msg").textContent);
+  $("lobby-pass").value = "pw";
+  roomItems[1].querySelector(".room-join").click();
+  await sleep(30);
+  check("填了密码后点进入就建连接", FakeWS.last !== beforeWs);
+  check("join 消息带上所选房间码",
+    sent.some((m) => m.type === "join" && m.room === "LOCK03"), JSON.stringify(sent));
+  check("join 消息带上密码",
+    sent.some((m) => m.type === "join" && m.password === "pw"), JSON.stringify(sent));
+  check("加入别人的房间时不带建房参数",
+    !sent.some((m) => m.type === "join" && m.create), JSON.stringify(sent));
+  check("加入别人的房间时不带剧本（剧本由房主定）",
+    !sent.some((m) => m.type === "join" && m.script), JSON.stringify(sent));
+
+  // ---- 建房：走的是同一条连接，区别只在 join 里带 create ----
+  $("lobby-back").click();
+  check("「改名字」退回加入页", !$("join-screen").classList.contains("hidden"), $("join-screen").className);
+  $("join-form").dispatchEvent(new w.Event("submit", { bubbles: true, cancelable: true }));
+  await sleep(30);
+  sent.length = 0;
+  $("create-name").value = "今晚八点蛇王墓";
+  $("create-note").value = "新手局，慢慢玩";
+  $("create-visibility").value = "private";
+  $("create-password").value = "pw123";
+  $("create-form").dispatchEvent(new w.Event("submit", { bubbles: true, cancelable: true }));
+  await sleep(30);
+  const build = sent.find((m) => m.type === "join" && m.create);
+  check("建房时 join 里带上 create（与加入走同一条路）", !!build, JSON.stringify(sent));
+  check("create 带上房名 / 备注（trim 过）",
+    !!build && build.create.name === "今晚八点蛇王墓" && build.create.note === "新手局，慢慢玩",
+    JSON.stringify(build && build.create));
+  check("create 带上人数上限（界面上的值）",
+    !!build && String(build.create.max_players) === $("create-max").value, JSON.stringify(build && build.create));
+  check("create 带上可见性与密码",
+    !!build && build.create.visibility === "private" && build.create.password === "pw123",
+    JSON.stringify(build && build.create));
+  check("create 带上所选剧本",
+    !!build && !!build.create.script, JSON.stringify(build && build.create));
+  check("建房时房间码留空（由服务端发号）", !!build && build.room === "", JSON.stringify(build));
+
+  // ---- 连入房间 ----
   await sleep(30); // 等 onopen 回调
   const ws = FakeWS.last;
-  check("提交加入后建立了 WebSocket", !!ws, "无 ws");
-  check("onopen 后发出 join 消息", sent.some((m) => m.type === "join" && m.name === "亚瑟"), JSON.stringify(sent));
-  check(
-    "建房时 join 消息带上所选剧本",
-    !!pickedScript && sent.some((m) => m.type === "join" && m.script === pickedScript),
-    JSON.stringify(sent)
-  );
+  check("提交后建立了 WebSocket", !!ws, "无 ws");
+  check("进游戏屏（等待室盖在上面，进来立刻有反馈）",
+    !$("game-screen").classList.contains("hidden"), $("game-screen").className);
+
+  const roomSnapshot = (extra) => Object.assign({
+    code: "ABC12", name: "今晚八点蛇王墓", note: "新手局，慢慢玩", script: "古堡秘宝",
+    owner: "亚瑟", online: 2, max_players: 4, phase: "waiting", phase_label: "等待中",
+    visibility: "private", has_password: true, created_at: 0,
+  }, extra || {});
 
   ws.deliver({
     type: "welcome",
@@ -157,6 +275,7 @@ function startFakeLLM() {
     you: "亚瑟",
     late: false,
     script: "古堡秘宝",
+    room_info: roomSnapshot(),
     script_info: {
       title: "古堡秘宝",
       path: "sample_script.json",
@@ -186,6 +305,158 @@ function startFakeLLM() {
   check("welcome 后顶栏显示房间码", $("room-code").textContent === "ABC12", $("room-code").textContent);
   check("welcome 后品牌名跟随剧本", (q(".brand-name") || {}).textContent === "RPGBar · 古堡秘宝", (q(".brand-name") || {}).textContent);
   check("一个模型都没接时胶囊显示未接入", $("model-pill").textContent === "模型：未接入", $("model-pill").textContent);
+
+  // ---- 等待室：开局前盖在游戏画面上，房主才看得到操作区 ----
+  check("等待阶段显示等待室", !$("waiting-room").classList.contains("hidden"), $("waiting-room").className);
+  check("等待室显示房名 / 房间码 / 剧本",
+    $("wait-title").textContent === "今晚八点蛇王墓" && $("wait-code").textContent === "ABC12" &&
+    $("wait-script").textContent === "古堡秘宝",
+    [$("wait-title").textContent, $("wait-code").textContent, $("wait-script").textContent].join(" / "));
+  check("等待室显示人数 x/y 与房主",
+    $("wait-count").textContent === "2/4" && $("wait-owner").textContent === "亚瑟",
+    $("wait-count").textContent + " / " + $("wait-owner").textContent);
+  check("等待室标出可见性与有没有进房密码",
+    $("wait-vis").textContent === "私密" && $("wait-pass").textContent === "有",
+    $("wait-vis").textContent + " / " + $("wait-pass").textContent);
+  check("等待室显示备注", $("wait-note").textContent === "新手局，慢慢玩", $("wait-note").textContent);
+  check("顶栏也能看到房名与人数",
+    $("room-name").textContent === "今晚八点蛇王墓" && $("room-players").textContent === "2/4",
+    $("room-name").textContent + " / " + $("room-players").textContent);
+  check("等待阶段先把场景胶囊收起来（没剧情可显示）",
+    $("scene-title").parentNode.classList.contains("hidden"), $("scene-title").parentNode.className);
+  check("我是房主 ⇒ 房主操作区可见", !$("wait-host").classList.contains("hidden"), $("wait-host").className);
+  check("房主看到的提示是「点开始游戏」",
+    ($("wait-hint").textContent || "").indexOf("开始游戏") >= 0, $("wait-hint").textContent);
+
+  // 队伍列表：房主对别人有「请出 / 设为房主」两个动作
+  // ⚠️ 快照要按服务端真实形状给（npcs / memory 一起带）——`renderState` 会**无条件**
+  // 用 state.npcs / state.memory 重画侧栏，少给两个键就等于把 welcome 里那份清成空。
+  ws.deliver({
+    type: "state",
+    state: {
+      players: [
+        { name: "亚瑟", character: { cls: "战士" } },
+        { name: "梅林", character: { cls: "法师" } },
+      ],
+      current_scene: "gate", scene_title: "古堡大门", location: "大门",
+      flags: [], flag_details: [], inventory: [], hp: {},
+      npcs: [
+        { id: "npc01", name: "老周", role: "古堡看守", aliases: ["周老头"], from_script: true },
+      ],
+      memory: { entries: 7, actors: 2, has_summary: true, embedding: true },
+    },
+  });
+  const waitRows = w.document.querySelectorAll("#wait-players li");
+  check("等待室列出队伍", waitRows.length === 2, String(waitRows.length));
+  check("队伍按名字+职业显示",
+    waitRows.length === 2 && waitRows[1].textContent.indexOf("梅林") >= 0 && waitRows[1].textContent.indexOf("法师") >= 0,
+    waitRows.length ? waitRows[1].textContent : "无");
+  check("房主那一行带「房主」标记",
+    waitRows.length === 2 && !!waitRows[0].querySelector(".host-flag"), waitRows.length ? waitRows[0].textContent : "无");
+  const hostBtns = waitRows.length === 2 ? waitRows[1].querySelectorAll("button") : [];
+  check("房主对别人有「请出 / 设为房主」两个动作",
+    hostBtns.length === 2 && hostBtns[0].textContent === "请出" && hostBtns[1].textContent === "设为房主",
+    Array.from(hostBtns).map((b) => b.textContent).join(" | "));
+  sent.length = 0;
+  if (hostBtns.length === 2) hostBtns[1].click();
+  check("点「设为房主」发出 transfer 消息",
+    sent.some((m) => m.type === "transfer" && m.target === "梅林"), JSON.stringify(sent));
+  sent.length = 0;
+  if (hostBtns.length === 2) hostBtns[0].click();
+  check("点「请出」发出 kick 消息",
+    sent.some((m) => m.type === "kick" && m.target === "梅林"), JSON.stringify(sent));
+
+  // ---- 房主控制条：改设置 / 开始 / 解散（两步）----
+  sent.length = 0;
+  $("set-note").value = "改成新手友好";
+  $("set-max").value = "3";
+  $("set-visibility").value = "public";
+  $("set-password").value = "newpw";
+  $("set-save").click();
+  await sleep(20);
+  const setMsg = sent.find((m) => m.type === "room_settings");
+  check("点「保存设置」发出 room_settings", !!setMsg, JSON.stringify(sent));
+  check("room_settings 带上改后的备注/上限/可见性",
+    !!setMsg && setMsg.note === "改成新手友好" && String(setMsg.max_players) === "3" &&
+    setMsg.visibility === "public",
+    JSON.stringify(setMsg));
+  check("填了新密码就带上新密码（不填 = 不改）",
+    !!setMsg && setMsg.password === "newpw" && !setMsg.clear_password, JSON.stringify(setMsg));
+  check("保存后清空密码框（免得留着一串看着像已生效）",
+    $("set-password").value === "", $("set-password").value);
+  sent.length = 0;
+  $("set-clear-password").checked = true;
+  $("set-save").click();
+  await sleep(20);
+  const clearMsg = sent.find((m) => m.type === "room_settings");
+  check("勾了「清除密码」就发 clear_password、不发 password",
+    !!clearMsg && clearMsg.clear_password === true && !clearMsg.password, JSON.stringify(clearMsg));
+  $("set-clear-password").checked = false;
+
+  sent.length = 0;
+  $("wait-start").click();
+  check("点「开始游戏」发出 start 消息", sent.some((m) => m.type === "start"), JSON.stringify(sent));
+
+  sent.length = 0;
+  $("wait-close").click();
+  check("解散要先点两次（第一次变成「确认解散」）",
+    sent.length === 0 && $("wait-close").textContent.indexOf("确认解散") >= 0,
+    $("wait-close").textContent + " / " + JSON.stringify(sent));
+  $("wait-close").click();
+  check("第二次点才真的发出 close_room",
+    sent.some((m) => m.type === "close_room"), JSON.stringify(sent));
+
+  // ---- 阶段翻转：等待室收起 ----
+  ws.deliver({ type: "room", room: roomSnapshot({ phase: "playing", phase_label: "进行中" }) });
+  check("进入进行中后等待室收起", $("waiting-room").classList.contains("hidden"), $("waiting-room").className);
+  check("场景胶囊重新出现", !$("scene-title").parentNode.classList.contains("hidden"),
+    $("scene-title").parentNode.className);
+  ws.deliver({ type: "room", room: roomSnapshot() });
+  check("回到等待阶段等待室又盖上（房主能退回等待室等人）",
+    !$("waiting-room").classList.contains("hidden"), $("waiting-room").className);
+  ws.deliver({ type: "room", room: roomSnapshot({ phase: "playing", phase_label: "进行中" }) });
+
+  // ---- 不是房主：操作区收起来，队伍里不再有别人 ----
+  ws.deliver({
+    type: "room_sync",
+    agents: {
+      owner: "老王",
+      dm: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "off" },
+      assistant: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "off" },
+      advisor: { kind: "off", base_url: "", model: "", has_api_key: false, ready: false, mode: "off" },
+    },
+    script_info: { title: "古堡秘宝", path: "sample_script.json", fmt: "json", structured: true, scenes: 5, flags: 5, chunks: 6, warnings: [] },
+    chunks: [],
+    prompt: { advisor: "（公开版）", dm: null },
+  });
+  ws.deliver({ type: "room", room: roomSnapshot({ owner: "老王" }) });
+  check("房主换人后房主操作区收起", $("wait-host").classList.contains("hidden"), $("wait-host").className);
+  check("非房主看到的提示是「等房主开始」",
+    ($("wait-hint").textContent || "").indexOf("等房主") >= 0, $("wait-hint").textContent);
+  const rowsAsGuest = w.document.querySelectorAll("#wait-players li");
+  check("非房主的队伍行里没有「请出 / 设为房主」",
+    Array.from(rowsAsGuest).every((r) => r.querySelectorAll("button").length === 0),
+    Array.from(rowsAsGuest).map((r) => r.textContent).join(" | "));
+
+  // 复位成「我是房主」的等待中状态，后面的设置抽屉用例按房主身份跑
+  ws.deliver({
+    type: "room_sync",
+    agents: {
+      owner: "亚瑟",
+      dm: { kind: "off", base_url: "https://api.deepseek.com/v1", model: "deepseek-chat", has_api_key: false, ready: false, mode: "off" },
+      assistant: { kind: "off", base_url: "http://127.0.0.1:8081/v1", model: "qwen2.5-3b-instruct", has_api_key: false, ready: false, mode: "off" },
+      advisor: { kind: "off", base_url: "http://127.0.0.1:8080/v1", model: "local-model", has_api_key: false, ready: false, mode: "off" },
+    },
+    script_info: { title: "古堡秘宝", path: "sample_script.json", fmt: "json", structured: true, scenes: 5, flags: 5, chunks: 6, warnings: [] },
+    chunks: [
+      { id: "meta", title: "剧本设定", kind: "meta", chars: 120 },
+      { id: "gate", title: "古堡大门", kind: "scene", chars: 220 },
+    ],
+    prompt: { advisor: "（小助手公开版 prompt）", dm: "（DM 完整版 prompt）" },
+  });
+  ws.deliver({ type: "room", room: roomSnapshot({ phase: "playing", phase_label: "进行中" }) });
+  check("回到房主身份后操作区又能看见", !$("wait-host").classList.contains("hidden"), $("wait-host").className);
+
   // 「本房间」同步块：剧本 + 切片 + 两份 prompt（房主能看到 DM 那份）
   const syncEl = $("room-sync");
   check("welcome 后同步块显示剧本名", !!syncEl && (syncEl.textContent || "").indexOf("古堡秘宝") >= 0, syncEl ? syncEl.textContent : "无");

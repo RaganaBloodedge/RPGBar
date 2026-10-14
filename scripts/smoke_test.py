@@ -1010,6 +1010,22 @@ async def drain_pending(ws, budget=0.05, limit=80):
             break
 
 
+async def start_room(ws, timeout=6.0):
+    """房主点「开始游戏」：等待中 → 进行中。返回是否真的翻转了。
+
+    2026-10-14 起房间先是**等待中**（大厅 + 等待室），开局前行动会被阶段门挡下
+    （回 `not_started`）。所以凡是「加入后马上行动」的用例都得先走这一步 ——
+    不然测到的是「被挡住了」，而不是「行动生效了」。
+    """
+    await ws.send(json.dumps({"type": "start"}, ensure_ascii=False))
+    snap = await recv_until(
+        ws,
+        lambda m: m["type"] == "room" and (m.get("room") or {}).get("phase") == "playing",
+        timeout=timeout,
+    )
+    return bool(snap)
+
+
 async def run_live():
     print("== 实时联机校验（需服务器已启动） ==")
     try:
@@ -1036,11 +1052,26 @@ async def run_live():
         wb = await recv_until(b, lambda m: m["type"] == "welcome")
         check("双客户端拿到 welcome", wa and wb, f"{bool(wa)}/{bool(wb)}")
         check("welcome 带回剧本名", bool(wa) and bool(wa.get("script")), str(wa))
+        check(
+            "联机：刚建的房间是等待中（等房主开始，开局前不能行动）",
+            ((wa or {}).get("room_info") or {}).get("phase") == "waiting",
+            str((wa or {}).get("room_info")),
+        )
+        check("联机：房主点「开始游戏」后进入进行中", await start_room(a))
+        await drain_pending(a)
+        await drain_pending(b)
 
         # 亚瑟推进场景（出口推进，无骰子，确定性）
         await a.send(json.dumps({"type": "action", "text": acts["move"]}, ensure_ascii=False))
         st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == acts["scene"])
-        check("联机：出口推进到下一场景", bool(st), f"未到达 {acts['scene']}")
+        # ⚠️ 断言里要**再判一次场景**：`recv_until` 在等不到匹配时会返回"最后一条读到的消息"，
+        # 只判 `bool(st)` 的话，只要收到过任何消息就算过 —— 实测正是这条把「行动被阶段门挡下、
+        # 场景压根没动」这种真故障掩盖成了 PASS。
+        check(
+            "联机：出口推进到下一场景",
+            bool(st) and (st.get("state") or {}).get("current_scene") == acts["scene"],
+            f"未到达 {acts['scene']}：{str(st)[:80]}",
+        )
 
         # 亚瑟触发检定（必有 dice 事件）
         await a.send(json.dumps({"type": "action", "text": acts["check"]}, ensure_ascii=False))
@@ -1138,17 +1169,27 @@ async def run_live_latejoin():
         wa = await recv_until(a, lambda m: m["type"] == "welcome")
         check("联机：首人加入 welcome.late=False", bool(wa) and wa.get("late") is False, str(wa))
 
+        # 先让房主开局：房间先是「等待中」，不点开始的话下面每一步行动都会被阶段门挡下，
+        # 而「中途加入」的判据也正是「此刻房间是不是进行中」—— 不开局就测不到补课。
+        check("联机：房主开局后房间转为进行中", await start_room(a))
+
         # 先到者推进剧情
         await a.send(json.dumps({"type": "action", "text": acts["move"]}, ensure_ascii=False))
         st = await recv_until(a, lambda m: m["type"] == "state" and m["state"]["current_scene"] == acts["scene"])
-        check("联机：先到者推进场景", bool(st), f"未到达 {acts['scene']}")
+        check(
+            "联机：先到者推进场景",
+            bool(st) and (st.get("state") or {}).get("current_scene") == acts["scene"],
+            f"未到达 {acts['scene']}：{str(st)[:80]}",
+        )
         await a.send(json.dumps({"type": "action", "text": acts["check"]}, ensure_ascii=False))
         await recv_until(a, lambda m: m["type"] == "dice")
 
         # 新玩家中途加入同一房间
         b = await websockets.connect(url, proxy=None)
         await b.send(json.dumps({"type": "join", "name": "迟到者", "room": room, "character": {"cls": "法师"}}, ensure_ascii=False))
-        b_msgs = await collect(b, 6)
+        # 8 条：welcome / system / thinking(true) / narration / thinking(false) / recap / room / state —
+        # 取 6 条会看不到 room 与 state（那条 state 断言就会退化成"空也过"）。
+        b_msgs = await collect(b, 8)
         types = [m["type"] for m in b_msgs]
 
         wb = next((m for m in b_msgs if m["type"] == "welcome"), None)
@@ -1165,7 +1206,10 @@ async def run_live_latejoin():
         fd = st_state.get("flag_details", [])
         check(
             "联机：状态快照带线索中文描述",
-            isinstance(fd, list)
+            # 先要求 state 真的到了：只判 `fd` 的话，收不到 state 时 fd 也是空列表、
+            # 而 `all(空)` 为真 —— 一条本该验"线索描述"的断言会变成"空也过"。
+            bool(st_msg)
+            and isinstance(fd, list)
             and len(fd) == len(st_state.get("flags", []))
             and all(d.get("label") for d in fd),
             f"flags={st_state.get('flags')} details={str(fd)[:80]}",
@@ -1179,6 +1223,9 @@ async def run_live_latejoin():
         )
 
         # 老玩家也应看到「中场加入」广播与同一段旁白
+        # 先清掉上一步 `check` 行动没被读完的尾巴（narration / thinking(false) / state / room），
+        # 否则下面的 `collect(a, 6)` 会把它们当成"新消息"数进去，断言就是撞运气。
+        await drain_pending(a)
         a_msgs = await collect(a, 6)
         check(
             "联机：老玩家收到中场加入广播",
@@ -1464,6 +1511,11 @@ async def run_live_npc():
               bool(npcs) and all(n.get("name") for n in npcs), str(npcs)[:140])
         check("NPC 实时：NPC 卡带身份", any(n.get("role") for n in npcs), str(npcs)[:140])
 
+        # 房间先是「等待中」，得先让房主开局，否则下面的互动会被阶段门挡下、
+        # 拿到的只有一条 `not_started`（看着像"NPC 互动没产出旁白"）。
+        check("NPC 实时：房主开局后房间转为进行中", await start_room(a))
+        await drain_pending(a)
+
         # 互动对象取本房间第一张人物卡（同样不写死名字）。
         npc_name = npcs[0]["name"] if npcs else "路人"
         await a.send(json.dumps({"type": "action", "text": f"我盯着{npc_name}看"}, ensure_ascii=False))
@@ -1509,6 +1561,10 @@ async def run_live_chronicle():
         wa = await recv_until(a, lambda m: m["type"] == "welcome")
         mem = (wa or {}).get("memory") or {}
         check("档案实时：version/欢迎包带档案状态", isinstance(mem, dict) and "entries" in mem, str(mem)[:140])
+
+        # 同样要先开局：等待阶段行动被挡，档案条目自然一条都不涨。
+        check("档案实时：房主开局后房间转为进行中", await start_room(a))
+        await drain_pending(a)
 
         await a.send(json.dumps({"type": "action", "text": "我打量四周并记下来"}, ensure_ascii=False))
         got, deadline = [], time.time() + 10
@@ -1929,6 +1985,558 @@ async def run_unit_engine():
           "seed" not in json.dumps(leaked, ensure_ascii=False), json.dumps(leaked, ensure_ascii=False))
 
 
+# ==================== 大厅 / 房间 ====================
+# 为什么单开一节：大厅是**协议之外**唯一会改房间生命周期的东西（建房 / 开局 /
+# 踢人 / 转让 / 解散），而它每一步都动 `rooms` 这个全局字典 —— 用假连接在进程内
+# 走一遍，比在真服务器上二分快得多，也才能把「最后一人走了要不要销毁」这种
+# 边界钉死。
+
+
+class _FakeWS:
+    """假连接：只记账。`Room` 只用到 `send_text` / `close` 两个方法。"""
+
+    def __init__(self, label=""):
+        self.label = label
+        self.sent = []
+        self.closed = False
+
+    async def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+    async def close(self, code=1000, reason=""):
+        self.closed = True
+
+    def types(self):
+        return [m.get("type") for m in self.sent]
+
+    def last(self):
+        return self.sent[-1] if self.sent else {}
+
+    def texts(self):
+        return " ".join(str(m.get("text") or "") for m in self.sent)
+
+    def clear(self):
+        self.sent = []
+
+
+async def run_unit_lobby():
+    print("== 大厅 / 房间（进程内） ==")
+    from server import main as M
+    from server.lobby import (
+        DEFAULT_MAX_PLAYERS,
+        MAX_NOTE,
+        MAX_ROOM_NAME,
+        VIS_PRIVATE,
+        VIS_PUBLIC,
+        build_public,
+        clean_create,
+        clean_settings,
+        password_ok,
+    )
+    from server.script_loader import (
+        DEFAULT_PLAYERS,
+        MAX_PLAYERS_LIMIT,
+        normalize_players,
+        parse_script,
+    )
+
+    # ---- 1. 剧本声明的人数：`players` 是**可选**段 ----
+    # 「没写」和「写坏」要区别对待：没写是正常情况（不能告警），写坏才告警 + 夹住。
+    cases = [
+        (None, dict(DEFAULT_PLAYERS), 0, "没写这个段 = 用缺省且不告警"),
+        ("", dict(DEFAULT_PLAYERS), 0, "空字符串按没写处理"),
+        (6, {"min": 1, "max": 6, "recommended": 6}, 1, "简写整数 = 只声明上限"),
+        ("3", {"min": 1, "max": 3, "recommended": 3}, 1, "简写数字串也认"),
+        ({"min": 2, "max": 5, "recommended": 4}, {"min": 2, "max": 5, "recommended": 4}, 0, "完整写法"),
+        ({"min": 5, "max": 2}, {"min": 2, "max": 5, "recommended": 5}, 1, "区间写反了对调"),
+        ({"min": 2, "max": 99}, {"min": 2, "max": MAX_PLAYERS_LIMIT, "recommended": MAX_PLAYERS_LIMIT}, 1, "超硬上限夹住"),
+        ({"min": 2, "max": 4, "recommended": 9}, {"min": 2, "max": 4, "recommended": 4}, 1, "recommended 出区间夹回来"),
+        ([1, 2], dict(DEFAULT_PLAYERS), 1, "类型不对告警并退回缺省"),
+        ("abc", dict(DEFAULT_PLAYERS), 1, "认不出来告警并退回缺省"),
+        (True, dict(DEFAULT_PLAYERS), 1, "布尔不是数字"),
+    ]
+    for raw, want, want_warn, label in cases:
+        got, warns = normalize_players(raw)
+        check(
+            f"剧本 players：{label}",
+            got == want and len(warns) == want_warn,
+            f"got={got} warns={warns}",
+        )
+
+    doc = parse_script(SCRIPT.read_text(encoding="utf-8"), source=str(SCRIPT), name="古堡秘宝")
+    check(
+        "自带剧本 sample_script 声明了 players",
+        doc.players.get("min") == 2 and doc.players.get("max") == 4,
+        str(doc.players),
+    )
+    tdoc = parse_script(TOTSK.read_text(encoding="utf-8"), source=str(TOTSK), name="蛇王墓")
+    check("自带剧本 totsk_l1 声明了 players", tdoc.players.get("max") == 5, str(tdoc.players))
+    check("players 进了 to_dict（接口/前端拿得到）", doc.players == doc.to_dict()["players"],
+          str(doc.to_dict().get("players")))
+
+    # ---- 2. lobby 的纯逻辑（建房清洗 / 改设置补丁 / 密码校验 / 对外投影）----
+    sp = {"min": 2, "max": 4, "recommended": 4}
+
+    params, err = clean_create({}, sp)
+    check("建房：空参数用剧本的 recommended", params["max_players"] == 4 and err is None, str(params))
+    check("建房：下限取剧本的 min", params["min_players"] == 2, str(params["min_players"]))
+    check("建房：缺省是公开房", params["visibility"] == VIS_PUBLIC, str(params["visibility"]))
+
+    params, _ = clean_create(
+        {"name": "  大厅  冒烟  ", "max_players": "3", "visibility": "private", "password": "p" * 99}, sp
+    )
+    check("建房：名字折叠内部空白", params["name"] == "大厅 冒烟", params["name"])
+    check("建房：数字串上限被认成 int", params["max_players"] == 3, str(params["max_players"]))
+    check("建房：私密房被认下来", params["visibility"] == VIS_PRIVATE, str(params["visibility"]))
+    check("建房：密码截到 32 字符", len(params["password"]) == 32, str(len(params["password"])))
+
+    params, _ = clean_create(
+        {"name": "x" * 99, "note": "y" * 200, "visibility": "secret", "max_players": True,
+         "script": 123}, sp
+    )
+    check("建房：房名截到 24 字符", len(params["name"]) == MAX_ROOM_NAME, str(len(params["name"])))
+    check("建房：备注截到 80 字符", len(params["note"]) == MAX_NOTE, str(len(params["note"])))
+    check("建房：乱写的可见性退回公开", params["visibility"] == VIS_PUBLIC, str(params["visibility"]))
+    check("建房：上限给了布尔 = 给不出数字，用默认", params["max_players"] == 4, str(params["max_players"]))
+    check("建房：非字符串剧本名被丢掉", params["script"] == "", repr(params["script"]))
+
+    check("建房：上限被夹到剧本上限", clean_create({"max_players": 99}, sp)[0]["max_players"] == 4, "")
+    check("建房：低于剧本下限被抬到下限", clean_create({"max_players": 1}, sp)[0]["max_players"] == 2, "")
+    params, _ = clean_create(None)
+    check(
+        "建房：payload 整个为 None 也给出一套完整值",
+        params["max_players"] == DEFAULT_MAX_PLAYERS and params["min_players"] >= 1,
+        str(params),
+    )
+
+    cur = {"min_players": 2}
+    check("改设置：只带上提到的字段", clean_settings({"note": "hi"}, cur, sp) == {"note": "hi"}, "")
+    check(
+        "改设置：改备注**不会**顺手清掉密码",
+        "password" not in clean_settings({"note": "hi"}, cur, sp),
+        str(clean_settings({"note": "hi"}, cur, sp)),
+    )
+    check("改设置：空密码 = 显式清空", clean_settings({"password": ""}, cur, sp).get("password") == "", "")
+    check("改设置：clear_password 也清空", clean_settings({"clear_password": True}, cur, sp).get("password") == "", "")
+    patch = clean_settings({"visibility": "nope", "max_players": 99}, cur, sp)
+    check("改设置：非法可见性忽略，上限仍被夹", "visibility" not in patch and patch.get("max_players") == 4, str(patch))
+    check("改设置：非字典补丁不炸", clean_settings("不是字典", cur, sp) == {}, "")
+    check("改设置：空补丁 = 空 patch", clean_settings({}, cur, sp) == {}, "")
+
+    check("密码：没设密码恒通过（不填、乱填都行）", password_ok("", None) and password_ok("", "随便"), "")
+    check("密码：精确匹配才放行（大小写敏感）", password_ok("pw", "pw") and not password_ok("pw", "PW"), "")
+    check("密码：没填 / 非字符串一律不放行", not password_ok("pw", None) and not password_ok("pw", 123), "")
+
+    pub = build_public(
+        code="A1", name="", note="", script_title="古堡秘宝", owner="甲", online=2,
+        max_players=4, phase="waiting", visibility=VIS_PRIVATE, has_password=True, created_at=0,
+    )
+    check("列表项：房名缺省用剧本名", pub["name"] == "古堡秘宝", pub["name"])
+    check("列表项：只有 has_password，没有密码本体",
+          pub["has_password"] is True and "password" not in pub, str(sorted(pub)))
+    check("列表项：带中文阶段标签（界面直接用）", pub["phase_label"] == "等待中", pub["phase_label"])
+
+    # ---- 3. 假 WebSocket 驱动**真实**的 Room ----
+    saved_rooms = dict(M.rooms)
+    saved_chronicle = M.CHRONICLE_ENABLED
+    M.rooms.clear()
+    # 剧情档案会往 data/ 里写 jsonl。进程内用例不需要它，关掉 —— 免得每次跑测试
+    # 都在用户的数据目录里堆一份 chronicle-*.jsonl。
+    M.CHRONICLE_ENABLED = False
+    try:
+        room = M.Room(
+            "ABC12", script_store=ScriptStore(SCRIPT),
+            create={"name": "测试房", "note": "备注", "max_players": 2,
+                    "visibility": VIS_PUBLIC, "password": "pw"},
+        )
+        M.rooms["ABC12"] = room
+        a, b = _FakeWS("甲"), _FakeWS("乙")
+
+        info = room.lobby_info()
+        check("房间：房名来自建房参数", info["name"] == "测试房", info["name"])
+        check("房间：备注落到房间", info["note"] == "备注")
+        check("房间：容量来自建房参数（可覆盖剧本）", info["max_players"] == 2, str(info["max_players"]))
+        check("房间：初始是等待阶段", info["phase"] == "waiting", info["phase"])
+        check("房间：快照里没有密码本体",
+              info["has_password"] is True and "password" not in info, str(sorted(info)))
+
+        check("房间：密码错被拒", (room.join_denied("甲", "bad") or {}).get("code") == "password")
+        check("房间：密码对放行", room.join_denied("甲", "pw") is None)
+
+        await room.on_join("甲", {}, a)
+        check("房间：首位加入者成为房主", room.owner == "甲", str(room.owner))
+        check("房间：连入即拿到房间快照", "room" in a.types(), str(a.types()))
+        await room.on_join("乙", {}, b)
+        check("房间：在线人数 = 2", room.lobby_info()["online"] == 2, str(room.lobby_info()["online"]))
+        check("房间：满员后新面孔被拒", (room.join_denied("丙", "pw") or {}).get("code") == "full")
+        # 容量只拦新面孔：否则满员的房间会把掉线重连的人永久关在外面
+        check("房间：满员时老面孔（断线重连/换标签页）照旧放行", room.join_denied("甲", "pw") is None)
+        check("房间：满员时先问密码、后问容量（不给容量当密码旁路）",
+              (room.join_denied("丙", "乱填") or {}).get("code") == "password", "")
+
+        # ---- 等待阶段的行动门控：既没开局也没剧情，放行只会让 DM 去猜 ----
+        a.clear()
+        check("等待阶段：action 不放行", await room.require_playing(a) is False)
+        check("等待阶段：回的是 not_started", a.last().get("type") == "not_started", str(a.last()))
+
+        b.clear()
+        await room.on_start("乙", b)
+        check("开始：非房主被拒", b.last().get("type") == "error", str(b.last()))
+        check("开始：阶段没被改动", room.phase == "waiting", room.phase)
+
+        a.clear()
+        await room.on_start("甲", a)
+        check("开始：房主点完进入进行中", room.phase == "playing", room.phase)
+        check(
+            "开始：广播了房间快照且阶段已翻转",
+            any(m.get("type") == "room" and m.get("room", {}).get("phase") == "playing" for m in a.sent),
+            str(a.types()),
+        )
+        check("开始：广播了开局提示", "开始了这一局" in a.texts(), a.texts()[:80])
+        check("开始：广播了开场旁白（剧本的 public_text）", "narration" in a.types(), str(a.types()))
+        check("开始：广播了状态快照", "state" in a.types(), str(a.types()))
+        check("开始后：action 过阶段门", await room.require_playing(a) is True)
+        a.clear()
+        await room.on_start("甲", a)
+        check("开始：已经开局了再点要明确回绝",
+              a.last().get("type") == "error" and "已经开始" in a.last().get("message", ""), str(a.last()))
+
+        # ---- 房主改设置 ----
+        b.clear()
+        await room.on_room_settings("乙", {"note": "越权"}, b)
+        check("改设置：非房主被拒", b.last().get("type") == "error", str(b.last()))
+        check("改设置：备注没被动", room.note == "备注", room.note)
+
+        a.clear()
+        await room.on_room_settings("甲", {"note": "新备注", "max_players": 99}, a)
+        check("改设置：房主能改备注", room.note == "新备注", room.note)
+        check("改设置：上限被夹进剧本区间", room.max_players == 4, str(room.max_players))
+        check("改设置：广播了变更项", "房间设置" in a.texts(), a.texts()[:80])
+        check(
+            "改设置：快照跟着更新（列表/等待室不用自己算）",
+            any(m.get("type") == "room" and m.get("room", {}).get("note") == "新备注" for m in a.sent),
+            str(a.types()),
+        )
+        a.clear()
+        await room.on_room_settings("甲", {"note": "新备注"}, a)
+        check("改设置：原样提交要明确回一句「没有变化」",
+              a.last().get("type") == "error" and "没有变化" in a.last().get("message", ""), str(a.last()))
+
+        # ---- 转让：DM 的次级 prompt 只发房主，所以换人必须按人重发 ----
+        b.clear()
+        await room.on_transfer("甲", "乙", a)
+        check("转让：房主换人", room.owner == "乙", str(room.owner))
+        sync = [m for m in b.sent if m.get("type") == "room_sync"]
+        check("转让：新得的人收到 room_sync", bool(sync), str(b.types()))
+        check("转让：新房主拿到 DM 次级 prompt", bool(sync and (sync[0].get("prompt") or {}).get("dm")), "")
+        check(
+            "转让：快照里的房主也更新了",
+            any(m.get("type") == "room" and m.get("room", {}).get("owner") == "乙" for m in b.sent),
+            str(b.types()),
+        )
+        b.clear()
+        await room.on_transfer("乙", "乙", b)
+        check("转让：转给自己要被回绝", b.last().get("type") == "error", str(b.last()))
+        b.clear()
+        await room.on_transfer("乙", "查无此人", b)
+        check("转让：转给不在房里的人要被回绝", b.last().get("type") == "error", str(b.last()))
+        b.clear()
+        await room.on_transfer("甲", "乙", b)
+        check("转让：已经不是房主了就不能再转", b.last().get("type") == "error", str(b.last()))
+
+        # ---- 踢人：房主不能踢自己、踢不掉的人要说清楚、被踢的要留痕 ----
+        a.clear()
+        await room.on_kick("甲", "乙", a)
+        check("踢人：非房主被拒", a.last().get("type") == "error", str(a.last()))
+        check("踢人：没人被踢掉", len(room.clients) == 2, str(len(room.clients)))
+        b.clear()
+        await room.on_kick("乙", "乙", b)
+        check("踢人：房主不能请自己出去（提示去解散）",
+              b.last().get("type") == "error" and "解散" in b.last().get("message", ""), str(b.last()))
+        b.clear()
+        await room.on_kick("乙", "查无此人", b)
+        check("踢人：不在房里的人要被回绝", b.last().get("type") == "error", str(b.last()))
+
+        b.clear()
+        await room.on_kick("乙", "甲", b)
+        check("踢人：房主能请人走", [n for n, _ in room.clients] == ["乙"], str([n for n, _ in room.clients]))
+        check("踢人：被踢方收到 kicked", a.sent and a.sent[-1].get("type") == "kicked", str(a.sent[-1:]))
+        check("踢人：服务端自己把连接也断了（不靠客户端自觉）", a.closed is True)
+        check("踢人：被踢的人被登记（断开时不再广播「离开队伍」）", "甲" in room.ejected)
+        check("踢人：房间还在（人没走光就不销毁）", "ABC12" in M.rooms)
+
+        # ---- 解散 ----
+        room2 = M.Room("XYZ99", script_store=ScriptStore(SCRIPT), create={"name": "解散测试"})
+        M.rooms["XYZ99"] = room2
+        z = _FakeWS("丙")
+        await room2.on_join("丙", {}, z)
+        z.clear()
+        await room2.on_close_room("丙", z)
+        check("解散：房间被标记关闭", room2.closed is True)
+        check("解散：收到 room_closed", "room_closed" in z.types(), str(z.types()))
+        check("解散：连接被服务端断开", z.closed is True)
+        check("解散：已从大厅删掉", "XYZ99" not in M.rooms, str(list(M.rooms)))
+        check("解散：房主名单也清空（收尾时不会重复销毁）", z.sent and not room2.clients, str(room2.clients))
+
+        # ---- 缺省建房（房号不存在时的隐式建房也走这条）----
+        r3 = M.Room("DEF00")
+        check("缺省建房：人数用剧本的 recommended",
+              r3.max_players == M.store.players["recommended"], str(r3.max_players))
+        check("缺省建房：公开", r3.visibility == VIS_PUBLIC, r3.visibility)
+        check("缺省建房：房名缺省用剧本名", r3.name == M.store.title, r3.name)
+        M.rooms["DEF00"] = r3
+
+        # ---- 大厅列表：私密房不上榜 ----
+        M.rooms["PRV01"] = M.Room(
+            "PRV01", script_store=ScriptStore(SCRIPT),
+            create={"name": "私密房", "visibility": VIS_PRIVATE, "password": "pw"},
+        )
+        listed = await M.api_rooms()
+        codes = [r["code"] for r in listed["rooms"]]
+        check("大厅列表：公开房在榜上", "ABC12" in codes, str(codes))
+        check("大厅列表：私密房不在榜上（这是建私密房的全部意义）", "PRV01" not in codes, str(codes))
+        check("大厅列表：等待中的排在已开局的前面",
+              codes.index("DEF00") < codes.index("ABC12"), str(codes))
+        check("大厅列表：任何一项都不含密码本体",
+              all("password" not in r for r in listed["rooms"]), str(listed["rooms"][:1]))
+        check("大厅列表：带建房表单的缺省值（按活动剧本算）",
+              isinstance((listed.get("defaults") or {}).get("players"), dict), str(listed.get("defaults")))
+        check("大厅列表：带上当前活动剧本名", bool(listed.get("active_title")), str(listed.get("active_title")))
+
+        # ---- 进不去的人不该把房间搞脏 ----
+        # join_denied 只是"能不能进"的判断，这里顺带确认它**没有副作用**：
+        # 被拒的名字不该混进玩家表，也不该占容量。
+        check("被拒的请求不改房间状态",
+              "丙" not in room.state.players and room.lobby_info()["online"] == 1,
+              f"{list(room.state.players)} online={room.lobby_info()['online']}")
+    finally:
+        M.CHRONICLE_ENABLED = saved_chronicle
+        M.rooms.clear()
+        M.rooms.update(saved_rooms)
+
+
+async def _ws_closed(ws, timeout=5.0):
+    """等服务端把这条连接关掉。True = 确实被关了。
+
+    「服务端说了 kicked / join_denied / room_closed，但连接还开着」是个真出现过的
+    bug（一个不听话的客户端会永远停在游戏屏上，而且它已经不在 clients 里、再也收不到
+    任何广播），所以这里必须等**连接**真的断，而不是只等那条消息。
+    """
+    end = time.time() + timeout * _TIMEOUT_SCALE
+    while time.time() < end:
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=max(0.05, end - time.time()))
+        except asyncio.TimeoutError:
+            return False
+        except Exception:  # noqa: BLE001  ConnectionClosed* / 任何断开
+            return True
+    return False
+
+
+async def run_live_lobby():
+    print("== 实时大厅 / 房间校验（需服务器已启动） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过")
+        return
+    try:
+        import httpx
+    except ImportError:
+        httpx = None
+
+    base = http_base()
+    url = ws_url()
+    tag = str(int(time.time() * 1000) % 100000)
+    room, pvt, wrk = "LOB" + tag, "PVT" + tag, "WRK" + tag
+    opened = []
+
+    async def dial():
+        w = await websockets.connect(url, proxy=None)
+        opened.append(w)
+        return w
+
+    async def join(w, name, code, create=None, password=None):
+        msg = {"type": "join", "name": name, "room": code, "character": {"cls": "战士"}}
+        if create is not None:
+            msg["create"] = create
+        if password is not None:
+            msg["password"] = password
+        await w.send(json.dumps(msg, ensure_ascii=False))
+
+    async def rooms_of():
+        if httpx is None:
+            return None
+        try:
+            return httpx.get(base + "/api/rooms", timeout=8, trust_env=False).json()
+        except Exception:  # noqa: BLE001  服务器没起来后面本来就会 SKIP
+            return None
+
+    try:
+        try:
+            a = await dial()
+        except Exception as e:  # noqa: BLE001
+            print(f"  [SKIP] 无法连接服务器 {url}：{e}")
+            return
+
+        # ---- 建房（带元数据）----
+        await join(a, "房主甲", room,
+                   create={"name": "大厅冒烟房", "note": "自动测试", "max_players": 2,
+                           "visibility": "public"})
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        ri = (wa or {}).get("room_info") or {}
+        check("大厅：建房者拿到 welcome", bool(wa), str(wa)[:100])
+        check("大厅：welcome 带回房名与备注",
+              ri.get("name") == "大厅冒烟房" and ri.get("note") == "自动测试", str(ri)[:140])
+        check("大厅：人数上限来自建房参数（房主可覆盖剧本声明）",
+              ri.get("max_players") == 2, str(ri.get("max_players")))
+        check("大厅：初始阶段是等待中", ri.get("phase") == "waiting", str(ri.get("phase")))
+        check("大厅：房主是第一个进来的人", ri.get("owner") == "房主甲", str(ri.get("owner")))
+        check("大厅：快照不下发密码本体", "password" not in ri, str(sorted(ri)))
+
+        data = await rooms_of()
+        if data is None:
+            print("  [SKIP] 没有 httpx，跳过大厅列表校验")
+        else:
+            codes = [r["code"] for r in data.get("rooms", [])]
+            check("大厅列表：公开房间在榜上", room in codes, str(codes[:6]))
+            row = next((r for r in data["rooms"] if r["code"] == room), {})
+            check("大厅列表：带房主与当前人数",
+                  row.get("owner") == "房主甲" and row.get("online") == 1, str(row)[:160])
+            check("大厅列表：不下发密码本体", "password" not in row, str(sorted(row)))
+            check("大厅列表：缺省人数按当前活动剧本算",
+                  isinstance((data.get("defaults") or {}).get("players"), dict), str(data.get("defaults")))
+
+        # ---- 等待阶段的行动门控（进行中之后不再发真行动，见下面的说明）----
+        await a.send(json.dumps({"type": "action", "text": "随便动一下"}, ensure_ascii=False))
+        na = await recv_until(a, lambda m: m["type"] == "not_started")
+        check("大厅：等待阶段行动被挡（not_started）", bool(na), str(na)[:120])
+        await a.send(json.dumps({"type": "roll"}, ensure_ascii=False))
+        nr = await recv_until(a, lambda m: m["type"] in ("not_started", "dice"))
+        check("大厅：等待阶段掷骰也被挡", bool(nr) and nr["type"] == "not_started", str(nr)[:120])
+
+        # ---- 第二个人进来（等待阶段 = 一起等人齐，不是「中途加入」）----
+        b = await dial()
+        await join(b, "玩家乙", room)
+        wb = await recv_until(b, lambda m: m["type"] == "welcome")
+        check("大厅：第二人在等待阶段进来（late=False）",
+              bool(wb) and wb.get("late") is False, str(wb)[:120])
+        hint = await recv_until(
+            b, lambda m: m["type"] == "system" and "等待房主开始" in (m.get("text") or "")
+        )
+        check("大厅：等待室明说「在等人齐 + 开局前不能行动」（不是静默卡住）",
+              bool(hint), str(hint)[:120])
+        ra = await recv_until(a, lambda m: m["type"] == "room" and m["room"]["online"] == 2)
+        check("大厅：人数一变就重播快照（房里的人不用手动刷新）", bool(ra), str(ra)[:140])
+
+        # ---- 满员拒绝 ----
+        c = await dial()
+        await join(c, "玩家丙", room)
+        deny = await recv_until(c, lambda m: m["type"] == "join_denied", timeout=4)
+        check("大厅：满员被拒（code=full）", bool(deny) and deny.get("code") == "full", str(deny)[:140])
+        check("大厅：被拒后服务端关掉连接", await _ws_closed(c), "")
+
+        # ---- 开始（只有房主）----
+        await b.send(json.dumps({"type": "start"}, ensure_ascii=False))
+        eb = await recv_until(b, lambda m: m["type"] == "error")
+        check("大厅：非房主不能开始",
+              bool(eb) and "房主" in (eb.get("message") or ""), str(eb)[:140])
+
+        await a.send(json.dumps({"type": "start"}, ensure_ascii=False))
+        snap = await recv_until(b, lambda m: m["type"] == "room" and m["room"]["phase"] == "playing")
+        check("大厅：房主开始后阶段翻转（所有人都收到）", bool(snap), str(snap)[:160])
+        sy = await recv_until(b, lambda m: m["type"] == "system" and "开始了这一局" in (m.get("text") or ""))
+        check("大厅：开局广播了提示", bool(sy), str(sy)[:140])
+        # ⚠️ 这里**故意**不再发一条真 action 去验「开局后门控放行」：一次行动会让
+        # DM 推理几十秒到几分钟并占住房间锁，后面的踢人/解散全得跟着等。放行这件事
+        # 由进程内那节（require_playing == True）覆盖，这里只钉「阶段已翻转」。
+
+        # ---- 转让 ----
+        await a.send(json.dumps({"type": "transfer", "target": "玩家乙"}, ensure_ascii=False))
+        s1 = await recv_until(b, lambda m: m["type"] == "room_sync")
+        check("大厅：转让后新房主收到 room_sync", bool(s1), str(s1)[:100])
+        t1 = await recv_until(b, lambda m: m["type"] == "room" and m["room"]["owner"] == "玩家乙")
+        check("大厅：转让后快照里的房主换人", bool(t1), str(t1)[:160])
+
+        # ---- 踢人：被请的人连接必须真的断（不靠客户端自觉）----
+        await b.send(json.dumps({"type": "kick", "target": "房主甲"}, ensure_ascii=False))
+        ka = await recv_until(a, lambda m: m["type"] == "kicked", timeout=4)
+        check("大厅：房主能请人走", bool(ka) and ka.get("by") == "玩家乙", str(ka)[:140])
+        check("大厅：被请的人连接被服务端断掉", await _ws_closed(a), "")
+        kb = await recv_until(b, lambda m: m["type"] == "room" and m["room"]["online"] == 1)
+        check("大厅：踢完人数变 1（房间没被踢散）", bool(kb), str(kb)[:140])
+
+        # ---- 解散 ----
+        await b.send(json.dumps({"type": "close_room"}, ensure_ascii=False))
+        kc = await recv_until(b, lambda m: m["type"] == "room_closed", timeout=4)
+        check("大厅：房主能解散房间", bool(kc), str(kc)[:140])
+        data2 = await rooms_of()
+        if data2 is not None:
+            check("大厅：解散后从列表消失",
+                  room not in [r["code"] for r in data2.get("rooms", [])],
+                  str([r["code"] for r in data2.get("rooms", [])][:8]))
+
+        # ---- 私密房 + 密码 ----
+        p = await dial()
+        await join(p, "私密房主", pvt,
+                   create={"name": "私密冒烟房", "visibility": "private", "password": "s3cr3t",
+                           "max_players": 2})
+        wp = await recv_until(p, lambda m: m["type"] == "welcome")
+        rp = (wp or {}).get("room_info") or {}
+        check("私密房：只给 has_password，不给密码本体",
+              rp.get("has_password") is True and "password" not in rp, str(sorted(rp)))
+        check("私密房：可见性就是私密", rp.get("visibility") == "private", str(rp.get("visibility")))
+        data3 = await rooms_of()
+        if data3 is not None:
+            check("私密房：不进公开列表",
+                  pvt not in [r["code"] for r in data3.get("rooms", [])],
+                  str([r["code"] for r in data3.get("rooms", [])][:8]))
+
+        q = await dial()
+        await join(q, "想混进去的人", pvt, password="猜的")
+        dq = await recv_until(q, lambda m: m["type"] == "join_denied", timeout=4)
+        check("私密房：密码错被拒（code=password）",
+              bool(dq) and dq.get("code") == "password", str(dq)[:140])
+        check("私密房：被拒的连接也被关掉", await _ws_closed(q), "")
+
+        r = await dial()
+        await join(r, "知道密码的人", pvt, password="s3cr3t")
+        wr = await recv_until(r, lambda m: m["type"] == "welcome")
+        check("私密房：密码对就能进", bool(wr), str(wr)[:120])
+
+        await p.send(json.dumps({"type": "close_room"}, ensure_ascii=False))
+        cr = await recv_until(r, lambda m: m["type"] == "room_closed", timeout=4)
+        check("私密房：解散通知也发给非房主", bool(cr), str(cr)[:140])
+        check("私密房：非房主的连接被服务端断掉", await _ws_closed(r), "")
+
+        # ---- 房主掉线：房间按「有人连线就活着」留下，房主身份自动移交 ----
+        x = await dial()
+        await join(x, "会掉线的房主", wrk, create={"name": "掉线测试房", "max_players": 3})
+        y = await dial()
+        await join(y, "接班的人", wrk)
+        wx = await recv_until(x, lambda m: m["type"] == "welcome")
+        wy = await recv_until(y, lambda m: m["type"] == "welcome")
+        check("掉线：两个人都在房里", bool(wx) and bool(wy), f"{bool(wx)}/{bool(wy)}")
+        # 直接关连接 = 模拟掉线（不发 leave），走的是服务端收尾那条路
+        await x.close()
+        # ⚠️ 顺序必须按服务端**实际发出的次序**找：`recv_until` 会把找匹配之前读到的
+        # 消息丢掉，所以先找 room_sync 再找 room 快照 —— 反了就永远找不到前者
+        # （收尾那条路是：离开公告 → 移交公告 → room_sync + state → room 快照）。
+        tx = await recv_until(y, lambda m: m["type"] == "system" and "房主已自动移交" in (m.get("text") or ""),
+                              timeout=8)
+        check("掉线：房主掉线后自动移交给在场最早的玩家", bool(tx), str(tx)[:140])
+        ky = await recv_until(y, lambda m: m["type"] == "room_sync", timeout=6)
+        check("掉线：接手的人拿到 room_sync（DM 次级 prompt 跟着走）", bool(ky), str(ky)[:100])
+        hy = await recv_until(y, lambda m: m["type"] == "room" and m["room"]["owner"] == "接班的人")
+        check("掉线：快照里的房主跟着换", bool(hy), str(hy)[:160])
+    finally:
+        for w in opened:
+            try:
+                await w.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
@@ -1938,6 +2546,7 @@ async def main():
     await run_unit_npc()
     await run_unit_chronicle()
     await run_unit_scripts()
+    await run_unit_lobby()
     await run_unit_engine()
     if not unit_only:
         await run_live()
@@ -1947,6 +2556,7 @@ async def main():
         await run_live_model_test()
         await run_live_scripts()
         await run_live_room_script()
+        await run_live_lobby()
         await run_live_npc()
         await run_live_chronicle()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")

@@ -41,7 +41,7 @@ DEFAULTS = {
     # context 是每个会话的 KV Cache 容量。**默认 4096**：DM 的第一轮 prompt
     # （职责 + 剧本次级 prompt + 本轮上下文 + 十几个工具的 JSON Schema）实测就要
     # 2400+ token，2048 装不下 → 引擎报「序列超长」→ 那次生成直接失败。
-    # 代价（引擎自报实测）：KV Cache @2048≈448 MiB、@4096≈896 MiB / 会话。
+    # 代价（引擎自报实测）：KV Cache @4096 ≈ 448 MiB（1.7B）/ 576 MiB（4B）每会话。
     "engine": {
         "enabled": False,
         # 推理后端：cpu（默认，纯 CPU）/ gpu（CUDA 版）。

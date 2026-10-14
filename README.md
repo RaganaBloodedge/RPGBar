@@ -140,9 +140,9 @@ python scripts/sync_engine.py --lib ~/cuda-build/librpg_engine.so   # GPU 库直
     "lib": "",        // 留空 = 按 backend 自动找 models/rpg_engine[_cuda].dll
     "model": "",      // 留空 = 自动找 models/Qwen3-*.gguf
     "threads": 0,     // 0 = 引擎按 CPU 核数自己定（gpu 后端忽略它）
-    "context": 4096,  // 每个会话的 KV Cache 容量（@4096≈896 MiB/会话）；别调到 4096 以下
+    "context": 4096,  // 每个会话的 KV Cache 容量（@4096≈448 MiB（1.7B）/576 MiB（4B））；别调到 4096 以下
     "max_tokens": 768,
-    "think": false    // Qwen3 思考模式，默认关；打开 = 每轮 35-50 秒、质量略好（见下）
+    "think": false    // Qwen3 思考模式，默认关；打开 = 每次生成 35-50 秒、质量略好（见下）
   },
   "models": {
     "assistant": { "kind": "engine" },   // 主机小助手：跑在主机
@@ -210,8 +210,9 @@ tok/s，还会报出**三个**后端：你请求的、按文件名找到的那�
 （例外只有一处：请求 `gpu` 但只有 CPU 版产物 —— 那时**退回 CPU 版**而不是当没接，
 因为"能玩 + 说实话"优于"诚实但玩不了"。）
 
-> 代价要提前知道：Qwen3-1.7B 权重在只有 CPU 的机器上约 7–10 tok/s，DM 一轮 25–35 秒
-> （4B 更慢）。这是"全离线、不依赖任何外部服务"的固有代价，不是缺陷。
+> 代价要提前知道：纯 CPU 上 Qwen3-1.7B 约 10–14 tok/s、4B 约 7–10 tok/s；开着思考时
+> DM **每次生成** 25–35 秒（这个口径是一次引擎调用，不是玩家的一次行动 —— 换整轮口径见上）。
+> 这是"全离线、不依赖任何外部服务"的固有代价，不是缺陷。
 
 DeepSeek / 智谱 GLM / 通义 Qwen 均为 OpenAI 兼容接口，改 `base_url` + `model` 即可切换。
 llama.cpp 的 `llama-server`、Ollama、LM Studio 同样暴露 OpenAI 兼容的 `/v1/chat/completions`，
@@ -370,8 +371,8 @@ python scripts/smoke_test.py --unit # 仅进程内
 npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **471 项**（Python，含需要服务器的实时联机校验）+ **170 项**（前端 DOM，可选）。
-> ⚠️ 不带服务器跑 Python 冒烟只会打印 `360 通过 / 0 失败` —— 实时那部分打了 `[SKIP]`，
+当前 **476 项**（Python：离线 **357 项** + 实时联机校验 **119 项**）+ **170 项**（前端 DOM，可选）。
+> ⚠️ 不带服务器跑 Python 冒烟只会打印 `357 通过 / 0 失败` —— 实时那部分打了 `[SKIP]`，
 > 那是"一部分没跑"，不是"整套全过"。`ui_check.js` 默认打 `127.0.0.1:8000`，
 > 服务器在别的端口时用 `RPGBAR_BASE_URL` 指过去。
 实时联机校验会跟随服务器当前加载的剧本自动选用对应动作，换剧本不用改测试。

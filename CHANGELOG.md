@@ -144,7 +144,8 @@
 - **内置引擎 `context` 默认值 2048 → 4096**：DM 的第一轮 prompt（System 职责 + 剧本
   次级 prompt + 本轮上下文 + 十几个工具的 JSON Schema）实测就要 2400+ token，2048
   根本装不下 → 引擎报「序列超长」→ 那次生成**直接失败**（不再静默退化成脚本旁白）。
-  代价是每个会话的 KV Cache 约 448 → 896 MiB（引擎自报实测值）。
+  代价是每个会话的 KV Cache 从 @2048 的 224 / 288 MiB 涨到 @4096 的
+  **448 MiB（1.7B）/ 576 MiB（4B）**（引擎自报实测值）。
 - **两个后端靠文件名区分**：CPU 版仍是 `models/rpg_engine.dll`（与以前完全一致），
   CUDA 版是 `models/rpg_engine_cuda.dll` —— 由 `sync_engine.py` 同步时改名，**另一个
   仓库的构建产物名不动**（那边的"同一个 ABI"故事也就不用改）。`engine.lib` 写了

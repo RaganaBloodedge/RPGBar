@@ -1,19 +1,49 @@
 """FastAPI + WebSocket 多人房间服务。
 
+房间有**两个阶段**：等待中（`waiting`）→ 房主点「开始」→ 进行中（`playing`）。
+等待阶段不能行动（服务端回 `not_started`），所有人在「等待室」里等人齐；
+开始之后进来的人算**中途加入**，DM 会单独补一段带入旁白。
+房间「有人连线就活着」，最后一人离开即回收（`rooms.pop`）。
+
 协议（JSON 文本帧）：
   客户端 → 服务端：
-    {"type":"join","name":"...","character":{...},"room":"ABC12"(可空),"script":"...(可空，建房时选)"}
+    {"type":"join","name":"...","character":{...},"room":"ABC12"(可空),"password":"...(可空)",
+     "script":"...(可空，建房时选)",
+     "create":{"name":"房间名(可空，缺省用剧本名)","note":"备注","max_players":4,
+               "visibility":"public|private","password":"...","script":"totsk_l1.json"}}
+       # room 为空 = 建房（房间名/备注/人数/可见性/密码都在 create 里）；
+       # room 填了但那个房号还不存在 = 也建房（原有玩法：两人各填同一个房号就能碰头）；
+       # room 填了且存在 = 加入，可能被 join_denied（密码错 / 房间满）。
     {"type":"action","text":"..."}
     {"type":"suggest"}
     {"type":"roll"}
     {"type":"configure","dm":{...}(可空),"advisor":{...}(可空),"assistant":{...}(可空)}
        # 运行期接模型；dm / assistant 仅房主可改，advisor 每人管自己的
-       槽位字段：kind(off|cloud|local) + base_url + model + temperature + api_key(省略=保持原值)
+       槽位字段：kind(off|cloud|local|engine) + base_url + model + temperature + api_key(省略=保持原值)
+    {"type":"start"}                          # 仅房主：等待中 → 进行中
+    {"type":"room_settings","name":"...","note":"...","max_players":4,
+     "visibility":"public|private","password":"...(省略=保持原值)","clear_password":true(清空)}
+       # 仅房主：只改白名单字段，没出现的字段不动
+    {"type":"kick","target":"玩家名"}          # 仅房主
+    {"type":"transfer","target":"玩家名"}      # 仅房主：移交房主
+    {"type":"close_room"}                     # 仅房主：解散房间（所有人收到 room_closed）
+    {"type":"leave"}                          # 主动离开（走正常收尾，会广播「离开了队伍」）
   服务端 → 客户端：
     {"type":"welcome","room":"...","you":"...","late":bool,"script":"剧本名","agents":{...},
-      "script_info":{...},"chunks":[...],"npcs":[...],"memory":{...},
+      "room_info":{...},"script_info":{...},"chunks":[...],"npcs":[...],"memory":{...},
       "prompt":{"advisor":"...","dm":"...(仅房主)"}}  # 连入即同步（含本房间已有 NPC / 档案状态）
-    {"type":"agent_status","agents":{...},"changed":["dm","advisor","assistant"]}   # 响应 configure
+    {"type":"room","room":{...}}
+      # 房间快照：房间名 / 备注 / 剧本 / 房主 / 在线人数 / 人数上限 / 阶段 / 可见性 /
+      # 是否要密码 / 建房时间。人数、房主、设置、阶段任一变化都会重发一次。
+      # ⚠️ 绝不含密码本身（只有 has_password 这个布尔）。
+    {"type":"room_sync","agents":{...},"script_info":{...},"chunks":[...],"prompt":{...}}
+      # 按人重发「剧本 + 次级 prompt + 房主是谁」。**房主换人时会发一次** ——
+      # DM 的次级 prompt 只给房主，换了房主就得让新的拿到、旧的失去。
+    {"type":"not_started","message":"..."}   # 等待阶段收到了 action / suggest / roll
+    {"type":"join_denied","code":"full|password","message":"..."}  # 进不去，界面退回大厅
+    {"type":"kicked","by":"房主名","message":"..."}                 # 被房主请出去
+    {"type":"room_closed","by":"房主名","message":"..."}            # 房间被解散
+    {"type":"agent_status","agents":{...},"changed":["dm","advisor","assistant","engine"]}
     {"type":"system","text":"..."}
     {"type":"thinking","active":bool,"who":"dm|advisor","label":"..."}
       # 模型推理中（active=true）/ 结束（false）。引擎在 CPU 上跑一轮要几十秒到
@@ -35,8 +65,9 @@
 HTTP 接口：
     GET  /api/version          版本 / 当前剧本 / 三个 Agent 的接线状态 / 剧情档案与嵌入模型状态
     GET  /api/net              本机可被访问的地址（含虚拟网卡，供主机分享给朋友）
+    GET  /api/rooms            大厅：列出公开房间（私密房间不上列表）+ 建房表单的缺省值
     POST /api/models/test      探测一个模型槽位（含工具调用能力）
-    GET  /api/scripts          列出可用的剧本文件
+    GET  /api/scripts          列出可用的剧本文件（含各自声明的人数）
     POST /api/scripts/inspect  读取某个剧本 → 自动切片 → 返回次级 prompt（只看不改）
     POST /api/scripts/load     读取并切换「活动剧本」（新开的房间用它）
 """
@@ -69,6 +100,15 @@ from .dm import DM
 from .embedding import get_embedder
 from .engine import BACKENDS, derive_seed, gpu_probe, normalize_backend
 from .llm import ToolCallingUnsupported, build_provider
+from .lobby import (
+    PHASE_PLAYING,
+    PHASE_WAITING,
+    VIS_PRIVATE,
+    build_public,
+    clean_create,
+    clean_settings,
+    password_ok,
+)
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .rag import ScriptStore
 from .state_machine import GameState
@@ -154,6 +194,8 @@ def _script_entry(path: Path) -> dict:
         "scenes": len(store.scenes),
         "flags": len(store.flag_ids),
         "chunks": len(store.chunk_list),
+        # 人数声明：建房表单用它做「人数上限」的默认值（剧本可选段，缺省 1–4）
+        "players": dict(store.players),
         "warnings": store.warnings,
     }
 
@@ -324,10 +366,30 @@ def _polarity(text: str) -> float:
 
 
 class Room:
-    def __init__(self, code, script_store=None):
+    def __init__(self, code, script_store=None, create=None):
         self.code = code
         # 房间在创建时「钉住」当时的活动剧本：之后服务端换剧本，进行中的对局不受影响。
         self.store = script_store or store
+        # ---- 大厅元数据（建房时由房主填，之后房主可以改）----
+        # 建房参数先过 lobby.clean_create：它保证这里拿到的**一定是一套完整值**，
+        # 而且人数上下限是按**本房间钉住的那份剧本**算的（剧本可选的 players 段，
+        # 没写就是 1–4 人）。
+        params, _ = clean_create(create or {}, self.store.players)
+        # 房间名缺省 = 剧本名：陌生人扫列表时看到的是剧本，不是一个空字符串。
+        self.name = params["name"] or self.store.title
+        self.note = params["note"]
+        self.min_players = params["min_players"]
+        self.max_players = params["max_players"]
+        self.visibility = params["visibility"]
+        # 密码只存在服务端、只用于校验；下发的一律只有 has_password 这个布尔。
+        self.password = params["password"]
+        # 等待中 → 房主点「开始」→ 进行中。开局前不能行动（见 require_playing）。
+        self.phase = PHASE_WAITING
+        self.created_at = time.time()
+        # 被房主踢掉 / 房间被解散的名字：这些人的断开**不该**再广播一次「离开队伍」
+        # （服务端/房主已经宣布过了），也不该触发「最后一人走了就销毁房间」。
+        self.ejected = set()
+        self.closed = False
         # 本局随机种子：建房时掷一次、整局固定（引擎是纯函数，不给种子则每个房间
         # 每一局的随机流都一模一样 —— "换个房间重开"其实拿到同一串随机数）。
         # 只进服务端日志、不下发：想复现某一局的剧情，从日志里取这个数。
@@ -335,7 +397,7 @@ class Room:
         self.state = GameState(self.store, self.store.start_scene)
         self.clients = []  # list[(name, websocket)]
         self.lock = asyncio.Lock()
-        self.owner = None  # 房主（第一个加入的人）才能改 DM / 主机小助手模型
+        self.owner = None  # 房主（第一个加入的人；建房者）才能改 DM / 房间设置
         self.dm_slot = dict(default_dm_slot)
         self.assistant_slot = dict(default_assistant_slot)
         # 内置引擎的「界面可调项」（enabled / think / context / max_tokens）。
@@ -354,6 +416,224 @@ class Room:
             else None
         )
         self._summarized = len(self.chronicle) if self.chronicle else 0
+
+    # ---- 大厅：房间的公开信息 / 容量 / 阶段 ----
+    def lobby_info(self) -> dict:
+        """本房间对外的公开信息（大厅列表项与 `room` 事件共用同一份形状）。
+
+        ⚠️ 密码本身**不出现在这里**（只有 `has_password` 布尔）；剧本内幕、
+        模型槽位、api_key 同理，一律不下发。
+        """
+        return build_public(
+            code=self.code,
+            name=self.name,
+            note=self.note,
+            script_title=self.store.title,
+            owner=self.owner,
+            online=len(self.clients),
+            max_players=self.max_players,
+            phase=self.phase,
+            visibility=self.visibility,
+            has_password=bool(self.password),
+            created_at=self.created_at,
+        )
+
+    async def broadcast_room(self) -> None:
+        """把房间快照广播出去 —— 人数 / 房主 / 设置 / 阶段任何一项变了都该发一次。"""
+        await self.broadcast({"type": "room", "room": self.lobby_info()})
+
+    def join_denied(self, name, password):
+        """能不能进这间房 —— 返回拒绝原因（None = 放行）。
+
+        顺序有讲究：**先密码、后容量**。房间满了但密码也不对的时候，不该先告诉对方
+        "满了" —— 那等于确认了"密码对了就有位置"，把容量当成了密码的旁路。
+
+        容量这条只拦**新面孔**：已经在 `state.players` 里的人（断线重连 / 换标签页）
+        照旧放行，否则满员的房间会把掉线的人永久关在外面。
+        """
+        if not password_ok(self.password, password):
+            return {"code": "password", "message": "这间房设了密码，请填对密码再进。"}
+        if len(self.clients) >= self.max_players and name not in self.state.players:
+            return {
+                "code": "full",
+                "message": f"房间已满（{len(self.clients)}/{self.max_players}），等有人退出再来。",
+            }
+        return None
+
+    async def require_playing(self, ws) -> bool:
+        """玩法动作的阶段门控：等待中不放行任何行动 / 建议 / 掷骰。
+
+        等待阶段既没开局、也没有剧情可推进，放行只会让 DM 去猜"现在该讲什么"。
+        这里直接回一条 `not_started`，界面据此提示"等房主开始"。
+        """
+        if self.phase == PHASE_PLAYING:
+            return True
+        await self.send_to(
+            ws,
+            {
+                "type": "not_started",
+                "message": "房主还没开始这一局 —— 先在等待室等人齐，房主点「开始」后再行动。",
+            },
+        )
+        return False
+
+    async def resync_context(self) -> None:
+        """按人重发「剧本 + Agent 次级 prompt + 房主是谁」。
+
+        房主换人时必须发一次：DM 的次级 prompt 只发给房主，换了房主就得让新的拿到、
+        旧的失去（客户端按 `agents.owner` 决定设置卡片能不能改）。
+        """
+        for n, w in list(self.clients):
+            try:
+                await self.send_to(w, {
+                    "type": "room_sync",
+                    "agents": self.agents_status(n),
+                    **self.room_context(n),
+                })
+            except Exception:  # noqa: BLE001
+                pass
+        await self.send_state()
+
+    @staticmethod
+    async def _reject(ws, message) -> None:
+        """房主权限不够 / 操作不合法时的统一回话。"""
+        await Room.send_to(ws, {"type": "error", "message": message})
+
+    # ---- 大厅：房主操作 ----
+    async def on_start(self, name, ws=None) -> None:
+        """房主点「开始」：等待中 → 进行中，DM 出场念开场。
+
+        门槛只做**软提示**：人数低于剧本声明的 min 时照样开始（房主说了算），
+        但会广播一句说明 —— 剧本的 min 是"建议"，不是"许可证"。
+        """
+        async with self.lock:
+            if self.owner != name:
+                await self._reject(ws, f"只有房主（{self.owner}）可以开始游戏")
+                return
+            if self.phase == PHASE_PLAYING:
+                await self._reject(ws, "这一局已经开始了")
+                return
+            n = len(self.clients)
+            self.phase = PHASE_PLAYING
+            await self.broadcast({"type": "system", "text": f"房主 {name} 开始了这一局"})
+            if n < self.min_players:
+                await self.broadcast({
+                    "type": "system",
+                    "text": f"（剧本《{self.store.title}》建议至少 {self.min_players} 人，现在只有 {n} 人 —— 房主决定照常开始。）",
+                })
+            await self.broadcast_room()
+            opening = self.state.current().get("public_text", "")
+            if opening:
+                await self.broadcast({"type": "narration", "author": "DM", "text": opening})
+                self._chronicle_add(opening, kind="narration")
+            await self.send_state()
+
+    async def on_room_settings(self, name, msg, ws) -> None:
+        """房主改房间设置（房间名 / 备注 / 人数上限 / 可见性 / 密码）。"""
+        async with self.lock:
+            if self.owner != name:
+                await self._reject(ws, f"只有房主（{self.owner}）可以修改房间设置")
+                return
+            patch = clean_settings(msg, {"min_players": self.min_players}, self.store.players)
+            changed, labels = [], {
+                "name": "房间名", "note": "备注", "max_players": "人数上限",
+                "visibility": "可见性", "password": "密码",
+            }
+            for key, value in patch.items():
+                if getattr(self, key, None) != value:
+                    setattr(self, key, value)
+                    changed.append(labels.get(key, key))
+            if not changed:
+                await self.send_to(ws, {"type": "error", "message": "房间设置没有变化"})
+                return
+            await self.broadcast({"type": "system", "text": "房主更新了房间设置：" + "、".join(changed)})
+            await self.broadcast_room()
+            if len(self.clients) > self.max_players:
+                await self.broadcast({
+                    "type": "system",
+                    "text": f"（人数上限现在是 {self.max_players}，当前 {len(self.clients)} 人 —— 不会赶人，但新玩家进不来。）",
+                })
+
+    async def on_kick(self, name, target, ws) -> None:
+        async with self.lock:
+            if self.owner != name:
+                await self._reject(ws, f"只有房主（{self.owner}）可以踢人")
+                return
+            target = (target or "").strip()
+            if not target:
+                await self._reject(ws, "没指定要请出谁")
+                return
+            if target == self.owner:
+                await self._reject(ws, "房主不能把自己请出去 —— 想结束就点「解散房间」")
+                return
+            hits = [w for n, w in self.clients if n == target]
+            if not hits:
+                await self._reject(ws, f"「{target}」不在这个房间里")
+                return
+            # 先登记再移人：否则这些人断开时会被当成"普通离开"，多广播一条「离开了队伍」，
+            # 而且最后一人走掉时还会把房间一起销毁。
+            self.ejected.add(target)
+            self.state.remove_player(target)
+            self.clients = [(n, w) for n, w in self.clients if n != target]
+            self.advisors.pop(target, None)
+            for w in hits:
+                await self.send_to(w, {
+                    "type": "kicked", "by": name,
+                    "message": f"你被房主 {name} 请出了房间。",
+                })
+                # 服务端主动断开：只靠前端"收到 kicked 自己关"是有洞的 ——
+                # 一个不听话的客户端（或旧版前端）会永远停在游戏屏上，而且它已经
+                # 不在 clients 里了，再也收不到任何 broadcast。断在这里最省事。
+                try:
+                    await w.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            await self.broadcast({"type": "system", "text": f"{target} 被房主请出了房间"})
+            await self.broadcast_room()
+            await self.send_state()
+
+    async def on_transfer(self, name, target, ws) -> None:
+        """把房主转给别人。"""
+        async with self.lock:
+            if self.owner != name:
+                await self._reject(ws, f"只有房主（{self.owner}）可以移交房主")
+                return
+            target = (target or "").strip()
+            if target not in [n for n, _ in self.clients]:
+                await self._reject(ws, f"「{target}」不在这个房间里")
+                return
+            if target == self.owner:
+                await self._reject(ws, f"{target} 已经是房主了")
+                return
+            self.owner = target
+            await self.broadcast({"type": "system", "text": f"房主已移交给 {target}"})
+            # DM 的次级 prompt 只发给房主 ⇒ 换了房主必须按人重发一次（新的拿到、旧的失去）
+            await self.resync_context()
+            await self.broadcast_room()
+
+    async def on_close_room(self, name, ws) -> None:
+        """房主解散房间：所有人收到通知，房间立刻从大厅消失。"""
+        async with self.lock:
+            if self.owner != name:
+                await self._reject(ws, f"只有房主（{self.owner}）可以解散房间")
+                return
+            self.closed = True
+            await self.broadcast({
+                "type": "room_closed", "by": name,
+                "message": f"房主 {name} 解散了房间。",
+            })
+            rooms.pop(self.code, None)
+            # 主动清空，免得每个客户端断开时再来一轮「离开了队伍」的广播
+            # （最后一人走掉还会顺手把已经销毁的房间再销毁一次）。
+            for n, w in list(self.clients):
+                self.ejected.add(n)
+                try:
+                    await w.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self.clients = []
+            self.state.players = {}
+            print(f"[RPGBar] 房间「{self.code}」已由房主 {name} 解散")
 
     # ---- Agent 生命周期 ----
     def _effective_slot(self, slot):
@@ -475,6 +755,8 @@ class Room:
             "scenes": len(self.store.scenes),
             "flags": len(self.store.flag_ids),
             "chunks": len(self.store.chunk_list),
+            # 剧本声明的人数（可选段，缺省 1–4）——大厅建房时拿它当容量默认值
+            "players": dict(self.store.players),
             "warnings": list(self.store.warnings),
         }
 
@@ -533,8 +815,10 @@ class Room:
 
     async def on_join(self, name, character, ws):
         async with self.lock:
-            # 加入前已开局 → 视为「中途加入」，需要 DM 补剧情
-            late = self.state.is_in_progress()
+            # 阶段决定这次是「一起等开局」还是「中途加入」：
+            # 等待中进来 = 一起在等待室等人齐；进行中进来 = 中途加入，要让 DM
+            # 单独补一段带入旁白 + 一份私有回顾（老玩家也能看到那段旁白）。
+            late = self.phase == PHASE_PLAYING
             self.state.add_player(name, character)
             self.clients.append((name, ws))
             self.advisors.setdefault(name, {"slot": dict(default_advisor_slot), "agent": None})
@@ -549,6 +833,9 @@ class Room:
                     "late": late,
                     "script": self.store.title,
                     "agents": self.agents_status(name),
+                    # 大厅元数据：房间名 / 备注 / 人数 x/y / 阶段 / 房主 / 是否要密码。
+                    # 连入即拿，界面不用再单独问一次。
+                    "room_info": self.lobby_info(),
                     # 连入即同步：本房间的剧本 + 两份 Agent 次级 prompt（DM 那份仅房主可见）
                     **self.room_context(name),
                     # 本房间已有的 NPC（人物卡）——晚加入也能认识在场的人
@@ -559,9 +846,13 @@ class Room:
             )
             if not late:
                 await self.broadcast({"type": "system", "text": f"{name} 加入了队伍"})
-                opening = self.state.current().get("public_text", "")
-                await self.broadcast({"type": "narration", "author": "DM", "text": opening})
-                self._chronicle_add(opening, kind="narration")
+                if self.phase == PHASE_WAITING:
+                    # 等待室不是"卡住了"：明说现在在等人齐、且开局前不能行动。
+                    await self.broadcast({
+                        "type": "system",
+                        "text": f"等待房主开始（{len(self.clients)}/{self.max_players} 人）"
+                                "—— 开局前还不能行动。",
+                    })
             else:
                 await self.broadcast({"type": "system", "text": f"{name} 中途加入了队伍"})
                 await self.broadcast(
@@ -586,6 +877,10 @@ class Room:
                     })
                 # 只发给新玩家：结构化「故事回顾」
                 await self.send_to(ws, {"type": "recap", "recap": self.state.recap()})
+            # 人数变了就得重播一次房间快照 —— 等待室里「3/4 人」那个数字、以及列表项
+            # 的 online 字段都只从快照来（`state.players` 里给不出 max_players）。
+            # 新人自己那份走的是 welcome 里的 room_info，这里主要是给**房里已有的人**更新。
+            await self.broadcast_room()
             await self.send_state()
 
     async def on_configure(self, name, msg, ws):
@@ -922,6 +1217,34 @@ async def api_models_test(payload: dict = Body(...)):
     return out
 
 
+@app.get("/api/rooms")
+async def api_rooms():
+    """大厅：列出**公开**房间。
+
+    私密房间不进这个列表（只能凭房间码 + 密码进），这是建私密房的全部意义。
+    「等待中」的房间排在前面 —— 陌生人进得去的主要就是这些；已经开局的房间
+    虽然也能中途加入，但先让人看到在等人的。
+    """
+    items = [
+        room.lobby_info()
+        for room in rooms.values()
+        if room.visibility != VIS_PRIVATE and not room.closed
+    ]
+    items.sort(key=lambda r: (r["phase"] != PHASE_WAITING, -r["online"], -r["created_at"]))
+    return {
+        "rooms": items,
+        "waiting": sum(1 for r in items if r["phase"] == PHASE_WAITING),
+        "active_script": active["rel"],
+        "active_title": store.title,
+        # 建房表单的缺省值：按当前「活动剧本」声明的人数算（剧本没写就是 1–4）
+        "defaults": {
+            "script": active["rel"],
+            "script_title": store.title,
+            "players": dict(store.players),
+        },
+    }
+
+
 @app.get("/api/scripts")
 async def api_scripts():
     """列出可用的剧本文件（scripts/ 目录下的 .json/.md/.txt）。"""
@@ -1006,6 +1329,7 @@ async def ws_endpoint(ws: WebSocket):
     name = None
     room = None
     pump = None
+    joined = False  # 真的进了房间才在收尾时做「离开」处理（被拒的不算）
     try:
         first = json.loads(await ws.receive_text())
         if first.get("type") != "join":
@@ -1014,10 +1338,18 @@ async def ws_endpoint(ws: WebSocket):
         name = (first.get("name") or "冒险者").strip()[:20] or "冒险者"
         character = first.get("character") or {}
         code = (first.get("room") or "").strip().upper()
-        script_rel = first.get("script")
+        password = first.get("password")
+        # 建房参数（可选）：房主在大厅点「创建房间」时带上。字段先过 lobby.clean_create，
+        # 脏数据在 Room 构造里就被换成合法值了。
+        create = first.get("create") if isinstance(first.get("create"), dict) else {}
+        script_rel = create.get("script") if create.get("script") else first.get("script")
         room = rooms.get(code) if code else None
-        if room is None:
-            # 新建房间：允许房主在建房时指定剧本（只认 scripts/ 目录里的文件）
+        created = room is None
+        if created:
+            # 两种情况都会走到这里：
+            #  ① 大厅点「创建房间」—— 带了 create 参数；
+            #  ② 输入了一个**还不存在**的房间码 —— 这是原有玩法（两个人各填同一个房号
+            #     就能碰头），所以照旧允许，只是按默认设置建房（公开、1–4 人）。
             room_store = None
             if isinstance(script_rel, str) and script_rel.strip():
                 p = _safe_script_path(script_rel)
@@ -1030,15 +1362,25 @@ async def ws_endpoint(ws: WebSocket):
                     print(f"[RPGBar] 忽略建房请求里无效的剧本：{script_rel!r}")
             if not code:
                 code = gen_code()
-            room = Room(code, room_store or store)
+            room = Room(code, room_store or store, create=create)
             rooms[code] = room
             # 本局种子进日志、不进界面：要复现某一局的剧情就从这里取数
             # （同一个种子 + 同一串输入 → 同一条随机流 → 同一个故事）。
             print(
-                f"[RPGBar] 新房「{code}」本局种子 {room.seed}"
+                f"[RPGBar] 新房「{code}」「{room.name}」剧本《{room.store.title}》"
+                f"{'私密' if room.visibility == VIS_PRIVATE else '公开'}"
+                f"/{room.max_players} 人 本局种子 {room.seed}"
                 f"（DM {derive_seed(room.seed, 'dm')}"
                 f" / 小助手 {derive_seed(room.seed, 'assistant')}）"
             )
+        else:
+            # 进已有的房间：先查密码与容量。密码/满了都**不再自动建房**（那是另一回事），
+            # 直接回一条带机器可读 code 的 `join_denied`，界面据此显示并退回大厅。
+            deny = room.join_denied(name, password)
+            if deny:
+                await ws.send_text(json.dumps({"type": "join_denied", **deny}, ensure_ascii=False))
+                await ws.close()
+                return
         # ---- 消息泵：把「收」与「处理」拆开 ----
         # `receive_text()` 必须一直有人在 await 着。uvicorn 的 WebSocket keepalive
         # 依赖它：一旦没人收，服务器发的 ping 就得不到 pong 处理，默认 20 秒把连接
@@ -1059,6 +1401,7 @@ async def ws_endpoint(ws: WebSocket):
         pump = asyncio.create_task(pump())
 
         # join 也可能慢（中途加入要让 DM 补剧情），放在泵之后就不怕它超时了。
+        joined = True
         await room.on_join(name, character, ws)
 
         busy = False  # 本连接是否有耗时任务在跑（同一玩家开两个标签页互不影响）
@@ -1069,6 +1412,8 @@ async def ws_endpoint(ws: WebSocket):
             msg = json.loads(raw)
             t = msg.get("type")
             if t == "action":
+                if not await room.require_playing(ws):
+                    continue
                 if busy:
                     # 之前这里是静默 `continue`：玩家点了没任何反应，还以为卡死。
                     await Room.send_to(ws, {
@@ -1082,6 +1427,8 @@ async def ws_endpoint(ws: WebSocket):
                 finally:
                     busy = False
             elif t == "suggest":
+                if not await room.require_playing(ws):
+                    continue
                 if busy:
                     await Room.send_to(ws, {
                         "type": "busy", "who": "advisor",
@@ -1093,10 +1440,25 @@ async def ws_endpoint(ws: WebSocket):
                     await room.on_suggest(name, ws)
                 finally:
                     busy = False
+            elif t == "roll":
+                if not await room.require_playing(ws):
+                    continue
+                await room.on_roll(name)
             elif t == "configure":
                 await room.on_configure(name, msg, ws)
-            elif t == "roll":
-                await room.on_roll(name)
+            # ---- 大厅 / 等待室 ----
+            elif t == "start":
+                await room.on_start(name, ws)
+            elif t == "room_settings":
+                await room.on_room_settings(name, msg, ws)
+            elif t == "kick":
+                await room.on_kick(name, msg.get("target") or msg.get("name"), ws)
+            elif t == "transfer":
+                await room.on_transfer(name, msg.get("target") or msg.get("name"), ws)
+            elif t == "close_room":
+                await room.on_close_room(name, ws)
+            elif t == "leave":
+                break  # 主动离开走正常收尾（会广播「离开了队伍」）
     except WebSocketDisconnect:
         pass
     except Exception as e:
@@ -1107,14 +1469,33 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         if pump is not None:
             pump.cancel()
-        if room is not None and name is not None:
+        if joined and room is not None and name is not None:
             room.state.remove_player(name)
+            ejected = name in room.ejected
+            room.ejected.discard(name)
             room.clients = [(n, w) for n, w in room.clients if n != name]
-            if room.clients:
+            if room.closed:
+                pass  # 房间已被房主解散，这里什么都不用做
+            elif ejected:
+                # 被房主请出去：服务端/房主已经宣布过了，别再广播一条「离开了队伍」
+                if room.clients:
+                    await room.broadcast_room()
+            elif room.clients:
                 await room.broadcast({"type": "system", "text": f"{name} 离开了队伍"})
-                await room.send_state()
+                if room.owner == name:
+                    # 房主走了、房间里还有人：房间按「有人连线就活着」继续存在，
+                    # 所以房主身份必须有人接 —— 自动移交给**最早加入的在场玩家**
+                    # （常见联网游戏的做法；房主也可以自己主动转让）。
+                    heir = room.clients[0][0]
+                    room.owner = heir
+                    await room.broadcast({"type": "system", "text": f"房主已自动移交给 {heir}"})
+                    await room.resync_context()
+                else:
+                    await room.send_state()
+                await room.broadcast_room()
             else:
                 rooms.pop(room.code, None)
+                print(f"[RPGBar] 房间「{room.code}」最后一人离开，已回收")
 
 
 # 静态资源（app.js / style.css / index.html）改动频繁，而"改了前端、浏览器还在用

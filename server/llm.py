@@ -276,6 +276,16 @@ class EngineProvider(LLMProvider):
 
     # ---- 生成 ----
 
+    @property
+    def needs_warmup(self) -> bool:
+        """还没跑过任何一次生成 —— 首次前向的成本（prefill / kernel 准备）还挂着。
+
+        只对内置引擎有这个概念：它按序列长度做首次 prefill，实测 2000 token 要 26 秒，
+        之后同样长度只要 7–10 秒。建了会话就说明已经跑过一次（`_ensure` 与 `_run` 同在
+        生成锁里），所以用「会话还没建」当判据。
+        """
+        return self._session is None
+
     def _run(self, messages, tools) -> dict:
         """同步跑一轮（阻塞几十秒，调用方负责丢到线程里）。
 

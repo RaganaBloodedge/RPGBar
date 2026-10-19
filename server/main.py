@@ -423,6 +423,8 @@ class Room:
         self.card_state = {"status": "pending", "card": None, "error": ""}
         self._card_lock = asyncio.Lock()
         self._card_task = None
+        # 预热：缓存命中时 GPU 是闲的，顺手把「首次前向」的成本付掉（见 _warm）。
+        self._warm_task = None
 
     # ---- 大厅：房间的公开信息 / 容量 / 阶段 ----
     def lobby_info(self) -> dict:
@@ -492,6 +494,10 @@ class Room:
             if cached is not None:
                 self._apply_card(cached)
                 await self.broadcast({"type": "character_schema", **self.card_public()})
+                # 缓存命中 = 这张卡不花模型调用，GPU 是闲的。而 DM 的第一次生成要付
+                # 一笔「首次前向」的固定成本（实测 2000 token 的 prompt 要 26 秒，
+                # 之后同样长度只要 7–10 秒）。玩家此刻正在等待室里没事干 —— 挪到这里。
+                self._kick_warm()
                 return
             # 先告诉等待室「在分析」，免得大家盯着一片空白以为坏了
             self.card_state.update(status="pending", error="")
@@ -512,6 +518,29 @@ class Room:
         # 卡片挂在**剧本**上：旁白 Agent 投检定时从 `store.card_schema` 取属性加值。
         # 同一份剧本内容算出来的卡必然相同，所以多个房间共用一个 store 也不会串味。
         self.store.card_schema = card
+
+    # ---- 预热 ----
+    def _kick_warm(self) -> None:
+        """踢一次后台预热（已经有一个在跑就跳过）。"""
+        if self._warm_task is not None and not self._warm_task.done():
+            return
+        self._warm_task = asyncio.create_task(self._warm())
+
+    async def _warm(self) -> None:
+        """在等待室里空转一次 DM 的前向，把「首次 prefill」的成本提前付掉。
+
+        只对**内置引擎**有意义（云 API 的首字延迟不归我们管）：`NarratorAgent.warmup()`
+        会自己判断 `provider.needs_warmup`，不是引擎就直接返回。
+
+        为什么允许它和开局抢 GPU：最坏情况是「预热先拿到锁 → 第一轮等它」，总耗时与
+        「没预热、让第一轮自己付这笔钱」**完全等价**；最好情况是省掉 20 多秒。只赢不输。
+        """
+        try:
+            await self.narrator().warmup(
+                NarratorContext(state=self.state, player_name="（预热）")
+            )
+        except Exception:  # noqa: BLE001  预热失败不影响任何东西
+            pass
 
     def join_denied(self, name, password):
         """能不能进这间房 —— 返回拒绝原因（None = 放行）。

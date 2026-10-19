@@ -10,6 +10,7 @@ from pathlib import Path
 import jieba
 from rank_bm25 import BM25Okapi
 
+from . import character_card
 from .script_loader import build_script_prompt, parse_script, read_script_file
 
 
@@ -54,6 +55,10 @@ class ScriptStore:
         self.fmt = doc.fmt
         # 剧本声明的「人数」（可选段，已在 script_loader 规范化）——大厅建房时拿它当容量默认值
         self.players = dict(doc.players)
+        # 角色卡（模型读剧本后给的属性表）。**剧本级**数据：同一份剧本内容永远同一张卡，
+        # 由 `character_card.card_key()` 的缓存保证；房间在建房后异步把它填进来。
+        # None = 还没分析过（不是「不需要」——「不需要」是一张 required=false 的卡）。
+        self.card_schema = None
         self.warnings = list(doc.warnings)
         self.scenes = {s["id"]: s for s in self.data.get("scenes", [])}
         # flag 中文描述（剧本可选提供，用于给玩家复述线索）
@@ -77,6 +82,8 @@ class ScriptStore:
                 "system": self.system,
                 "script_prompt": self.script_prompt,
                 "script_prompt_public": self.script_prompt_public,
+                # 已分析过就顺手带上（未分析 = null，界面据 this 显示「还没分析」）
+                "card": character_card.to_client(self.card_schema) if self.card_schema else None,
             }
         )
         return out

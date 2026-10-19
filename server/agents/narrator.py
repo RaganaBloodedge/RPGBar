@@ -16,7 +16,7 @@
 """
 from dataclasses import dataclass, field
 
-from .. import dice
+from .. import character_card, dice
 from ..dm import DM  # 只为 DM._exit_ok（出口门控判定）；不再用它的脚本化流水线
 from .base import Agent, AgentResult, Tool, _obj, int_prop, str_prop
 
@@ -83,7 +83,8 @@ class NarratorAgent(Agent):
         state = ctx.state
         cur = state.current()
         players = "；".join(
-            f"{p.name}({p.character.get('cls', '')})" for p in state.players.values()
+            character_card.player_line(p.name, p.character, getattr(self.store, "card_schema", None))
+            for p in state.players.values()
         )
         npc_block = f"\n【在场 NPC（人物卡）】\n{ctx.npc_brief}" if getattr(ctx, "npc_brief", "") else ""
         hist = self.chronicle.digest(6) if self.chronicle is not None else ""
@@ -279,7 +280,12 @@ class NarratorAgent(Agent):
                 "error": f"当前场景没有检定 {check_id}",
                 "available": [c["id"] for c in scene.get("checks", [])],
             }
-        r = dice.roll_check(check["skill"], check.get("dc", 10))
+        # 属性加值：谁能做成这件事，取决于**行动的人**自己的角色卡。
+        # 没填卡 / 这个技能没映射到属性 ⇒ 加值 0，等同于原来的纯 d20 vs DC。
+        card = getattr(self.store, "card_schema", None)
+        actor = ctx.state.players.get(ctx.player_name)
+        mod, attr = character_card.modifier_for(card, (actor.character if actor else {}), check["skill"])
+        r = dice.roll_check(check["skill"], check.get("dc", 10), mod=mod)
         ok = r["success"]
         if ok and check.get("success_flag"):
             ctx.state.set_flag(check["success_flag"])
@@ -291,6 +297,9 @@ class NarratorAgent(Agent):
                 "skill": check["skill"],
                 "dc": r["dc"],
                 "roll": r["roll"],
+                "mod": r["mod"],
+                "total": r["total"],
+                "attr": attr,
                 "success": ok,
                 "flag": check.get("success_flag") if ok else None,
             }
@@ -299,6 +308,9 @@ class NarratorAgent(Agent):
         return {
             "rolled": True,
             "success": ok,
+            # 把加值的来历告诉 DM：它可以据此说「你的学识让你看出了门道」，
+            # 但照旧**不要在旁白里报数字**（提示词里那条硬边界不变）。
+            "ability": f"{attr} {mod:+d}" if attr else "",
             "flag_gained": check.get("success_flag") if ok else None,
             "note": "系统已投骰并广播结果，你只需补一句简短衔接。",
         }

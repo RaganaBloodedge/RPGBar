@@ -26,25 +26,45 @@ __all__ = ["Task", "ToolAgent", "parse_json", "Tool", "AgentResult", "Step", "_o
 
 
 def parse_json(raw) -> dict:
-    """从模型输出里抠出一个 JSON 对象（容忍 ``` 包裹与前后废话）。"""
+    """从模型输出里抠出一个 JSON 对象（容忍 ``` 包裹、前后废话、**多余的花括号**）。
+
+    小模型的两种常见手滑，这里都兜：
+
+    - 外面套一层 ```：直接剥掉；
+    - 结尾多吐一个 `}`（或中间少了）：严格解析失败后，从后往前找一个「能解析的 `}`」。
+      实测 4B 在长一点的 schema 上就会这样（`…}}}`），而 `re.search(r"\\{.*\\}")`
+      是贪婪匹配、会连多出来的那个 `}` 一起吞掉 —— 结果整段 JSON 一个字段都读不出来。
+    """
     import re
 
     raw = (raw or "").strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
-    try:
-        val = json.loads(raw)
-        return val if isinstance(val, dict) else {}
-    except Exception:  # noqa: BLE001
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return {}
-        try:
-            val = json.loads(m.group(0))
-            return val if isinstance(val, dict) else {}
-        except Exception:  # noqa: BLE001
-            return {}
+    attempts = [raw]
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        attempts.append(m.group(0))
+    for text in attempts:
+        for candidate in (text, re.sub(r",\s*([}\]])", r"\1", text)):
+            try:
+                val = json.loads(candidate)
+                if isinstance(val, dict):
+                    return val
+            except Exception:  # noqa: BLE001
+                continue
+    # 最后一道：从后往前试每一个 `}`，看哪一段是完整对象
+    for text in attempts:
+        for end in range(len(text), 0, -1):
+            if text[end - 1] != "}":
+                continue
+            try:
+                val = json.loads(re.sub(r",\s*([}\]])", r"\1", text[:end]))
+                if isinstance(val, dict):
+                    return val
+            except Exception:  # noqa: BLE001
+                continue
+    return {}
 
 
 def _resolve(value, agent, ctx):

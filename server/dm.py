@@ -12,7 +12,7 @@
 import json
 import re
 
-from . import dice
+from . import character_card, dice
 
 # flag 白名单兜底：剧本未声明任何 flag 时使用
 FLAG_WHITELIST = {
@@ -125,7 +125,14 @@ class DM:
         return events
 
     def _run_check(self, state, player_name, check, events):
-        r = dice.roll_check(check["skill"], check.get("dc", 10))
+        # 属性加值来自**行动的人**自己的角色卡（没填卡就是 +0，与老行为一致）
+        actor = state.players.get(player_name)
+        mod, attr = character_card.modifier_for(
+            getattr(self.store, "card_schema", None),
+            (actor.character if actor else {}),
+            check["skill"],
+        )
+        r = dice.roll_check(check["skill"], check.get("dc", 10), mod=mod)
         ok = r["success"]
         if ok and check.get("success_flag"):
             state.set_flag(check["success_flag"])
@@ -136,6 +143,9 @@ class DM:
                 "skill": check["skill"],
                 "dc": r["dc"],
                 "roll": r["roll"],
+                "mod": r["mod"],
+                "total": r["total"],
+                "attr": attr,
                 "success": ok,
                 "flag": check.get("success_flag") if ok else None,
             }
@@ -196,7 +206,10 @@ class DM:
             f"当前可用出口：{legal_exits or '无'}\n"
             f"已知 flag 全集：{sorted(self._flag_whitelist())}\n"
         )
-        players = "；".join(f"{p.name}({p.character.get('cls', '')})" for p in state.players.values())
+        players = "；".join(
+            character_card.player_line(p.name, p.character, getattr(self.store, "card_schema", None))
+            for p in state.players.values()
+        )
         user_msg = f"{context}\n\n{state_info}在场玩家：{players}\n玩家行动：{action}"
         messages = [{"role": "system", "content": sys_msg}]
         if secondary and secondary.strip():

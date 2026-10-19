@@ -12,9 +12,25 @@ def roll(d: int = 20) -> int:
     return _rng.randint(1, d)
 
 
-def roll_check(skill: str, dc: int) -> dict:
+def roll_check(skill: str, dc: int, mod: int = 0) -> dict:
+    """投一次检定：`d20 + mod >= DC` 即成功。
+
+    `mod` 是角色卡的属性加值（见 `character_card.modifier`），默认 0 ——
+    没填卡、或这个技能没映射到属性时，退化成原来的「纯 d20 vs DC」。
+    注意**骰面本身仍然只有这一个来源**：加值来自服务端算出的卡片数据，
+    模型既给不出骰子、也给不出一份自己编的属性。
+    """
     value = roll(20)
-    return {"skill": skill, "dc": dc, "roll": value, "success": value >= dc}
+    bonus = int(mod or 0)
+    total = value + bonus
+    return {
+        "skill": skill,
+        "dc": dc,
+        "roll": value,
+        "mod": bonus,
+        "total": total,
+        "success": total >= dc,
+    }
 
 
 def weighted_pick(weights: list) -> tuple:

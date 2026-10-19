@@ -15,7 +15,7 @@ from pathlib import Path
 from .advisor import AdvisorAgent, AdvisorContext
 from .base import Agent, AgentResult, Step, Tool
 from .narrator import NarratorAgent, NarratorContext
-from .persona import AssistantAgent, SummaryCtx
+from .persona import AssistantAgent, SummaryCtx, analyze_character_card
 from .tool_agent import Task, ToolAgent, parse_json
 
 __all__ = [
@@ -32,6 +32,7 @@ __all__ = [
     "AdvisorContext",
     "AssistantAgent",
     "SummaryCtx",
+    "analyze_character_card",
     "describe_agents",
 ]
 

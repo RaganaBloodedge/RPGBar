@@ -6,6 +6,8 @@
 """
 from dataclasses import dataclass, field
 
+from ..character_card import normalize_card as _normalize_card
+from ..character_card import script_digest as _script_digest
 from .tool_agent import Task, ToolAgent
 
 
@@ -195,8 +197,74 @@ SUMMARIZE_TASK = Task(
 )
 
 
+# ---------------------------------------------------------------- character_card
+
+CHARACTER_CARD_SYSTEM = (
+    "你是一场中文文字跑团（TRPG）的「角色卡设计者」。\n"
+    "【你的职责】读一份剧本摘要，判断玩这个本需不需要玩家角色卡；如果需要，"
+    "设计出这个本**真正用得上**的属性维度，并给出可自由分配的点数。\n"
+    "【判断标准】\n"
+    "- 本子有检定（战斗、学识、魅力……）、有需要不同人分工的挑战 ⇒ 需要角色卡。\n"
+    "- 纯叙事 / 纯解谜、成败与人物能力无关的本 ⇒ **不需要**：required 填 false，attributes 留空。\n"
+    "- 拿不准时倾向「不需要」——多一张没人看的卡，比少一张更烦人。\n"
+    "【设计规则】\n"
+    "- 属性 2–6 项，名字要短（≤4 字），贴合这个剧本的世界观与题材，**不要照抄 D&D 六维**。\n"
+    "- 如果剧本的检定技能本身就是能力项（力量 / 学识 / 侦查 / 聆听……），属性就**沿用这些名字** ——\n"
+    "  玩家一眼能对上，也不会出现「这个技能到底算哪项属性」的歧义。\n"
+    "- 每项给 min / base / max：base 是人人白送的基础值（一般 10），玩家用点数在 base 之上加到 max。\n"
+    "- total_points 是人人相同的可分配点数（3–12 之间；属性越多给得越多）。\n"
+    "- skill_map 写成**列表**，剧本里出现的**每一个**检定技能各一条："
+    '{"skill":"战斗","attr":"力量"}。不许漏，也不许凭空造出摘要里没有的技能。\n'
+    "- 只输出 JSON，不要任何解释文字。"
+)
+
+CHARACTER_CARD_JSON_HINT = (
+    "严格按下面的骨架输出（尖括号是占位，不要照抄成一行；attribute 要 2–6 项，"
+    "skill_map 要为摘要里的每个技能各写一条）：\n"
+    "{\n"
+    '  "required": true,\n'
+    '  "reason": "<一句话说明为什么需要/不需要>",\n'
+    '  "total_points": <3-12 的整数>,\n'
+    '  "attributes": [\n'
+    '    {"key": "<属性名>", "desc": "<一两句说明这个属性能干什么>", '
+    '"min": <下限>, "base": <基础值>, "max": <上限>},\n'
+    '    {"key": "<属性名>", ...}\n'
+    "  ],\n"
+    '  "skill_map": [\n'
+    '    {"skill": "<摘要里的某个检定技能>", "attr": "<上面某个属性名>"},\n'
+    '    {"skill": "<另一个检定技能>", "attr": "<...>"}\n'
+    "  ]\n"
+    "}\n"
+    "不需要角色卡时：{\"required\": false, \"reason\": \"<原因>\", "
+    "\"attributes\": [], \"skill_map\": []}"
+)
+
+
+def _card_user(agent, ctx) -> str:
+    return (
+        _script_digest(agent.store)
+        + "\n\n请判断这个剧本需不需要角色卡，并按上面的规则输出 JSON。"
+    )
+
+
+def _card_validate(agent, data, ctx) -> dict:
+    # 真正的护栏在 character_card.normalize_card 里（区间、点数、skill_map 全部洗一遍）。
+    # 它返回 {} = 洗不出来 → 这一轮算没产出，不拿假卡顶替。
+    return _normalize_card(data)
+
+
+CHARACTER_CARD_TASK = Task(
+    name="character_card",
+    label="分析剧本角色卡",
+    system=CHARACTER_CARD_SYSTEM,
+    user=_card_user,
+    json_hint=CHARACTER_CARD_JSON_HINT,
+    validate=_card_validate,
+)
+
+
 class AssistantAgent(ToolAgent):
-    """主机端小模型助手：挂 `persona` / `react_weights` / `summarize`。"""
+    """主机端小模型助手：挂 `persona` / `react_weights` / `summarize` / `character_card`。"""
 
     name = "assistant"
     default_task = "persona"
@@ -206,3 +274,15 @@ class AssistantAgent(ToolAgent):
         self.register(PERSONA_TASK)
         self.register(REACT_TASK)
         self.register(SUMMARIZE_TASK)
+        self.register(CHARACTER_CARD_TASK)
+
+
+async def analyze_character_card(store, provider):
+    """跑一次「分析剧本 → 角色卡」。
+
+    单独开一个一次性的 `ToolAgent`：这张卡是**剧本级**的（一个本一张，跟着缓存走），
+    不属于任何一局，所以不借用房间里的助手实例（免得顺手改了它的任务状态）。
+    """
+    agent = ToolAgent(store, provider)
+    agent.register(CHARACTER_CARD_TASK)
+    return await agent.run_task("character_card", None)

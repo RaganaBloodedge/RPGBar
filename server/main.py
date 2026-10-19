@@ -83,7 +83,7 @@ from pathlib import Path
 from fastapi import Body, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__
+from . import __version__, character_card
 from .agents import (
     AdvisorAgent,
     AdvisorContext,
@@ -91,6 +91,7 @@ from .agents import (
     NarratorAgent,
     NarratorContext,
     SummaryCtx,
+    analyze_character_card,
     describe_agents,
 )
 from .chronicle import Chronicle
@@ -416,6 +417,12 @@ class Room:
             else None
         )
         self._summarized = len(self.chronicle) if self.chronicle else 0
+        # 角色卡：这个本要不要玩家填卡，由模型读剧本后给出（剧本级结论，按内容缓存）。
+        # status 三态：pending（还没分析）/ ready（有结论）/ failed（这一轮没产出）。
+        # card 为 None 不代表「不需要」——「不需要」是一张 required=false 的卡。
+        self.card_state = {"status": "pending", "card": None, "error": ""}
+        self._card_lock = asyncio.Lock()
+        self._card_task = None
 
     # ---- 大厅：房间的公开信息 / 容量 / 阶段 ----
     def lobby_info(self) -> dict:
@@ -441,6 +448,70 @@ class Room:
     async def broadcast_room(self) -> None:
         """把房间快照广播出去 —— 人数 / 房主 / 设置 / 阶段任何一项变了都该发一次。"""
         await self.broadcast({"type": "room", "room": self.lobby_info()})
+
+    # ---- 角色卡：剧本分析 ----
+
+    def card_public(self) -> dict:
+        """角色卡对外的状态（下发给等待室）。
+
+        ⚠️ `skill_map` 刻意**不下发**：它写着「哪个检定吃哪个属性」，等于把
+        「这个本有哪些检定」摊开给玩家，与 `dm_notes` 同一档内幕。
+        """
+        card = self.card_state.get("card")
+        return {
+            "status": self.card_state.get("status", "pending"),
+            "error": self.card_state.get("error", ""),
+            "needs_card": bool(card and card.get("required")),
+            "card": character_card.to_client(card) if card else None,
+        }
+
+    def _kick_card(self, force: bool = False) -> None:
+        """后台起一次角色卡分析（不阻塞这一轮的 join / 配置）。
+
+        分析是一次完整的模型调用（本地引擎上几十秒），等它会把「进房」卡住；
+        结果到了 `ensure_card` 自己广播。已经有一次在跑就不重复起。
+        """
+        if self._card_task is not None and not self._card_task.done():
+            return
+        self._card_task = asyncio.create_task(self.ensure_card(force=force))
+
+    async def ensure_card(self, force: bool = False) -> None:
+        """保证这张角色卡已经分析过（缓存优先），并把结果广播给等待室。
+
+        为什么用 **DM 槽位**的模型来做：要开局就必须有一个 DM 模型，所以
+        「没有模型就没有角色卡」不会造出「能玩但没卡」的怪状态；换成助手槽位就会有这个缺口。
+
+        `force=True` 允许从失败里重来 —— 房主常常是**先进房再配模型**的，
+        第一次分析多半就是撞在「还没配模型」上，不重试的话这张卡永远出不来。
+        """
+        async with self._card_lock:
+            if self.card_state["status"] == "ready" and not force:
+                return
+            key = character_card.card_key(self.store)
+            cached = character_card.load_cached(key)
+            if cached is not None:
+                self._apply_card(cached)
+                await self.broadcast({"type": "character_schema", **self.card_public()})
+                return
+            # 先告诉等待室「在分析」，免得大家盯着一片空白以为坏了
+            self.card_state.update(status="pending", error="")
+            await self.broadcast({"type": "character_schema", **self.card_public()})
+            res = await analyze_character_card(self.store, self.narrator().provider)
+            if res.source == "llm" and res.data:
+                character_card.save_cached(key, res.data, title=self.store.title)
+                self._apply_card(res.data)
+            else:
+                self.card_state.update(
+                    status="failed", card=None,
+                    error=res.error or "模型没有给出可用的角色卡",
+                )
+            await self.broadcast({"type": "character_schema", **self.card_public()})
+
+    def _apply_card(self, card) -> None:
+        self.card_state.update(status="ready", card=card, error="")
+        # 卡片挂在**剧本**上：旁白 Agent 投检定时从 `store.card_schema` 取属性加值。
+        # 同一份剧本内容算出来的卡必然相同，所以多个房间共用一个 store 也不会串味。
+        self.store.card_schema = card
 
     def join_denied(self, name, password):
         """能不能进这间房 —— 返回拒绝原因（None = 放行）。
@@ -842,6 +913,8 @@ class Room:
                     "npcs": self.npc.snapshot() if self.npc is not None else [],
                     # 本房间的剧情档案状态（已记录多少条 / 是否已有滚动摘要）
                     "memory": self.memory_status(),
+                    # 角色卡：这个本要不要填卡、属性有哪些（还没分析完就带 status=pending）
+                    "card_state": self.card_public(),
                 },
             )
             if not late:
@@ -882,6 +955,10 @@ class Room:
             # 新人自己那份走的是 welcome 里的 room_info，这里主要是给**房里已有的人**更新。
             await self.broadcast_room()
             await self.send_state()
+            # 角色卡分析只做一次（结果按剧本内容缓存）。第一次有人进房就顺手起一次，
+            # 之后除非上一次失败了，否则不再调模型。
+            if self.card_state["status"] in ("pending", "failed"):
+                self._kick_card(force=self.card_state["status"] == "failed")
 
     async def on_configure(self, name, msg, ws):
         """运行期接入模型：dm / assistant 仅房主可改；advisor 每个玩家管自己的。"""
@@ -893,6 +970,10 @@ class Room:
                     merge_slot(self.dm_slot, dm_patch)
                     self._narrator = None  # 重建 Agent
                     changed.append("dm")
+                    # 房主多半是**先进房再配模型**：之前那次分析很可能就是撞在
+                    # 「还没配模型」上，换了 DM 模型就再试一次（已有卡则不动）。
+                    if self.card_state["status"] in ("pending", "failed"):
+                        self._kick_card(force=True)
                 else:
                     await self.send_to(
                         ws,
@@ -1105,6 +1186,59 @@ class Room:
         await self.broadcast(
             {"type": "dice", "player": name, "skill": "d20", "dc": None, "roll": roll(20), "success": None, "flag": None}
         )
+
+    # ---- 角色卡：玩家提交 ----
+
+    async def on_character(self, name, attrs, ws):
+        """玩家提交 / 修改自己的角色卡。
+
+        三条规则：
+        - 这个本不需要卡 ⇒ 直接回绝（界面本来也不该显示那一块）。
+        - **等待中随便改**（还在准备，改来改去是正常的）；**开局后只能设一次** ——
+          否则就能边打边加点，把 DC 当成橡皮泥捏。
+        - 校验一律在**服务端**做（区间 / 基础值 / 点数总量）。前端那些加减号只是提示，
+          改一下 JS 就能发任意数字过来。
+        """
+        async with self.lock:
+            card = self.card_state.get("card")
+            if not card or not card.get("required"):
+                await self.send_to(
+                    ws, {"type": "character_rejected", "errors": ["这个剧本不需要角色卡"]}
+                )
+                return
+            p = self.state.players.get(name)
+            if p is None:
+                await self.send_to(
+                    ws, {"type": "character_rejected", "errors": ["你不在这个房间里"]}
+                )
+                return
+            if self.phase == PHASE_PLAYING and (p.character or {}).get("attrs"):
+                await self.send_to(ws, {
+                    "type": "character_rejected",
+                    "errors": ["已经开局了，角色卡不能再改"],
+                })
+                return
+            clean, errors = character_card.validate_allocation(card, attrs)
+            if errors:
+                await self.send_to(ws, {"type": "character_rejected", "errors": errors})
+                return
+            p.character = dict(p.character or {})
+            p.character["attrs"] = clean
+            await self.send_to(ws, {
+                "type": "character_ok",
+                "attrs": clean,
+                "summary": character_card.summary(card, p.character),
+            })
+            # 队伍名单是所有人可见的：谁填了、填成什么样，都在 state 里
+            await self.send_state()
+
+    async def on_card_refresh(self, name, ws):
+        """重试一次角色卡分析（只对「没分析出来」有意义；已有卡就原样重播）。"""
+        async with self.lock:
+            if self.card_state["status"] == "ready":
+                await self.send_to(ws, {"type": "character_schema", **self.card_public()})
+                return
+            self._kick_card(force=True)
 
 
 rooms = {}
@@ -1446,6 +1580,11 @@ async def ws_endpoint(ws: WebSocket):
                 await room.on_roll(name)
             elif t == "configure":
                 await room.on_configure(name, msg, ws)
+            # ---- 角色卡（等待室里填，不需要过阶段门：开局前正是填卡的时机）----
+            elif t == "character":
+                await room.on_character(name, msg.get("attrs"), ws)
+            elif t == "card_refresh":
+                await room.on_card_refresh(name, ws)
             # ---- 大厅 / 等待室 ----
             elif t == "start":
                 await room.on_start(name, ws)

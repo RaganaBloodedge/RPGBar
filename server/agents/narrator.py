@@ -3,7 +3,8 @@
 护栏从「事后校验 LLM 的 JSON」改成了「工具本身只在合法范围内生效」——
 这是标准 Agent 写法：模型能做什么，由它拿到的工具决定。
 
-- 只读工具：read_scene / list_exits / list_checks / lookup_script
+- 只读工具：read_scene / lookup_script（当前场景的原文、出口、检定已经整段注入
+  user 消息，所以**没有** list_exits / list_checks —— 那两次调用纯属重复劳动）
 - 写工具（会改游戏状态）：roll_check / move_to / set_flag
   - move_to 只接受「当前场景列出的、且条件已满足的出口」，否则返回错误让模型重试
   - set_flag 只接受剧本声明过的 flag
@@ -60,14 +61,17 @@ class NarratorAgent(Agent):
             "你是一场中文文字跑团（TRPG）的主持人（DM）。\n"
             "【你的职责】\n"
             "1. 依据给定的剧本，为玩家行动给出 2-4 句简短、有画面感的旁白，推动剧情前进。\n"
-            "2. 判定玩家意图：命中检定就投骰，命中出口就推进场景，其余自由发挥。\n"
+            "2. 判定玩家意图：该投骰就投骰，该换场景就换场景，其余自由发挥。\n"
             "3. 扮演剧本中的 NPC，但不替玩家做决定。\n"
-            "【工作方式】\n"
-            "- 先用只读工具了解现状（read_scene / list_exits / list_checks / lookup_script），再决定动作。\n"
-            "- 要推进场景就调 move_to；要投骰就调 roll_check；剧情明确产生新线索才调 set_flag。\n"
-            "- 需要某个 NPC 的设定时用 npc_card；出场了剧本里没有的新 NPC 时用 npc_introduce 建档。\n"
-            "- 忘了此前发生过什么（谁做过什么、拿过什么），用 recall_history 检索本局档案，别自己瞎猜。\n"
-            "- 收尾时调 finish(narration) 给出最终旁白；若无需推进任何东西，直接给旁白也可以。\n"
+            "【当前场景已经全给你了】\n"
+            "用户消息的【当前场景】里有：原文、DM 内幕、在场 NPC、"
+            "**每个出口及其解锁状态**、**可触发的检定（id / 技能 / DC）**。\n"
+            "这就是判断这一轮所需的全部信息 —— **不要再为了「确认一下」去调工具**。\n"
+            "- 要换场景：move_to（出口见【当前场景】）。它的返回值会带上新场景的完整信息，不必再读。\n"
+            "- 要投骰：roll_check（检定 id 见【当前场景】）。\n"
+            "- 只有这几种才需要查：剧本别处的设定用 lookup_script；"
+            "某个 NPC 的过往用 npc_card 或 recall_history；出场了剧本里没有的新 NPC 用 npc_introduce。\n"
+            "- 剧情明确产生新线索时才 set_flag。\n"
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
             "- 骰子只能由 roll_check 产生，你不得编造任何骰子结果，也不要在旁白里报出数值。\n"
@@ -90,7 +94,7 @@ class NarratorAgent(Agent):
         hist = self.chronicle.digest(6) if self.chronicle is not None else ""
         hist_block = f"\n【剧情档案（热层）】\n{hist}\n（需要更早的细节时用 recall_history 检索）" if hist else ""
         return (
-            f"{self.store.build_context(state.current_scene, user_input)}\n\n"
+            f"{self.store.build_context(state.current_scene, user_input, flags=state.flags)}\n\n"
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
@@ -99,26 +103,42 @@ class NarratorAgent(Agent):
             f"玩家行动：{user_input}"
         )
 
+    # ---- 预热 ----
+    async def warmup(self, ctx) -> bool:
+        """用**真实长度**的 prompt 空转一次前向，把首次 prefill 的成本提前付掉。
+
+        为什么值得：实测（4B Q4 / RTX 5060）DM 的第一次生成，2000 token 的 prompt 要
+        26 秒；同样长度第二次只要 7–10 秒。那 26 秒是引擎按序列长度做首次 prefill /
+        kernel 准备，不是模型本身慢。玩家进房之后本来就在等待室里等 —— 正好付在这里。
+
+        **不给工具**这句话现在只对"执行"成立：为了让 prefill 的长度与真实一轮**一致**，
+        这里仍然把工具 schema 发过去（它占 ~510 token，是 prompt 的大头之一），只是拿到
+        的 `tool_calls` 一律丢弃 —— 没有 handler 会跑，状态改不了。
+        `provider.needs_warmup` 让云 API / 本地服务直接跳过（首字延迟不在我们这边）。
+        """
+        if self.provider is None or not getattr(self.provider, "needs_warmup", False):
+            return False
+        msgs = [
+            {"role": "system", "content": self.system_prompt(ctx)},
+            {"role": "system", "content": self.secondary_prompt(ctx)},
+            {"role": "user", "content": self.build_user_message(ctx, "（预热，请只回复「好」）")},
+        ]
+        # schema 发过去只为凑长度；返回值丢掉
+        await self.provider.chat_with_tools(msgs, [t.schema() for t in self.build_tools(ctx)])
+        return True
+
     # ---- 工具 ----
+    # **只有 6 个**，而且刻意不含 list_exits / list_checks：两者要回答的问题
+    # （这个场景能往哪走、有什么检定）在【当前场景】里已经写好了，出口甚至带着
+    # 解锁状态。曾经实测一轮行动 6 次生成、55 秒，其中 3 次就是模型在「确认」这两件事
+    # 和重读当前场景 —— 信息重复提供 + 提示词命令它去查，它当然照办。
     def build_tools(self, ctx) -> list:
         tools = [
             Tool(
                 "read_scene",
-                "读取某个场景的完整内容（含 DM 内幕）。省略 scene_id 则读当前场景。只读。",
-                _obj({"scene_id": str_prop("场景 id，省略则当前场景")}),
+                "读取**其他**场景的原文与内幕（当前场景已在上下文里，不要为了确认而重读）。只读。",
+                _obj({"scene_id": str_prop("场景 id；省略则读当前场景")}),
                 self._t_read_scene,
-            ),
-            Tool(
-                "list_exits",
-                "列出当前场景的全部出口，以及每个出口的条件是否已满足。只读。",
-                _obj(),
-                self._t_list_exits,
-            ),
-            Tool(
-                "list_checks",
-                "列出当前场景可触发的检定（id / 技能 / 难度）。只读。",
-                _obj(),
-                self._t_list_checks,
             ),
             Tool(
                 "lookup_script",
@@ -156,7 +176,7 @@ class NarratorAgent(Agent):
                     _obj(
                         {
                             "query": str_prop("检索关键词，如某个 NPC 的名字或一桩事件"),
-                            "k": int_prop("返回条数", 4),
+                            "k": int_prop("返回条数", 3),
                             "actor": str_prop("只看与这个角色相关的记录，可选"),
                         }
                     ),
@@ -168,14 +188,14 @@ class NarratorAgent(Agent):
                 Tool(
                     "roll_check",
                     "让服务端投掷某个检定并应用结果（可能获得线索）。这是唯一产生骰子结果的途径。",
-                    _obj({"check_id": str_prop("检定 id，见 list_checks")}, ["check_id"]),
+                    _obj({"check_id": str_prop("检定 id，见【当前场景】的检定列表")}, ["check_id"]),
                     self._t_roll_check,
                     read_only=False,
                 ),
                 Tool(
                     "move_to",
                     "把队伍推进到某个出口指向的场景。仅当该出口存在且条件已满足时生效。",
-                    _obj({"scene_id": str_prop("目标场景 id，见 list_exits")}, ["scene_id"]),
+                    _obj({"scene_id": str_prop("目标场景 id，见【当前场景】的出口")}, ["scene_id"]),
                     self._t_move_to,
                     read_only=False,
                 ),
@@ -226,34 +246,19 @@ class NarratorAgent(Agent):
             "npcs": [{"name": n["name"], "role": n["role"]} for n in s.get("npcs", [])],
         }
 
-    def _t_list_exits(self, ctx):
-        cur = ctx.state.current()
-        return {
-            "exits": [
-                {"scene_id": e["to"], "label": e["label"], "unlocked": DM._exit_ok(e, ctx.state)}
-                for e in cur.get("exits", [])
-            ]
-        }
-
-    def _t_list_checks(self, ctx):
-        return {
-            "checks": [
-                {"check_id": c["id"], "skill": c["skill"], "dc": c.get("dc", 10)}
-                for c in ctx.state.current().get("checks", [])
-            ]
-        }
-
-    def _t_recall_history(self, ctx, query="", k=4, actor=""):
+    def _t_recall_history(self, ctx, query="", k=3, actor=""):
         if self.chronicle is None:
             return {"error": "本局未启用剧情档案"}
         hits = self.chronicle.search((query or "").strip(), k=k, actor=(actor or "").strip() or None)
+        # 每条截 300 字：这是一次工具结果，会**留在 messages 里**跟着后续每一次生成
+        # 重新 prefill（不像热层那样只回 6 条）。原来截 400 字 × 4 条 ≈ 1000 token。
         return {
             "hits": [
                 {
                     "turn": h.get("turn"),
                     "kind": h.get("kind"),
                     "scene": h.get("scene"),
-                    "text": (h.get("text") or "")[:400],
+                    "text": (h.get("text") or "")[:300],
                 }
                 for h in hits
             ],
@@ -339,7 +344,10 @@ class NarratorAgent(Agent):
             "ok": True,
             "scene_id": scene_id,
             "title": target["title"],
-            "note": "系统已广播新场景原文，你只需补一句简短衔接（可以留空）。",
+            # 把新场景整段带回去：否则模型下一句一定是 read_scene，白烧一次生成
+            # （实测这一跳 3–6 秒，而内容本来就在手里）。
+            "scene": self.store.scene_brief(scene_id, flags=ctx.state.flags),
+            "note": "系统已广播新场景原文。上面的 scene 就是新场景的全部信息，不用再 read_scene，只需补一句衔接（可以留空）。",
         }
 
     def _t_set_flag(self, ctx, flag=""):

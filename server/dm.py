@@ -177,7 +177,7 @@ class DM:
         """
         if self.provider is None:
             return ""
-        context = self.store.build_context(state.current_scene, action)
+        context = self.store.build_context(state.current_scene, action, flags=state.flags)
         messages = self._build_messages(state, context, action)
         try:
             raw = await self.provider.chat(messages, json_mode=True)

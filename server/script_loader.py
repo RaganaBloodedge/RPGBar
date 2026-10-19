@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_CHUNK_CHARS = 900  # 无结构文本单片上限
+# 次级 prompt 里最多列多少个切片。超出的折叠成一行提示：这些是**每轮都要重发**的
+# 固定开销，剧本一大（几十上百个场景）就会把本地 4B 的上下文吃光。
+MAX_INDEX_CHUNKS = 30
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(\S.*)$")
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？；!?;])")
 
@@ -485,8 +488,16 @@ def build_script_prompt(doc: ScriptDoc, audience: str = "dm") -> str:
     if index:
         lines.append("")
         lines.append("【切片索引】")
-        for c in index:
-            kw = f"（关键词：{'、'.join(c.keywords)}）" if c.keywords else ""
-            lines.append(f"- {c.id}｜{c.title}｜{c.chars} 字{kw}")
+        # 只给 id + 标题。字数与关键词曾经也列在这里，但那是给「人去挑切片」用的：
+        # 一行 40 字，剧本一长（几十个场景）就是几千 token 的**固定开销** —— 每轮
+        # 都要重新 prefill 一遍，而模型真正需要的信息（当前场景的原文/出口/检定）
+        # 已经在 user 消息里了。地图感留着，体积砍掉。
+        for c in index[:MAX_INDEX_CHUNKS]:
+            lines.append(f"- {c.id}｜{c.title}")
+        if len(index) > MAX_INDEX_CHUNKS:
+            lines.append(
+                f"（另有 {len(index) - MAX_INDEX_CHUNKS} 个场景未列出："
+                "用 lookup_script(关键词) 检索，或 read_scene(场景id) 直读。）"
+            )
         lines.append("正文不在此展开：需要某个切片时用 read_scene(场景id) 或 lookup_script(关键词) 按需读取。")
     return "\n".join(lines)

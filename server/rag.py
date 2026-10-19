@@ -141,7 +141,13 @@ class ScriptStore:
                     break
         return results
 
-    def scene_brief(self, scene_id: str) -> str:
+    def scene_brief(self, scene_id: str, flags=None) -> str:
+        """一个场景的完整工作台：原文 / 内幕 / NPC / 出口 / 检定。
+
+        **这是 DM 判断一轮所需的全部信息**，所以「当前场景」每次都整段注入 ——
+        既然已经给了，模型就不该再花一次生成去 `read_scene`。`flags` 给了就把每个
+        出口的解锁状态直接判好（`需 xxx`），省掉 `list_exits` 那一次调用。
+        """
         s = self.scenes.get(scene_id)
         if not s:
             return "(未知场景)"
@@ -153,7 +159,16 @@ class ScriptStore:
             lines.append(
                 "NPC：" + "；".join(f"{n.get('name', '?')}({n.get('role', '')})" for n in s["npcs"])
             )
-        exits = [f"{e['to']}({e['label']})" for e in s.get("exits", [])]
+        exits = []
+        for e in s.get("exits", []):
+            cond = e.get("condition")
+            if not cond:
+                mark = "可用"
+            elif flags is not None and cond in flags:
+                mark = "可用"
+            else:
+                mark = f"需 {cond}"
+            exits.append(f"{e['to']}({e['label']}｜{mark})")
         if exits:
             lines.append("出口：" + "；".join(exits))
         checks = [f"{c['id']}({c['skill']} DC{c['dc']})" for c in s.get("checks", [])]
@@ -161,9 +176,14 @@ class ScriptStore:
             lines.append("可触发的检定：" + "；".join(checks))
         return "\n".join(lines)
 
-    def build_context(self, scene_id: str, action: str, k: int = 3) -> str:
-        """组装注入 DM 的上下文：当前场景全文 + 检索到的相关场景片段。"""
-        parts = [f"【当前场景】\n{self.scene_brief(scene_id)}"]
+    def build_context(self, scene_id: str, action: str, k: int = 3, flags=None) -> str:
+        """组装注入 DM 的上下文：当前场景的完整工作台 + 检索到的相关场景片段。
+
+        `flags` 传进来只为一件事：把出口的解锁状态算好写在这里。否则模型要先调一次
+        `list_exits` 才知道能不能走 —— 那一次调用的成本是「一次完整 prefill + 一段
+        解码」，实测 3–6 秒，而信息本来就在手里。
+        """
+        parts = [f"【当前场景】\n{self.scene_brief(scene_id, flags=flags)}"]
         related = self.retrieve(scene_id, action, k=k)
         others = [sid for sid in related if sid != scene_id]
         if others:

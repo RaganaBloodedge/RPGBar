@@ -4,8 +4,10 @@
 工具集里没有任何能改游戏状态的东西，所以「小助手不会替玩家改剧情」不是靠提示词祈求，
 而是靠它拿不到写工具。
 
-- 只读工具：read_scene / list_valid_actions / lookup_script
-- finish(options)：输出 2-4 条建议
+- 只读工具：lookup_script（+ finish 收尾）
+- **没有 read_scene / list_valid_actions**：场景描述、可走的方向、可尝试的检定全都写在
+  每轮的 user 消息里了。小助手模型更小（1.7B），多一个"去查一下"的工具就多一次生成 ——
+  而它要回答的问题（给 3 条建议）本来不需要再多一次往返。
 
 这条通道是给「玩家自己机器上的 3B/4B 模型」准备的（也可以是主机端小模型）：
 把小助手指向 `http://127.0.0.1:8080/v1` 之类的本地地址即可，算力花在玩家自己身上。
@@ -33,21 +35,38 @@ ADVISOR_SYSTEM = (
     "【你的职责】\n"
     "1. 看着当前场景，给出 3 条玩家**当下就能做**的具体行动建议。\n"
     "2. 建议要短、要以动词开头（例如「检查石门」「合力抬开石闩」）。\n"
-    "【工作方式】\n"
-    "- 先调用 list_valid_actions 看有哪些合法选项，必要时用 read_scene / lookup_script 弄清场景。\n"
-    "- 最后调用 finish(options) 输出建议列表。\n"
+    "【当前场景已经全给你了】\n"
+    "用户消息里有场景描述、**可走的方向**、**可尝试的检定** —— 这些就是全部合法选项，"
+    "直接据此给建议，不用调工具确认。\n"
+    "- 只有想知道剧本别处的设定时，才用 lookup_script 检索。\n"
+    "- 最后用 finish(options) 给出建议列表。\n"
     "【硬性边界】\n"
     "- 你只能读，不能改剧情；不替玩家做决定，只给选项。\n"
     "- 每条建议不超过 15 字，且必须是当前场景真实可做的行动。\n"
 )
 
 
+def _valid_actions(scene) -> tuple:
+    """当前场景的合法选项 → (出口, 检定)。两边都按「给玩家看的名字」排。"""
+    exits = [(e.get("label") or e.get("to"), e.get("to")) for e in scene.get("exits", [])]
+    checks = []
+    for c in scene.get("checks", []):
+        kw = c.get("keywords") or []
+        checks.append((kw[0] if kw else c["id"], c["id"]))
+    return exits, checks
+
+
 def _advise_user(agent, ctx) -> str:
     state = ctx.state
     cur = state.current()
+    exits, checks = _valid_actions(cur)
+    moves = "、".join(label for label, _ in exits) or "（这里没有出口）"
+    tries = "、".join(label for label, _ in checks) or "（这里没有明确的检定）"
     return (
         f"当前场景：{cur.get('title', '')}（{cur.get('location', '')}）\n"
         f"地点描述：{cur.get('public_text', '')}\n"
+        f"可走的方向：{moves}\n"
+        f"可尝试的检定：{tries}\n"
         f"队伍已获线索：{'；'.join(agent.store.flag_label(f) for f in sorted(state.flags)) or '无'}\n"
         f"玩家：{ctx.player_name}\n"
         "请给出 3 条行动建议。"
@@ -81,24 +100,12 @@ class AdvisorAgent(ToolAgent):
         super().__init__(store, provider)
         self.register(ADVISE_TASK)
 
-    # ---- 只读工具（结构上拿不到写工具）----
+    # ---- 只读工具（结构上拿不到写工具；也没有"去查一下"这两个冗余项）----
     def _advisor_tools(self, ctx) -> list:
         return [
             Tool(
-                "read_scene",
-                "读取当前场景的公开描述（不含只有 DM 知道的内幕）。只读。",
-                _obj({"scene_id": str_prop("场景 id，省略则当前场景")}),
-                self._t_read_scene,
-            ),
-            Tool(
-                "list_valid_actions",
-                "列出当前场景所有合法的行动选项：出口（可移动）与可尝试的检定。只读。",
-                _obj(),
-                self._t_list_valid_actions,
-            ),
-            Tool(
                 "lookup_script",
-                "在剧本里检索与关键词最相关的片段。只读。",
+                "在剧本里检索与关键词最相关的片段（想了解别处的设定时才用）。只读。",
                 _obj({"query": str_prop("检索关键词"), "k": int_prop("返回条数", 3)}),
                 self._t_lookup_script,
             ),
@@ -122,26 +129,6 @@ class AdvisorAgent(ToolAgent):
     # 兼容旧调用：冒烟测试直接调 build_tools(ctx)
     def build_tools(self, ctx) -> list:
         return self._advisor_tools(ctx)
-
-    def _t_read_scene(self, ctx, scene_id=""):
-        sid = (scene_id or "").strip() or ctx.state.current_scene
-        s = self.store.get_scene(sid)
-        if not s:
-            return {"error": f"未知场景：{sid}"}
-        # 注意：不下发 dm_notes（那是 DM 的内幕），小助手不该看到
-        return {"id": s["id"], "title": s["title"], "location": s["location"], "public_text": s["public_text"]}
-
-    def _t_list_valid_actions(self, ctx):
-        scene = ctx.state.current()
-        exits = [
-            {"option": e["label"], "kind": "move", "target": e["to"]}
-            for e in scene.get("exits", [])
-        ]
-        checks = [
-            {"option": (c.get("keywords") or [c["id"]])[0], "kind": "attempt", "check_id": c["id"]}
-            for c in scene.get("checks", [])
-        ]
-        return {"exits": exits, "attempts": checks}
 
     def _t_lookup_script(self, ctx, query="", k=3):
         k = max(1, min(int(k or 3), 6))

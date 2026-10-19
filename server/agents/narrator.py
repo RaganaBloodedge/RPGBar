@@ -42,6 +42,37 @@ NARRATOR_JSON_HINT = {
     ),
 }
 
+# 「这句话是不是在宣称检定成功了」——用来兜住 4B 最常犯的那个错：
+# 骰子判失败，旁白却写「石闩被缓缓抬起」。命中就丢掉模型这一段。
+_SUCCESS_WORDS = (
+    "成功", "发现", "拿到", "得手", "打开", "推开", "抬起", "破解",
+    "找到", "取下", "识破", "看穿", "撬开", "砸开",
+)
+_NEGATIONS = ("没", "未", "无", "不", "别")
+
+
+def asserts_success(text: str) -> str:
+    """文本里有没有「做到了」的断言；排除「未能发现」「空无一物」这类否定/中性写法。
+
+    命中就返回那个词（用于日志与测试），没命中返回空串。
+    只看词前 4 个字里有没有否定词 —— 中文的否定几乎都贴着动词。
+    """
+    for word in _SUCCESS_WORDS:
+        i = text.find(word)
+        while i >= 0:
+            if not any(n in text[max(0, i - 4):i] for n in _NEGATIONS):
+                return word
+            i = text.find(word, i + 1)
+    return ""
+
+
+def echoes_text(text: str, source: str, probe: int = 40) -> bool:
+    """旁白是不是把已经播报过的原文整段抄了一遍（取前 40 字做探针）。"""
+    src = (source or "").strip()
+    if len(src) < probe or not text:
+        return False
+    return src[:probe] in text
+
 
 class NarratorAgent(Agent):
     name = "narrator"
@@ -53,6 +84,49 @@ class NarratorAgent(Agent):
         self.store = store
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
         self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
+
+    async def run(self, ctx, user_input: str = "") -> AgentResult:
+        """跑一轮，并在返回前**核一遍旁白与权威结果是否打架**。
+
+        两种打架都会把模型那一段丢掉（`drop_reason` 留痕，测试用它断言）：
+
+        1. 本轮有失败的检定，旁白却写成成功 —— 实测 27% 的失败检定点会这样；
+        2. 刚换场景，旁白把系统已经播报过的场景原文又抄一遍 —— 实测 24% 的推进轮。
+
+        丢掉不等于「没产出」：权威文案（检定结果 / 新场景原文）本来就是系统自己广播的，
+        玩家一个字都不会少。宁可少一句衔接，也不给一句自相矛盾的话。
+        """
+        before = ctx.state.current_scene
+        res = await super().run(ctx, user_input)
+        reason = self._guard_narration(ctx, res.text or "", before)
+        if reason:
+            res.drop_reason = reason
+            res.text = ""
+        return res
+
+    def _guard_narration(self, ctx, text: str, before_scene: str) -> str:
+        if not (text or "").strip():
+            return ""
+        # 工具返回值里那句「系统已广播新场景原文，你只需补一句衔接」被 4B 原样念出来过
+        # （`系统已广播新场景原文。甬道深处传来石门的低鸣…`）—— 玩家不该看见系统指令。
+        if "系统已广播" in text or "你只需补一句" in text:
+            return "把系统指令念成了旁白"
+        if any(e.get("type") == "dice" and not e.get("success") for e in ctx.events):
+            word = asserts_success(text)
+            if word:
+                return f"检定失败却写成成功（{word}）"
+        if ctx.state.current_scene != before_scene:
+            if echoes_text(text, ctx.state.current().get("public_text", "")):
+                return "复述了系统刚播报的场景原文"
+        # 热层里存着最近几条旁白原文，模型会直接抄回来 —— 实测越界局里
+        # 连续两轮一字不差，其中一轮骰子还是反的。逐字相同的旧旁白一律丢掉：
+        # 这一轮本来也没有新信息，少一句好过给一句假话。
+        if self.chronicle is not None:
+            t = text.strip()
+            for e in self.chronicle.entries[-4:]:
+                if e.get("kind") == "narration" and (e.get("text") or "").strip() == t:
+                    return "与之前某轮的旁白逐字重复"
+        return ""
 
     # ---- 提示词 ----
     # 第一层：System prompt —— 只写「我是谁、我能做什么、我的边界」，与具体剧本无关。
@@ -75,6 +149,13 @@ class NarratorAgent(Agent):
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
             "- 骰子只能由 roll_check 产生，你不得编造任何骰子结果，也不要在旁白里报出数值。\n"
+            "- **检定失败就写失败**：说「没做到、一无所获、看不出所以然」，"
+            "绝不写门被打开、东西被拿到、线索被发现。\n"
+            "- **新场景的原文系统已经播报了**：move_to 之后只补一句衔接，不要复述原文。\n"
+            "- **剧本之外的动作不要顺着他演**：玩家要生火、挖墙、抢人东西、骂人、跳过剧情，"
+            "就用一句话说明这里做不到（或没人理他），然后把选择权交回给玩家。\n"
+            "- **玩家问规则或元问题**（能不能存档、你是不是 AI、这关怎么过），"
+            "用一句话直接回答，不要当没听见，也不要借机推进剧情或投骰。\n"
             "- 剧本中标注为「DM 内幕」的内容是你的底牌，不能直接说出口。\n"
             "- move_to / roll_check 调用后系统会自行广播权威结果，你的最终旁白只补一句衔接（可以留空）。\n"
         )
@@ -317,7 +398,16 @@ class NarratorAgent(Agent):
             # 但照旧**不要在旁白里报数字**（提示词里那条硬边界不变）。
             "ability": f"{attr} {mod:+d}" if attr else "",
             "flag_gained": check.get("success_flag") if ok else None,
-            "note": "系统已投骰并广播结果，你只需补一句简短衔接。",
+            # 这一行是给 4B 看的**硬指令**。实测它会把失败当成功写：
+            # 力量检定掷出 11 vs DC13（石闩纹丝不动），下一句却是「石闩被缓缓抬起」。
+            # 光在 system prompt 里写「遵循结果」不够 —— 工具返回是每轮都在眼前的，
+            # 提示词是几十轮前就沉到上下文底部的。
+            "note": (
+                "成功。旁白可以写他做到了。"
+                if ok else
+                "**失败**。旁白必须写成「没做到 / 一无所获 / 看不出所以然」，"
+                "不得写出只有成功才会出现的结果（门被打开、东西被拿到、线索被发现）。"
+            ),
         }
 
     def _t_move_to(self, ctx, scene_id=""):

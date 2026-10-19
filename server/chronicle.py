@@ -252,7 +252,9 @@ class Chronicle:
             lines.append(f"【此前剧情概要】{self.summary}")
         rec = self.recent(n)
         if rec:
-            lines.append("【最近发生】")
+            # 括号里那句话是给模型的：热层存的就是**旁白原文**，4B 会直接抄回来
+            # （实测连续两轮一字不差）。提示一次比事后全靠护栏兜更省事。
+            lines.append("【最近发生】（已经播报过的内容，不要原样复述）")
             for e in rec:
                 who = "、".join(e.get("actors") or [])
                 tag = f"{who}：" if who else ""

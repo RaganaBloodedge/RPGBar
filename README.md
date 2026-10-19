@@ -44,13 +44,17 @@ python -m server.main
 
 | Agent | 模型量级 | 能用的工具 | 干什么 |
 | --- | --- | --- | --- |
-| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `list_exits` `list_checks` `lookup_script` `npc_card` `recall_history`（只读）+ `move_to` `set_flag` `roll_check` `npc_introduce`（改状态） | 推进剧情、投骰判定、扮 NPC、回忆前情 |
+| **主机 DM**（`NarratorAgent`） | 大模型 | `read_scene` `lookup_script` `npc_card` `recall_history`（只读）+ `move_to` `set_flag` `roll_check` `npc_introduce`（改状态） | 推进剧情、投骰判定、扮 NPC、回忆前情 |
 | **主机小助手**（`AssistantAgent`） | 小模型 | 无（固定流程单轮 JSON） | 给剧本外 NPC 生成人物小传、算反应权重、滚动剧情摘要 |
-| **玩家小助手**（`AdvisorAgent`） | 小模型 | `read_scene` `list_valid_actions` `lookup_script`（**全是只读**） | 给你 2-4 条行动建议 |
+| **玩家小助手**（`AdvisorAgent`） | 小模型 | `lookup_script`（**只读**） | 给你 2-4 条行动建议 |
 
 小助手改不了剧情，不是靠提示词求它别改，而是**它的工具集里根本没有写工具**。
 两台小助手其实是**同一个任务引擎（`ToolAgent`）上的两条固定流程**——`persona` / `react_weights` / `action_advice`
 各自是一条独立的 COT（职责 system + 输出 schema + 结果校验），共用同一个 `server/agents/tool_agent.py`。
+
+> **DM 的工具集里刻意没有 `list_exits` / `list_checks`。** 当前场景的原文、内幕、NPC、出口（含解锁状态）
+> 与检定清单本来就整段写在每轮的 user 消息里；再给两个"去查一下"的工具，小模型就会真的去查 ——
+> 实测一轮 6 次生成 / 55 秒，其中 3 次是这种重复劳动。删掉后同一轮 2–4 次生成，热态 **8–15 秒**。
 
 > **默认三个槽位都是「留空」，但留空 = 玩不了。** 本仓库**没有脚本化兜底**（2026-10-13 起）：
 > 槽位没接模型就没有旁白、没有剧情推进，界面会直接把「本轮没有生成（原因）」摆出来。
@@ -379,8 +383,8 @@ python scripts/smoke_test.py --unit # 仅进程内
 npm i jsdom && node scripts/ui_check.js
 ```
 
-当前 **549 项**（Python：离线 **418 项** + 实时联机校验 **131 项**）+ **199 项**（前端 DOM，可选）。
-> ⚠️ 不带服务器跑 Python 冒烟只会打印 `418 通过 / 0 失败` —— 实时那部分打了 `[SKIP]`，
+当前 **569 项**（Python：离线 **438 项** + 实时联机校验 **131 项**）+ **199 项**（前端 DOM，可选）。
+> ⚠️ 不带服务器跑 Python 冒烟只会打印 `438 通过 / 0 失败` —— 实时那部分打了 `[SKIP]`，
 > 那是"一部分没跑"，不是"整套全过"。`ui_check.js` 默认打 `127.0.0.1:8000`，
 > 服务器在别的端口时用 `RPGBAR_BASE_URL` 指过去。
 > 实时那组会等 DM 真推理，跑之前先把内置引擎关掉（`RPGBAR_ENGINE=0`），否则一轮 35–180 秒，会成片超时。

@@ -1025,8 +1025,90 @@ async def run_unit_chronicle():
     check("预热：云 API 这类没有 needs_warmup 的 Provider 不参与",
           await NarratorAgent(store, FakeProvider([])).warmup(NarratorContext(state=st_w)) is False, "")
 
+    # --- 11. 旁白护栏：旁白与权威结果打架时丢掉旁白 ---
+    #  实跑 25 轮里，15 次检定有 4 次被写成成功；6 次推进里 6 次把已播报的原文又抄一遍。
+    #  这两种都不该让玩家看到 —— 权威文案系统已经广播过了。
+    from server import agents as _agents_pkg  # noqa: F401  (确保模块已加载)
+    from server.agents import narrator as narrator_mod
+
+    # 这两条要用「蛇王墓」这份剧本：它才有石闩与卡特。
+    l1 = ScriptStore(str(Path(__file__).resolve().parent.parent / "scripts" / "totsk_l1.json"))
+    l1_start = l1.start_scene
+    check("护栏：『石闩被缓缓抬起』被判成成功语气",
+          narrator_mod.asserts_success("石闩被缓缓抬起，铁钉随之上升。") == "抬起", "")
+    check("护栏：『你未能发现』不算成功语气",
+          narrator_mod.asserts_success("你未能发现任何机关的细节。") == "", "")
+    check("护栏：『一无所获』不算成功语气",
+          narrator_mod.asserts_success("你们扒了半天，一无所获。") == "", "")
+    _pt = l1.get_scene(l1_start)["public_text"]
+    check("护栏：整段复述场景原文能被识别",
+          narrator_mod.echoes_text("他抬头看了看。" + _pt[:60], _pt) is True, "")
+    check("护栏：只补一句衔接不算复述",
+          narrator_mod.echoes_text("你推门走了进去，湿气扑面。", _pt) is False, "")
+
+    _orig_roll = narrator_mod.dice.roll_check
+    try:
+        # 11a. 检定失败 + 旁白写成功
+        narrator_mod.dice.roll_check = lambda skill, dc, mod=0: {
+            "skill": skill, "dc": dc, "roll": 1, "mod": mod, "total": 1 + mod, "success": False,
+        }
+        st_f = GameState(l1, l1_start)
+        st_f.add_player("测试员", {})
+        fp = FakeProvider([
+            _reply(tool_call("roll_check", {"check_id": "ask_patron"})),
+            _reply(tool_call("finish", {"narration": "卡特点了点头——你发现了铭文的秘密。"})),
+        ])
+        ctx_f = NarratorContext(state=st_f, player_name="测试员")
+        res_f = await NarratorAgent(l1, fp).run(ctx_f, "我凑近看看浮雕")
+        check("护栏：检定失败却写成成功 → 丢掉模型那段",
+              res_f.text == "" and "失败" in getattr(res_f, "drop_reason", ""),
+              f"text={res_f.text!r} reason={getattr(res_f, 'drop_reason', '')}")
+        check("护栏：丢掉旁白不影响权威骰子事件",
+              any(e.get("type") == "dice" and e.get("success") is False for e in ctx_f.events), "")
+        check("护栏：权威失败文案仍在（玩家不会少信息）",
+              any("卡特" in p for p in ctx_f.narration_parts), str(ctx_f.narration_parts)[:60])
+
+        # 11b. 换场景 + 旁白把新场景原文又抄一遍
+        fp2 = FakeProvider([
+            _reply(tool_call("move_to", {"scene_id": "entrance_hall"})),
+            _reply(tool_call("finish", {"narration": l1.get_scene("entrance_hall")["public_text"]})),
+        ])
+        st_e = GameState(l1, l1_start)
+        st_e.add_player("测试员", {})
+        res_e = await NarratorAgent(l1, fp2).run(
+            NarratorContext(state=st_e, player_name="测试员"), "我钻进石门")
+        check("护栏：推进后复述新场景原文 → 丢掉模型那段",
+              res_e.text == "" and "复述" in getattr(res_e, "drop_reason", ""),
+              f"text={res_e.text[:40]!r} reason={getattr(res_e, 'drop_reason', '')}")
+        check("护栏：场景确实推进了", st_e.current_scene == "entrance_hall", st_e.current_scene)
+
+        # 11c. 模型把热层里的旧旁白抄回来（越界局实测：连续两轮一字不差）
+        ch_g = Chronicle(tmp / "g.jsonl")
+        ch_g.add("李维的火堆在雨中摇曳，却无法驱散阴冷。", turn=1, kind="narration")
+        fp3 = FakeProvider([_reply(tool_call("finish", {"narration": "李维的火堆在雨中摇曳，却无法驱散阴冷。"}))])
+        st_g = GameState(l1, l1_start)
+        st_g.add_player("测试员", {})
+        res_g = await NarratorAgent(l1, fp3, chronicle=ch_g).run(
+            NarratorContext(state=st_g, player_name="测试员"), "我生火")
+        check("护栏：抄旧旁白 → 丢掉并说明原因",
+              res_g.text == "" and "重复" in getattr(res_g, "drop_reason", ""),
+              getattr(res_g, "drop_reason", ""))
+        res_i = await NarratorAgent(l1, FakeProvider([
+            _reply(tool_call("finish", {"narration": "系统已广播新场景原文。甬道深处传来低鸣。"}))]
+        )).run(NarratorContext(state=st_g, player_name="测试员"), "我往前走")
+        check("护栏：把系统指令念成旁白 → 丢掉",
+              res_i.text == "" and "指令" in getattr(res_i, "drop_reason", ""),
+              getattr(res_i, "drop_reason", ""))
+        res_h = await NarratorAgent(l1, FakeProvider([
+            _reply(tool_call("finish", {"narration": "李维蹲下拨开碎石，露出一道浅浅的划痕。"}))]
+        )).run(NarratorContext(state=st_g, player_name="测试员"), "我拨开碎石")
+        check("护栏：没有档案可抄时不会误判", res_h.text != "", res_h.text[:24])
+    finally:
+        narrator_mod.dice.roll_check = _orig_roll
+
     # 清理
-    for f in (jsonl, tmp / "c.meta.json", tmp / "v.jsonl", tmp / "v.meta.json"):
+    for f in (jsonl, tmp / "c.meta.json", tmp / "v.jsonl", tmp / "v.meta.json",
+              tmp / "g.jsonl", tmp / "g.meta.json"):
         if f.exists():
             f.unlink()
     try:

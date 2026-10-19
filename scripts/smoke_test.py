@@ -44,10 +44,10 @@ from server.chronicle import Chronicle
 from server.dice import seed as dice_seed
 from server.dm import DM
 from server.embedding import Embedder
-from server.llm import ToolCallingUnsupported, build_provider
+from server.llm import EngineProvider, ToolCallingUnsupported, build_provider
 from server.npc import ARCHETYPES, NpcService, PersonaCard, infer_archetype
 from server.rag import ScriptStore
-from server.script_loader import build_script_prompt, parse_script
+from server.script_loader import MAX_INDEX_CHUNKS, build_script_prompt, parse_script
 from server.state_machine import GameState
 
 SCRIPT = Path(__file__).resolve().parent / "sample_script.json"
@@ -386,6 +386,71 @@ async def run_unit_scripts():
           [m["role"] for m in dm_msgs] == ["system", "system", "user"],
           str([m["role"] for m in dm_msgs]))
 
+    # --- 6.5 上下文瘦身：每轮都要重发的东西，一点冗余都不留 ---
+    # 实测（RTX 5060 / 4B Q4）：一轮 6 次生成 / 55 秒，其中 3 次是模型在「确认」
+    # 当前场景的出口与检定 —— 而这两样本来就写在 user 消息里了。下面把这件事钉住。
+    ctx0 = NarratorContext(state=state, player_name="A")
+    tool_names = [t.name for t in n_agent.build_tools(ctx0)]
+    check("DM 工具不含 list_exits / list_checks（信息已在【当前场景】里）",
+          "list_exits" not in tool_names and "list_checks" not in tool_names, str(tool_names))
+    check("无 NPC/档案时 DM 只有这 6 件工具",
+          set(tool_names) == {"read_scene", "lookup_script", "roll_check", "move_to", "set_flag", "finish"},
+          str(sorted(tool_names)))
+
+    # 出口的解锁状态直接算进【当前场景】，省掉 list_exits 那次调用
+    brief = st.scene_brief(st.start_scene)
+    check("场景简报自带出口与检定清单",
+          ("出口：" in brief or "可触发的检定：" in brief), brief[-160:])
+    cond = next(
+        (e.get("condition") for s in st.scenes.values() for e in s.get("exits", []) if e.get("condition")),
+        None,
+    )
+    if cond:
+        sid = next(
+            sid for sid, s in st.scenes.items()
+            if any(e.get("condition") == cond for e in s.get("exits", []))
+        )
+        check("未拿到 flag 时出口标「需 xxx」", f"需 {cond}" in st.scene_brief(sid), st.scene_brief(sid))
+        check("拿到 flag 后同一出口标「可用」",
+              f"需 {cond}" not in st.scene_brief(sid, flags={cond}), st.scene_brief(sid, flags={cond}))
+        check("不传 flags 时也要标出前置条件（不知道状态就别装作能走）",
+              f"需 {cond}" in st.scene_brief(sid, flags=None), "")
+
+    # build_context 把 flags 透下去（否则上面那套等于白算）
+    ctx_txt = st.build_context(st.start_scene, "看看四周", flags=state.flags)
+    check("build_context 把 flag 状态透传给场景简报", "可用" in ctx_txt, ctx_txt[:80])
+
+    # move_to 把新场景整段带回去 —— 不然模型下一句一定是 read_scene，白烧一次生成
+    ready = [e["to"] for e in state.current().get("exits", []) if DM._exit_ok(e, state)]
+    if ready:
+        r = n_agent._t_move_to(NarratorContext(state=GameState(st, st.start_scene), player_name="A"), ready[0])
+        check("move_to 的返回值带新场景简报", "scene" in r and "公开文本" in (r.get("scene") or ""),
+              str(r)[:140])
+
+    # 切片索引封顶：大剧本不再把上下文吃光
+    big_doc = {
+        "title": "大本压测",
+        "system": "世界观。" * 20,
+        "start_scene": "s000",
+        "scenes": [
+            {
+                "id": f"s{i:03d}", "title": f"第{i}间", "location": "地宫",
+                "public_text": "一段场景描写。" * 4,
+                "exits": ([{"to": f"s{i + 1:03d}", "label": "向前", "condition": None}]
+                          if i < 59 else []),
+                "checks": [],
+            }
+            for i in range(60)
+        ],
+    }
+    st_big = ScriptStore.from_content(json.dumps(big_doc, ensure_ascii=False), "big.json")
+    p_big = st_big.script_prompt
+    check(f"大剧本的切片索引封顶在 {MAX_INDEX_CHUNKS} 行",
+          p_big.count("\n- ") == MAX_INDEX_CHUNKS, str(p_big.count("\n- ")))
+    check("折叠后给出「按关键词检索」的出口", "未列出" in p_big, p_big[-160:])
+    check("索引行不再列字数与关键词（那是给人挑切片用的）",
+          " 字" not in p_big and "关键词：" not in p_big, p_big[-200:])
+
     # --- 7. 无结构文本：自动切段 + 线性场景链 ---
     md = (
         "# 第一章 迷雾渡口\n夜色里渡船靠岸，船夫说河对岸有座白塔。\n\n"
@@ -582,10 +647,15 @@ async def run_unit_agents():
         str([t.name for t in adv_tools]),
     )
     check(
-        "小助手：读场景不下发 DM 内幕",
-        "dm_notes" not in json.dumps(adv_tools[0].handler(AdvisorContext(state=GameState(store, start))), ensure_ascii=False),
-        "",
+        "小助手：不再有 read_scene / list_valid_actions（信息已在 user 消息里）",
+        {t.name for t in adv_tools} == {"lookup_script", "finish"},
+        str([t.name for t in adv_tools]),
     )
+    adv_ctx5 = AdvisorContext(state=GameState(store, start))
+    adv_user = adv.build_user_message(adv_ctx5)
+    check("小助手：user 消息带「可走的方向」与「可尝试的检定」",
+          "可走的方向：" in adv_user and "可尝试的检定：" in adv_user, adv_user[:160])
+    check("小助手：user 消息不含 DM 内幕（dm_notes）", "dm_notes" not in adv_user, "")
 
     # --- 6. 小助手：接了模型走工具循环，没接就显式失败（取消脚本化兜底） ---
     s6 = GameState(store, start)
@@ -936,6 +1006,24 @@ async def run_unit_chronicle():
     # --- 9. 热层注入 user 消息（只给结论，不灌全文） ---
     msg = n_with.build_user_message(NarratorContext(state=state), "看看周围")
     check("DM：user 消息带剧情档案热层", "剧情档案（热层）" in msg, "")
+
+    # --- 10. 预热：把「首次前向」的成本挪到等待室 ---
+    #  实测 4B：2000 token 的首次生成 26 秒，同长度第二次 7-10 秒。预热就是空转一次，
+    #  所以它必须**只发请求、不执行工具**（拿到 tool_calls 也丢掉）。
+    wp = FakeProvider([_reply(tool_call("move_to", {"scene_id": "nowhere"}))])
+    wp.needs_warmup = True
+    st_w = GameState(store, store.start_scene)
+    ok = await NarratorAgent(store, wp).warmup(NarratorContext(state=st_w, player_name="（预热）"))
+    check("预热：真的发了一次请求", ok and len(wp.seen) == 1, str(len(wp.seen)))
+    check("预热：请求里带工具声明（为了让 prefill 长度与真实一轮一致）",
+          len(wp.seen[0]) == 3 and len(wp.seen[0][2]) > 0,
+          str(len(wp.seen[0][2]) if len(wp.seen[0]) > 2 else 0))
+    check("预热：模型回了 move_to，但场景没动（没有 handler 跑）",
+          st_w.current_scene == store.start_scene, st_w.current_scene)
+    check("预热：没有模型时直接跳过",
+          await NarratorAgent(store, None).warmup(NarratorContext(state=st_w)) is False, "")
+    check("预热：云 API 这类没有 needs_warmup 的 Provider 不参与",
+          await NarratorAgent(store, FakeProvider([])).warmup(NarratorContext(state=st_w)) is False, "")
 
     # 清理
     for f in (jsonl, tmp / "c.meta.json", tmp / "v.jsonl", tmp / "v.meta.json"):
@@ -1910,6 +1998,30 @@ async def run_unit_engine():
     _h1 = _lib.model_for("D:/m/X.gguf")
     _h2 = _lib.model_for("D:/m/X.gguf")
     check("引擎：同一路径只加载一次权重", _h1 == _h2 and _lib.loads == 1, f"loads={_lib.loads}")
+
+    # 4d. needs_warmup：建会话之前为真，跑过一次之后为假（决定要不要在等待室预热）
+    class _WarmLib:
+        path = "D:/fake/rpg_engine.dll"
+
+        def model_for(self, *a, **k):
+            return 11
+
+        def new_session(self, *a, **k):
+            return 22
+
+        def destroy_session(self, s):
+            pass
+
+        def generate(self, sess, req):
+            return {"text": "好", "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        def model_backend(self, m):
+            return "gpu"
+
+    p_w = EngineProvider(_WarmLib(), "D:/m/W.gguf")
+    check("引擎：还没生成过时 needs_warmup 为真", p_w.needs_warmup is True, "")
+    p_w._ensure()
+    check("引擎：建了会话之后 needs_warmup 为假", p_w.needs_warmup is False, "")
 
     # 5. 随机种子：引擎是纯函数，随机数由宿主给的 seed 展开。
     #    「谁带 seed、谁带 temperature」是一条协议（种子落在会话上、温度落在请求上），

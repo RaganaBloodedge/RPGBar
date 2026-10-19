@@ -40,6 +40,13 @@
   var joinDeny = null;
   var closedNotice = null;
 
+  // ---- 角色卡 ----
+  // cardState：服务端下发的 {status, error, needs_card, card}（status: pending/ready/failed）
+  // cardDraft：我正在调的属性值（未提交时以它为准；提交成功后由 state 回存覆盖）
+  var cardState = null;
+  var cardDraft = {};
+  var cardSubmitted = false;
+
   // 剧本名由服务端提供（/api/version 与 welcome），界面各处跟随它，不再写死。
   function setScript(name) {
     if (!name) return;
@@ -207,6 +214,15 @@
     });
   }
 
+  // 检定的算式：有属性加值时写全「d20 14 +2 = 16」，没有就退回原来的「d20=14」。
+  // 加值是服务端按角色卡算好一起发下来的 —— 前端不自己算，免得两边算不一样。
+  function diceMath(msg) {
+    var mod = typeof msg.mod === "number" ? msg.mod : 0;
+    if (!mod) return "d20=" + msg.roll;
+    var total = typeof msg.total === "number" ? msg.total : msg.roll + mod;
+    return "d20 " + msg.roll + (mod > 0 ? " +" + mod : " " + mod) + " = " + total;
+  }
+
   function addEntry(kind, author, text) {
     var div = document.createElement("div");
     div.className = "entry " + kind;
@@ -273,12 +289,17 @@
     playersEl.innerHTML = "";
     (state.players || []).forEach(function (p) {
       var li = document.createElement("li");
-      li.textContent = p.name + " · " + (p.character && p.character.cls ? p.character.cls : "");
+      var bits = [p.name];
+      if (p.character && p.character.cls) bits.push(p.character.cls);
+      var attrs = attrsLine(p.character);
+      if (attrs) bits.push(attrs);
+      li.textContent = bits.join(" · ");
       playersEl.appendChild(li);
     });
     // 等待室要显示同一份队伍名单（房间快照里只有人数，没有名单），先缓存起来
     playersCache = state.players || [];
     renderWaitPlayers();
+    syncCardFromState();
 
     flagsEl.innerHTML = "";
     var details = state.flag_details;
@@ -428,6 +449,9 @@
         renderMemory(msg.memory);
         // 房间快照：等待室画什么、顶栏显示什么，全看它
         renderRoomInfo(msg.room_info);
+        // 角色卡：这个本要不要填卡（还没分析完就是 pending，稍后会有 character_schema）
+        cardState = msg.card_state || null;
+        renderCard();
         addEntry(
           "system",
           "",
@@ -448,6 +472,26 @@
         isOwner = !!(msg.agents && msg.agents.owner === you);
         applyAgents(msg.agents);
         renderRoomSync(msg);
+        break;
+      case "character_schema":
+        // 剧本分析的结果（含「还在分析」与「分析失败」两个中间态）
+        cardState = msg;
+        cardSubmitted = false; // 新到的卡可能换了属性，草稿要按新卡重来
+        cardDraft = {};
+        renderCard();
+        renderWaitPlayers();
+        if (msg.status === "failed" && msg.error) {
+          addEntry("system", "角色卡", "这个剧本的角色卡没分析出来：" + msg.error + "（房主可以在等待室里点「重试」）");
+        }
+        break;
+      case "character_ok":
+        cardSubmitted = true;
+        cardMsg("已提交" + (msg.summary ? "：" + msg.summary : ""), "ok");
+        renderCard();       // 按钮文案跟着变成「更新角色卡」
+        renderWaitPlayers();
+        break;
+      case "character_rejected":
+        cardMsg((msg.errors || ["没通过校验"]).join("；"), "bad");
         break;
       case "not_started":
         addEntry("system", "还不能行动", msg.message || "等房主开始这一局。");
@@ -486,7 +530,8 @@
       case "dice":
         var label = msg.skill === "d20"
           ? msg.player + " 掷出了 d20 → " + msg.roll
-          : msg.player + " 进行「" + msg.skill + "」检定：d20=" + msg.roll + " vs DC" + msg.dc + " → " + (msg.success ? "成功" : "失败");
+          : msg.player + " 进行「" + msg.skill + "」检定："
+            + diceMath(msg) + " vs DC" + msg.dc + " → " + (msg.success ? "成功" : "失败");
         addEntry(msg.success === false ? "dice fail" : "dice", "骰子", label);
         break;
       case "suggestions":
@@ -1786,6 +1831,14 @@
         cls.textContent = p.character.cls;
         row.appendChild(cls);
       }
+      if (cardState && cardState.needs_card) {
+        // 房主靠这一列判断「人齐了但还有谁没填卡」，不用挨个问
+        var filled = !!(p.character && p.character.attrs && Object.keys(p.character.attrs).length);
+        var tag = document.createElement("span");
+        tag.className = "card-tag" + (filled ? " done" : "");
+        tag.textContent = filled ? "已填卡" : "未填卡";
+        row.appendChild(tag);
+      }
       if (p.name === owner) {
         var flag = document.createElement("span");
         flag.className = "host-flag";
@@ -1805,6 +1858,176 @@
       }
       ul.appendChild(row);
     });
+  }
+
+  // ---------------------------------------------------------------- 角色卡
+  // 全部逻辑围绕两个东西：服务端下发的 cardState（权威形状）与本地 cardDraft（我的草稿）。
+  // 加减号只是「帮我把数字拼对」，真正的校验在服务端 —— 改 JS 发任意数字过去也会被拒。
+
+  function cardMsg(text, cls) {
+    var el = document.getElementById("card-msg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = "hint small" + (cls ? " " + cls : "");
+  }
+
+  // 队伍名单里那行属性摘要（没卡 / 没填就返回空串，界面一个字都不多）
+  function attrsLine(character) {
+    var card = cardState && cardState.card;
+    if (!card || !card.required) return "";
+    var attrs = (character && character.attrs) || {};
+    var parts = [];
+    (card.attributes || []).forEach(function (a) {
+      if (typeof attrs[a.key] === "number") parts.push(a.key + " " + attrs[a.key]);
+    });
+    return parts.join(" · ");
+  }
+
+  function cardUsed() {
+    var card = cardState && cardState.card;
+    if (!card) return 0;
+    var used = 0;
+    (card.attributes || []).forEach(function (a) {
+      var v = typeof cardDraft[a.key] === "number" ? cardDraft[a.key] : a.base;
+      used += Math.max(0, v - a.base);
+    });
+    return used;
+  }
+
+  function cardLeft() {
+    var card = cardState && cardState.card;
+    return card ? Math.max(0, card.total_points - cardUsed()) : 0;
+  }
+
+  // 草稿按当前的卡对齐一次：缺的补 base，越界的夹回区间
+  function ensureCardDraft() {
+    var card = cardState && cardState.card;
+    if (!card) return;
+    var next = {};
+    (card.attributes || []).forEach(function (a) {
+      var v = cardDraft[a.key];
+      next[a.key] = typeof v === "number" ? Math.max(a.min, Math.min(a.max, v)) : a.base;
+    });
+    cardDraft = next;
+  }
+
+  function renderCard() {
+    var panel = document.getElementById("card-panel");
+    if (!panel) return;
+    var cs = cardState || {};
+    var show = !!(cs.status === "ready" && cs.needs_card && cs.card);
+    panel.classList.toggle("hidden", !show);
+
+    // 分析中 / 分析失败：只留一行状态，不占版面。失败时给个「重试分析」。
+    var statusEl = document.getElementById("card-status");
+    var statusText = document.getElementById("card-status-text");
+    var retry = document.getElementById("card-retry");
+    var pending = cs.status === "pending";
+    var failed = cs.status === "failed";
+    if (statusEl) statusEl.classList.toggle("hidden", !(pending || failed));
+    if (statusText) {
+      statusText.textContent = failed
+        ? "角色卡没分析出来：" + (cs.error || "这一轮没有产出") + "（把 DM 模型接上后再试一次）"
+        : "正在分析剧本，看这个本要不要角色卡…";
+    }
+    if (retry) retry.classList.toggle("hidden", !failed);
+    if (!show) return;
+
+    ensureCardDraft();
+    var card = cardState.card;
+
+    var budget = document.getElementById("card-budget");
+    if (budget) budget.textContent = "剩余 " + cardLeft() + " / " + card.total_points + " 点";
+    var reason = document.getElementById("card-reason");
+    if (reason) reason.textContent = card.reason || "";
+
+    var box = document.getElementById("card-rows");
+    box.innerHTML = "";
+    (card.attributes || []).forEach(function (a) {
+      box.appendChild(cardRow(a));
+    });
+
+    var submit = document.getElementById("card-submit");
+    if (submit) submit.textContent = cardSubmitted ? "更新角色卡" : "提交角色卡";
+  }
+
+  function cardRow(a) {
+    var row = document.createElement("div");
+    row.className = "card-row";
+
+    var k = document.createElement("span");
+    k.className = "k";
+    k.textContent = a.key;
+
+    var d = document.createElement("span");
+    d.className = "d";
+    d.textContent = a.desc || ("基础 " + a.base + "，最高 " + a.max);
+
+    var minus = document.createElement("button");
+    minus.type = "button";
+    minus.className = "btn ghost step";
+    minus.textContent = "−";
+    minus.disabled = cardDraft[a.key] <= a.min;
+    minus.onclick = function () { bumpCard(a, -1); };
+
+    var v = document.createElement("span");
+    v.className = "v";
+    v.textContent = cardDraft[a.key];
+
+    var plus = document.createElement("button");
+    plus.type = "button";
+    plus.className = "btn ghost step";
+    plus.textContent = "+";
+    plus.disabled = cardDraft[a.key] >= a.max || cardLeft() <= 0;
+    plus.onclick = function () { bumpCard(a, 1); };
+
+    [k, d, minus, v, plus].forEach(function (el) { row.appendChild(el); });
+    return row;
+  }
+
+  function bumpCard(a, delta) {
+    var cur = typeof cardDraft[a.key] === "number" ? cardDraft[a.key] : a.base;
+    var next = Math.max(a.min, Math.min(a.max, cur + delta));
+    if (next === cur) return;
+    if (delta > 0 && cardLeft() <= 0) { cardMsg("点数用完了，先减掉某项再加", "bad"); return; }
+    cardDraft[a.key] = next;
+    cardMsg("", "");
+    renderCard();
+  }
+
+  // 服务端回存的属性是权威的：有就盖掉草稿（提交成功、换标签页重连都会走到这里）。
+  // **没提交过就绝不动草稿** —— 否则别人一进房（会广播 state）就把你正在调的点数冲掉。
+  function syncCardFromState() {
+    if (!cardState || !cardState.needs_card || !cardState.card) return;
+    var mine = null;
+    (playersCache || []).forEach(function (p) { if (p.name === you) mine = p; });
+    var attrs = (mine && mine.character && mine.character.attrs) || null;
+    if (!attrs) return;
+    var changed = false;
+    (cardState.card.attributes || []).forEach(function (a) {
+      if (typeof attrs[a.key] === "number" && cardDraft[a.key] !== attrs[a.key]) {
+        cardDraft[a.key] = attrs[a.key];
+        changed = true;
+      }
+    });
+    if (!cardSubmitted) { cardSubmitted = true; changed = true; }
+    if (changed) renderCard();
+  }
+
+  function submitCard() {
+    if (!cardState || !cardState.card) return;
+    if (cardLeft() > 0) {
+      // 不强制花满，但提醒一句 —— 大多数人只是忘了
+      cardMsg("还有 " + cardLeft() + " 点没分配（也可以就这么提交）", "");
+    }
+    send({ type: "character", attrs: cardDraft });
+  }
+
+  function resetCard() {
+    cardDraft = {};
+    cardSubmitted = false;
+    cardMsg("", "");
+    renderCard();
   }
 
   function saveRoomSettings() {
@@ -1829,6 +2052,16 @@
   (function initLobbyAndWaiting() {
     var refreshBtn = document.getElementById("lobby-refresh");
     if (refreshBtn) refreshBtn.onclick = function () { lobbyMsg(""); loadRooms(); };
+
+    // 角色卡：提交 / 重置 / 重试分析
+    var cardSubmitBtn = document.getElementById("card-submit");
+    if (cardSubmitBtn) cardSubmitBtn.onclick = submitCard;
+    var cardResetBtn = document.getElementById("card-reset");
+    if (cardResetBtn) cardResetBtn.onclick = resetCard;
+    var cardRetryBtn = document.getElementById("card-retry");
+    if (cardRetryBtn) {
+      cardRetryBtn.onclick = function () { cardMsg("", ""); send({ type: "card_refresh" }); };
+    }
 
     var backBtn = document.getElementById("lobby-back");
     if (backBtn) {

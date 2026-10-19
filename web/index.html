@@ -188,6 +188,23 @@
       <h3>队伍</h3>
       <ul id="wait-players" class="wait-players"></ul>
 
+      <!-- 角色卡：这个剧本不需要卡就整块不出现；还没分析完只显示一行状态 -->
+      <p id="card-status" class="hint small hidden">
+        <span id="card-status-text">正在分析剧本，看这个本要不要角色卡…</span>
+        <button id="card-retry" class="btn ghost hidden" type="button">重试分析</button>
+      </p>
+      <div id="card-panel" class="card-panel hidden">
+        <h3>角色卡 <span id="card-budget" class="chip">—</span></h3>
+        <p id="card-reason" class="hint small"></p>
+        <div id="card-rows" class="card-rows"></div>
+        <p id="card-hidden-hint" class="hint small hidden"></p>
+        <div class="card-actions">
+          <button id="card-submit" class="btn primary" type="button">提交角色卡</button>
+          <button id="card-reset" class="btn ghost" type="button">重置</button>
+          <span id="card-msg" class="hint small"></span>
+        </div>
+      </div>
+
       <div id="wait-host" class="wait-host hidden">
         <h3>房主操作</h3>
         <div class="wait-host-row">

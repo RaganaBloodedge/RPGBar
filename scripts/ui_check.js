@@ -366,6 +366,133 @@ function startFakeLLM() {
   check("点「请出」发出 kick 消息",
     sent.some((m) => m.type === "kick" && m.target === "梅林"), JSON.stringify(sent));
 
+  // ---- 角色卡：等待室里填（不需要卡的剧本整块不出现）----
+  // 服务端下发的形状：{type:"character_schema", status, error, needs_card, card}
+  const CARD = {
+    required: true, reason: "这个本有战斗与学识检定", total_points: 6,
+    attributes: [
+      { key: "力量", desc: "搬、劈、扛", min: 8, base: 10, max: 16 },
+      { key: "学识", desc: "识破机关", min: 10, base: 10, max: 18 },
+    ],
+    // skill_map 服务端不会下发（是剧本内幕）；这里故意多带一个，验证界面不依赖它
+    skill_map: { 战斗: "力量" },
+  };
+  const cardRows = () => Array.from(w.document.querySelectorAll("#card-rows .card-row"));
+  const cardVal = (i) => (cardRows()[i] ? cardRows()[i].querySelector(".v").textContent : "—");
+  const cardBtns = (i) => (cardRows()[i] ? cardRows()[i].querySelectorAll("button") : []);
+
+  check("还没分析完时不显示角色卡面板", $("card-panel").classList.contains("hidden"), $("card-panel").className);
+
+  ws.deliver({ type: "character_schema", status: "pending", needs_card: false, card: null });
+  await sleep(10);
+  check("分析中：面板不出现，只留一行状态",
+    $("card-panel").classList.contains("hidden") && !$("card-status").classList.contains("hidden"),
+    $("card-status").className + " / " + $("card-status-text").textContent);
+  check("分析中：不显示「重试分析」", $("card-retry").classList.contains("hidden"), $("card-retry").className);
+
+  ws.deliver({ type: "character_schema", status: "ready", needs_card: true, card: CARD });
+  await sleep(10);
+  check("分析完且需要填卡 ⇒ 面板出现", !$("card-panel").classList.contains("hidden"), $("card-panel").className);
+  check("角色卡按剧本给的维度画行", cardRows().length === 2, String(cardRows().length));
+  check("初值是剧本给的基础值", cardVal(0) === "10" && cardVal(1) === "10", cardVal(0) + "/" + cardVal(1));
+  check("显示剩余点数", $("card-budget").textContent.indexOf("6 / 6") >= 0, $("card-budget").textContent);
+  check("显示剧本给的理由", $("card-reason").textContent === CARD.reason, $("card-reason").textContent);
+  check("有属性说明就显示说明", cardRows()[0].querySelector(".d").textContent === "搬、劈、扛",
+    cardRows()[0].querySelector(".d").textContent);
+  check("按钮初值是「提交角色卡」", $("card-submit").textContent === "提交角色卡", $("card-submit").textContent);
+
+  // 加减号：服务端会再校验一遍，这里的禁用只是提示
+  cardBtns(0)[1].click(); // +
+  await sleep(10);
+  check("点 + 加一点", cardVal(0) === "11", cardVal(0));
+  check("剩余点数跟着减少", $("card-budget").textContent.indexOf("5 / 6") >= 0, $("card-budget").textContent);
+  cardBtns(0)[0].click(); // -
+  cardBtns(0)[0].click(); // -
+  await sleep(10);
+  check("点 − 减到基础值之下也行（到下限为止）", cardVal(0) === "9", cardVal(0));
+  cardBtns(0)[0].click();
+  await sleep(10);
+  check("到下限就不能再减", cardVal(0) === "8" && cardBtns(0)[0].disabled === true, cardVal(0));
+
+  // 把点数用光 → 别人的 + 都该置灰
+  for (let i = 0; i < 8; i++) cardBtns(0)[1].click();
+  await sleep(10);
+  check("加到上限就停住", cardVal(0) === "16", cardVal(0));
+  check("点数用光后 + 全部置灰",
+    cardBtns(0)[1].disabled === true && cardBtns(1)[1].disabled === true,
+    [cardBtns(0)[1].disabled, cardBtns(1)[1].disabled].join("/"));
+  check("点数用光时剩余是 0", $("card-budget").textContent.indexOf("0 / 6") >= 0, $("card-budget").textContent);
+
+  sent.length = 0;
+  $("card-submit").click();
+  await sleep(10);
+  const cardMsgSent = sent.find((m) => m.type === "character");
+  check("提交发出 character 消息并带上全部属性",
+    !!cardMsgSent && cardMsgSent.attrs && cardMsgSent.attrs["力量"] === 16 && cardMsgSent.attrs["学识"] === 10,
+    JSON.stringify(sent));
+
+  ws.deliver({ type: "character_ok", attrs: { 力量: 16, 学识: 10 }, summary: "力量 16 · 学识 10" });
+  await sleep(10);
+  check("提交成功后有回执", ($("card-msg").textContent || "").indexOf("已提交") >= 0, $("card-msg").textContent);
+  check("提交后按钮变成「更新角色卡」", $("card-submit").textContent === "更新角色卡", $("card-submit").textContent);
+
+  ws.deliver({ type: "character_rejected", errors: ["点数超了：一共 6 点，你用了 8 点"] });
+  await sleep(10);
+  check("被拒时把原因写出来", ($("card-msg").textContent || "").indexOf("点数超了") >= 0, $("card-msg").textContent);
+  check("被拒的错误是红的", $("card-msg").className.indexOf("bad") >= 0, $("card-msg").className);
+
+  $("card-reset").click();
+  await sleep(10);
+  check("重置回到基础值", cardVal(0) === "10" && cardVal(1) === "10", cardVal(0) + "/" + cardVal(1));
+
+  // 服务端回存的属性是权威的：state 一带 attrs，界面就跟着走
+  ws.deliver({
+    type: "state",
+    state: {
+      players: [
+        { name: "亚瑟", character: { cls: "战士", attrs: { 力量: 14, 学识: 12 } } },
+        { name: "梅林", character: { cls: "法师" } },
+      ],
+      current_scene: "gate", scene_title: "古堡大门", location: "大门",
+      flags: [], flag_details: [], inventory: [], hp: {},
+      // ⚠️ 必须是完整的 state 形状：`renderState` 会无条件用这些键重画侧栏，
+      // 少给一个（比如 npcs: []）就等于把 welcome 里那份清掉 —— 后面的 NPC 断言就全塌了。
+      npcs: [
+        { id: "npc01", name: "老周", role: "古堡看守", aliases: ["周老头"], from_script: true },
+      ],
+      memory: { entries: 7, actors: 2, has_summary: true, embedding: true },
+    },
+  });
+  await sleep(10);
+  check("state 里的属性会盖回卡片", cardVal(0) === "14" && cardVal(1) === "12", cardVal(0) + "/" + cardVal(1));
+  const cardRowsNow = w.document.querySelectorAll("#wait-players li");
+  check("队伍里标出谁填了卡",
+    cardRowsNow.length === 2 &&
+    !!cardRowsNow[0].querySelector(".card-tag.done") && !!cardRowsNow[1].querySelector(".card-tag"),
+    cardRowsNow.length ? Array.from(cardRowsNow).map((li) => li.textContent).join(" | ") : "无");
+
+  // 不需要角色卡的剧本：整块都不出现
+  ws.deliver({ type: "character_schema", status: "ready", needs_card: false, card: { required: false, reason: "纯叙事", attributes: [], total_points: 0 } });
+  await sleep(10);
+  check("不需要角色卡 ⇒ 面板与状态行都消失",
+    $("card-panel").classList.contains("hidden") && $("card-status").classList.contains("hidden"),
+    $("card-panel").className + " / " + $("card-status").className);
+
+  // 分析失败：如实报错，并给一个「重试分析」
+  ws.deliver({ type: "character_schema", status: "failed", needs_card: false, card: null, error: "未配置模型" });
+  await sleep(10);
+  check("分析失败时显示原因", ($("card-status-text").textContent || "").indexOf("未配置模型") >= 0,
+    $("card-status-text").textContent);
+  check("分析失败才出现「重试分析」", !$("card-retry").classList.contains("hidden"), $("card-retry").className);
+  sent.length = 0;
+  $("card-retry").click();
+  await sleep(10);
+  check("点「重试分析」发出 card_refresh", sent.some((m) => m.type === "card_refresh"), JSON.stringify(sent));
+
+  // 回到「有卡」的状态，后面的用例继续用同一块等待室
+  ws.deliver({ type: "character_schema", status: "ready", needs_card: true, card: CARD });
+  await sleep(10);
+
   // ---- 房主控制条：改设置 / 开始 / 解散（两步）----
   sent.length = 0;
   $("set-note").value = "改成新手友好";

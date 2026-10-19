@@ -36,6 +36,7 @@ from server.agents import (
     SummaryCtx,
     Task,
     ToolAgent,
+    analyze_character_card,
     describe_agents,
 )
 from server import dice
@@ -244,7 +245,18 @@ async def run_unit_totsk():
 
     # 完整通关：把检定固定为成功，从开场一路走到第二层入口
     real_roll = dice_mod.roll_check
-    dice_mod.roll_check = lambda skill, dc: {"skill": skill, "dc": dc, "roll": 20, "success": True}
+
+    def _always_success(skill, dc, mod=0):
+        """钉死骰面 20 的假骰子。
+
+        签名要跟真的 `roll_check` 一致（角色卡上线后多了 `mod`），返回的字段也一样 ——
+        否则被替换掉的函数会在下游读 `r["mod"]` 时炸掉，而不是在"该失败的地方"失败。
+        """
+        bonus = int(mod or 0)
+        return {"skill": skill, "dc": dc, "roll": 20, "mod": bonus,
+                "total": 20 + bonus, "success": True}
+
+    dice_mod.roll_check = _always_success
     try:
         run = GameState(store, store.start_scene)
         run.add_player("A", {"cls": "战士"})
@@ -2537,6 +2549,336 @@ async def run_live_lobby():
                 pass
 
 
+async def run_unit_card():
+    print("== 进程内校验：角色卡（分析结果规范化 / 点数分配 / 检定加值 / 缓存） ==")
+    import tempfile
+
+    from server import character_card as cc
+
+    # ---- normalize_card：模型吐出来的脏 JSON 必须洗成一份能用的卡 ----
+    check("角色卡：None / 空对象不算合格", cc.normalize_card(None) == {} and cc.normalize_card({}) == {})
+    check("角色卡：不是对象一律不合格", cc.normalize_card([1, 2]) == {})
+    no_card = cc.normalize_card({"required": False, "reason": "纯叙事"})
+    check(
+        "角色卡：required=false 是合法结论（不是「没分析出来」）",
+        no_card.get("required") is False and no_card.get("attributes") == [] and no_card.get("reason") == "纯叙事",
+    )
+    check("角色卡：说需要却不给维度 = 没产出", cc.normalize_card({"required": True}) == {})
+
+    card = cc.normalize_card(
+        {
+            "required": True, "reason": "有战斗与学识检定", "total_points": 6,
+            "attributes": [
+                {"key": "力量", "desc": "搬、劈、扛", "min": 8, "base": 10, "max": 16},
+                {"key": "学识", "desc": "识破机关", "min": 10, "base": 10, "max": 18},
+            ],
+            "skill_map": {"战斗": "力量", "调查": "学识", "胡说": "不存在"},
+        }
+    )
+    check("角色卡：合法输入原样通过", card.get("required") is True and len(card["attributes"]) == 2)
+    check(
+        "角色卡：skill_map 指向不存在的属性会被丢掉",
+        "胡说" not in card["skill_map"] and card["skill_map"].get("调查") == "学识",
+    )
+
+    many = cc.normalize_card({"required": True, "attributes": [{"key": f"属性{i}"} for i in range(12)]})
+    check("角色卡：维度最多 8 项", len(many["attributes"]) == 8)
+    dup = cc.normalize_card({"required": True, "attributes": [{"key": "力量"}, {"key": "力量"}]})
+    check("角色卡：重复的属性名只留一个", len(dup["attributes"]) == 1)
+    longkey = cc.normalize_card({"required": True, "attributes": [{"key": "很长很长很长很长的属性名字"}]})
+    check("角色卡：属性名截到 12 字", len(longkey["attributes"][0]["key"]) <= cc.MAX_KEY_LEN)
+    bad_range = cc.normalize_card({"required": True, "attributes": [{"key": "力量", "min": 16, "max": 8}]})
+    one = bad_range["attributes"][0]
+    check("角色卡：区间反了按缺省重来", one["min"] < one["max"] and one["min"] == 8 and one["max"] == 16)
+    over_base = cc.normalize_card({"required": True, "attributes": [{"key": "力量", "min": 8, "base": 99, "max": 16}]})
+    check("角色卡：基础值越界被夹进区间", over_base["attributes"][0]["base"] == 16)
+    huge = cc.normalize_card({"required": True, "total_points": 999, "attributes": [{"key": "力量"}]})
+    check("角色卡：点数总量有硬上限", huge["total_points"] == cc.MAX_TOTAL_POINTS)
+    okstr = cc.normalize_card({"required": True, "total_points": "6", "attributes": [{"key": "力量"}]})
+    check("角色卡：点数是字符串也认", okstr["total_points"] == 6)
+    junk = cc.normalize_card({"required": True, "attributes": [{"key": "力量"}, "我不对象", 42]})
+    check("角色卡：非对象的属性项被跳过", len(junk["attributes"]) == 1)
+    listmap = cc.normalize_card(
+        {"required": True, "attributes": [{"key": "力量"}],
+         "skill_map": [{"skill": "战斗", "attr": "力量"}, {"skill": "游泳", "attr": "不存在"}]}
+    )
+    check("角色卡：skill_map 写成列表也收（对象形态会被重复键悄悄折叠）",
+          listmap["skill_map"] == {"战斗": "力量"}, str(listmap["skill_map"]))
+    same = cc.normalize_card({"required": True, "attributes": [{"key": "侦查"}]})
+    check("角色卡：技能名与属性同名时自动对上（skill_map 漏了也不至于完全不加值）",
+          cc.attr_for_skill(same, "侦查") == "侦查")
+
+    # ---- JSON 容错：小模型的手滑不该让整张卡丢掉 ----
+    from server.agents.tool_agent import parse_json
+
+    check("JSON 容错：结尾多一个 } 也能解析", parse_json('{"a":1}}') == {"a": 1}, str(parse_json('{"a":1}}')))
+    check("JSON 容错：尾随逗号", parse_json('{"a":1,}') == {"a": 1})
+    check("JSON 容错：``` 包裹照旧", parse_json('```json\n{"a":1}\n```') == {"a": 1})
+    check("JSON 容错：实在解析不出来就是空对象", parse_json("我觉得这个本很棒") == {})
+
+    # ---- 检定加值：10 为基准，每 2 点 ±1 ----
+    check(
+        "角色卡：修正公式（8→-1 / 9→-1 / 10→0 / 11→0 / 16→+3）",
+        (cc.modifier(8), cc.modifier(9), cc.modifier(10), cc.modifier(11), cc.modifier(16)) == (-1, -1, 0, 0, 3),
+        f"{[cc.modifier(v) for v in (8, 9, 10, 11, 16)]}",
+    )
+    check("角色卡：技能按名字精确命中", cc.attr_for_skill(card, "战斗") == "力量")
+    check("角色卡：技能名多几个字也能命中（「战斗检定」→ 战斗）", cc.attr_for_skill(card, "战斗检定") == "力量")
+    check("角色卡：没映射的技能不加值", cc.attr_for_skill(card, "游泳") is None)
+    check("角色卡：空技能名不加值", cc.attr_for_skill(card, "") is None)
+    check("角色卡：不需要卡的剧本对任何技能都不加值", cc.attr_for_skill(no_card, "战斗") is None)
+    check("角色卡：按人算加值", cc.modifier_for(card, {"attrs": {"力量": 14}}, "战斗") == (2, "力量"))
+    check("角色卡：没填卡的人加值 0（不会把难度带偏）", cc.modifier_for(card, {"cls": "战士"}, "战斗") == (0, ""))
+    check("角色卡：属性值不是数字也当没填", cc.modifier_for(card, {"attrs": {"力量": "很高"}}, "战斗") == (0, ""))
+
+    # ---- 点数分配校验（服务端权威） ----
+    check(
+        "角色卡：合法分配通过",
+        cc.validate_allocation(card, {"力量": 14, "学识": 12}) == ({"力量": 14, "学识": 12}, []),
+    )
+    ok_default, errs = cc.validate_allocation(card, {})
+    check("角色卡：什么都不填 = 全部落在基础值", ok_default == {"力量": 10, "学识": 10} and not errs, str(errs))
+    check("角色卡：低于下限被拒", "不能低于" in cc.validate_allocation(card, {"力量": 4, "学识": 10})[1][0])
+    check("角色卡：高于上限被拒", "不能高于" in cc.validate_allocation(card, {"力量": 20, "学识": 10})[1][0])
+    check("角色卡：点数超了被拒", "点数超了" in cc.validate_allocation(card, {"力量": 16, "学识": 18})[1][0])
+    check("角色卡：不是数字被拒", bool(cc.validate_allocation(card, {"力量": "很强", "学识": 10})[1]))
+    check("角色卡：整个不是对象被拒", cc.validate_allocation(card, "x")[1] == ["角色卡格式不对"])
+    check("角色卡：不需要卡就别提交", cc.validate_allocation(no_card, {})[1] == ["这个剧本不需要角色卡"])
+    check("角色卡：已用点数只算基础值之上", cc.spent(card, {"力量": 14, "学识": 12}) == 6)
+    check("角色卡：剩余点数", cc.remaining(card, {"力量": 12, "学识": 10}) == 4)
+
+    # ---- 提示词 / 界面用的一行摘要 ----
+    check("角色卡：一行摘要", cc.summary(card, {"attrs": {"力量": 14, "学识": 12}}) == "力量 14 · 学识 12")
+    check("角色卡：没填就没有摘要", cc.summary(card, {}) == "")
+    check(
+        "角色卡：提示词里的玩家行带职业与属性",
+        cc.player_line("亚瑟", {"cls": "战士", "attrs": {"力量": 14}}, card) == "亚瑟(战士 · 力量 14)",
+    )
+    check("角色卡：没卡时玩家行只留职业", cc.player_line("亚瑟", {"cls": "战士"}, None) == "亚瑟(战士)")
+    client = cc.to_client(card)
+    check(
+        "角色卡：下发前端的卡不含 skill_map（那是剧本内幕）",
+        "skill_map" not in client and len(client.get("attributes") or []) == 2,
+    )
+
+    # ---- 缓存：同一份剧本内容只分析一次 ----
+    store_now = ScriptStore(SCRIPT, label="sample_script.json")
+    key_a = cc.card_key(store_now)
+    store_again = ScriptStore(SCRIPT, label="换个文件名.json")
+    check("角色卡：同一份剧本内容 → 同一个缓存键（换文件名也算同一份）", key_a == cc.card_key(store_again))
+    totsk_store = ScriptStore(TOTSK, label="totsk_l1.json")
+    check("角色卡：不同剧本 → 不同键", cc.card_key(totsk_store) != key_a)
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="rpgbar-card-"))
+    real_dir = cc.CARD_DIR
+    cc.CARD_DIR = tmpdir
+    try:
+        check("角色卡：没缓存时读到 None", cc.load_cached(key_a) is None)
+        cc.save_cached(key_a, card, title=store_now.title)
+        got = cc.load_cached(key_a)
+        check("角色卡：存过就能读回来", bool(got) and got["attributes"][0]["key"] == "力量")
+        (tmpdir / f"{key_a}.json").write_text("{ 这不是 JSON", encoding="utf-8")
+        check("角色卡：缓存坏了当没缓存（重新分析一次，不崩）", cc.load_cached(key_a) is None)
+        (tmpdir / f"{key_a}.json").write_text(
+            json.dumps({"card": {"required": True, "attributes": [{"key": "x", "min": 5, "max": 5}]}}),
+            encoding="utf-8",
+        )
+        fixed = cc.load_cached(key_a)
+        check(
+            "角色卡：缓存读出来也要过一遍规范化",
+            bool(fixed) and fixed["attributes"][0]["min"] < fixed["attributes"][0]["max"],
+            str(fixed)[:90],
+        )
+    finally:
+        cc.CARD_DIR = real_dir
+
+    # ---- 给模型看的剧本摘要 ----
+    digest = cc.script_digest(totsk_store)
+    check("剧本摘要：带剧本名与检定技能清单", "《" in digest and "检定技能" in digest, digest[:60])
+    notes = [((s.get("dm_notes") or "")[:15]) for s in totsk_store.scenes.values()]
+    notes = [n for n in notes if len(n) > 15]
+    check("剧本摘要：不含 DM 内幕（设计角色卡不需要主持人的底牌）", not any(n in digest for n in notes))
+
+    # ---- 分析：模型给了就洗，没给就明确失败（不造假卡） ----
+    reply = json.dumps(
+        {"required": True, "reason": "有战斗", "total_points": 4,
+         "attributes": [{"key": "力量", "min": 8, "base": 10, "max": 16}],
+         "skill_map": {"战斗": "力量"}},
+        ensure_ascii=False,
+    )
+    res = await analyze_character_card(store_now, FakeProvider([reply]))
+    check("角色卡：接上模型就能分析出卡", res.source == "llm" and res.data.get("required") is True, str(res.data)[:100])
+    bad = await analyze_character_card(store_now, FakeProvider(["我觉得这个本很棒"]))
+    check("角色卡：模型胡说时不造假卡（明确失败）", bad.source == "failed" and not bad.data, str(bad.error)[:80])
+    none = await analyze_character_card(store_now, None)
+    check("角色卡：没有模型就没有卡", none.source == "failed" and none.stopped == "no_provider", str(none)[:80])
+
+    # ---- 检定：加值真的加在骰面上 ----
+    real_roll = dice.roll
+    try:
+        dice.roll = lambda d=20: 10
+        r = dice.roll_check("战斗", 12, mod=2)
+        check("检定：d20 + 加值 与 DC 比（10+2 ≥ 12 成功）", r["total"] == 12 and r["success"] is True and r["mod"] == 2, str(r))
+        r2 = dice.roll_check("战斗", 12, mod=1)
+        check("检定：差一点就是失败（10+1 < 12）", r2["total"] == 11 and r2["success"] is False, str(r2))
+        r3 = dice.roll_check("战斗", 10)
+        check("检定：不给加值时行为与以前完全一致", r3["total"] == 10 and r3["mod"] == 0 and r3["success"] is True, str(r3))
+    finally:
+        dice.roll = real_roll
+
+
+async def run_live_card():
+    print("== 实时校验：角色卡（提交 / 越界拒绝 / 开局后锁定） ==")
+    try:
+        import websockets
+    except ImportError:
+        print("  [SKIP] 未安装 websockets，跳过")
+        return
+
+    from server import main as M
+    from server import character_card as cc
+
+    url = ws_url()
+    tag = str(int(time.time() * 1000) % 100000)
+    code, plain = "CRD" + tag, "NCD" + tag
+    opened = []
+
+    async def dial():
+        w = await websockets.connect(url, proxy=None)
+        opened.append(w)
+        return w
+
+    card = cc.normalize_card(
+        {
+            "required": True, "reason": "有战斗与学识检定", "total_points": 6,
+            "attributes": [
+                {"key": "力量", "desc": "搬、劈、扛", "min": 8, "base": 10, "max": 16},
+                {"key": "学识", "desc": "识破机关", "min": 10, "base": 10, "max": 18},
+            ],
+            "skill_map": {"战斗": "力量", "调查": "学识"},
+        }
+    )
+    no_card = cc.normalize_card({"required": False, "reason": "纯叙事，没有检定"})
+
+    # 这个本走的是服务端当前的活动剧本；那个本显式指到 sample_script.json（换个缓存键）。
+    plain_store = ScriptStore(SCRIPT, label="sample_script.json")
+    seeded = [
+        (cc.card_key(M.store), card, M.store.title),
+        (cc.card_key(plain_store), no_card, plain_store.title),
+    ]
+    # 备份真实缓存 → 用完还原。否则这里塞进去的假卡会一直生效（缓存按剧本内容命中）。
+    backups = {}
+    for key, payload, title in seeded:
+        p = cc.cache_path(key)
+        backups[key] = p.read_text(encoding="utf-8") if p.exists() else None
+        cc.save_cached(key, payload, title=title)
+
+    try:
+        a = await dial()
+        await a.send(
+            json.dumps(
+                {"type": "join", "name": "甲", "room": code, "character": {"cls": "战士"}},
+                ensure_ascii=False,
+            )
+        )
+        wa = await recv_until(a, lambda m: m["type"] == "welcome")
+        cs = (wa or {}).get("card_state") or {}
+        check(
+            "角色卡实时：welcome 带上卡片状态",
+            cs.get("status") in ("pending", "ready", "failed"),
+            str(cs)[:90],
+        )
+
+        # 连带进来就会开始分析（这里命中的是刚写好的缓存，所以是秒回）。
+        snap = await recv_until(
+            a, lambda m: m["type"] == "character_schema" and m.get("status") == "ready", timeout=10
+        )
+        check("角色卡实时：进房后分析结果广播到等待室", bool(snap), str(snap)[:110])
+        check("角色卡实时：这个本需要填卡", (snap or {}).get("needs_card") is True, str(snap)[:100])
+        check(
+            "角色卡实时：下发的卡不含 skill_map（内幕不出服务端）",
+            bool(snap) and "skill_map" not in (snap.get("card") or {}),
+            str(snap)[:120],
+        )
+        check(
+            "角色卡实时：属性带上区间与基础值（界面要靠它画加减号）",
+            bool(snap) and (snap["card"]["attributes"][0]["max"], snap["card"]["attributes"][0]["base"]) == (16, 10),
+            str((snap or {}).get("card"))[:120],
+        )
+
+        await a.send(json.dumps({"type": "character", "attrs": {"力量": 14, "学识": 12}}, ensure_ascii=False))
+        ok = await recv_until(a, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：提交合法卡通过", (ok or {}).get("type") == "character_ok", str(ok)[:120])
+        check("角色卡实时：回执带一行摘要", (ok or {}).get("summary") == "力量 14 · 学识 12", str((ok or {}).get("summary")))
+        st = await recv_until(a, lambda m: m["type"] == "state")
+        me = next(
+            (p for p in ((st or {}).get("state") or {}).get("players", []) if p.get("name") == "甲"),
+            None,
+        )
+        check(
+            "角色卡实时：属性进了服务端权威状态",
+            bool(me) and ((me.get("character") or {}).get("attrs") or {}).get("力量") == 14,
+            str(me)[:120],
+        )
+
+        await a.send(json.dumps({"type": "character", "attrs": {"力量": 30, "学识": 10}}, ensure_ascii=False))
+        bad = await recv_until(a, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：越界的提交被拒", (bad or {}).get("type") == "character_rejected", str(bad)[:120])
+
+        await a.send(json.dumps({"type": "character", "attrs": {"力量": 16, "学识": 18}}, ensure_ascii=False))
+        over = await recv_until(a, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：点数超了被拒", (over or {}).get("type") == "character_rejected", str(over)[:120])
+
+        # 等待中改来改去是正常的；开局之后就不许再动了
+        await a.send(json.dumps({"type": "character", "attrs": {"力量": 12, "学识": 10}}, ensure_ascii=False))
+        again = await recv_until(a, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：等待中还能改", (again or {}).get("type") == "character_ok", str(again)[:120])
+
+        await start_room(a)
+        await a.send(json.dumps({"type": "character", "attrs": {"力量": 16, "学识": 18}}, ensure_ascii=False))
+        locked = await recv_until(a, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：开局后不能再改", (locked or {}).get("type") == "character_rejected", str(locked)[:120])
+
+        # ---- 不需要角色卡的剧本：整块不该出现，硬提交要被回绝 ----
+        b = await dial()
+        await b.send(
+            json.dumps(
+                {"type": "join", "name": "乙", "room": plain,
+                 "script": "sample_script.json", "character": {"cls": "法师"}},
+                ensure_ascii=False,
+            )
+        )
+        wb = await recv_until(b, lambda m: m["type"] == "welcome")
+        check("角色卡实时：不需要卡的房间也带状态", isinstance((wb or {}).get("card_state"), dict), str(wb)[:90])
+        plain_snap = await recv_until(
+            b, lambda m: m["type"] == "character_schema" and m.get("status") == "ready", timeout=10
+        )
+        check(
+            "角色卡实时：不需要卡的剧本 needs_card=false",
+            (plain_snap or {}).get("needs_card") is False,
+            str(plain_snap)[:100],
+        )
+        await b.send(json.dumps({"type": "character", "attrs": {"力量": 10}}, ensure_ascii=False))
+        rej = await recv_until(b, lambda m: m["type"] in ("character_ok", "character_rejected"))
+        check("角色卡实时：不需要卡时提交被回绝", (rej or {}).get("type") == "character_rejected", str(rej)[:120])
+    finally:
+        for w in opened:
+            try:
+                await w.close()
+            except Exception:  # noqa: BLE001
+                pass
+        for key, _payload, _title in seeded:
+            p = cc.cache_path(key)
+            raw = backups.get(key)
+            try:
+                if raw is None:
+                    p.unlink(missing_ok=True)
+                else:
+                    p.write_text(raw, encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def main():
     global PASS, FAIL
     unit_only = "--unit" in sys.argv
@@ -2547,6 +2889,7 @@ async def main():
     await run_unit_chronicle()
     await run_unit_scripts()
     await run_unit_lobby()
+    await run_unit_card()
     await run_unit_engine()
     if not unit_only:
         await run_live()
@@ -2557,6 +2900,7 @@ async def main():
         await run_live_scripts()
         await run_live_room_script()
         await run_live_lobby()
+        await run_live_card()
         await run_live_npc()
         await run_live_chronicle()
     print(f"\n结果：{PASS} 通过，{FAIL} 失败")

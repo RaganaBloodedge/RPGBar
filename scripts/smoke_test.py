@@ -2969,6 +2969,15 @@ async def run_unit_card():
         "skill_map" not in client and len(client.get("attributes") or []) == 2,
     )
 
+    # ---- 前端加减号的下限必须是 base（2026-10-21 修的回归）----
+    # 点数花满后点减号若能压到 base 以下，used 被 max(0, v-base) 钳住不回升，
+    # 加号又因剩余 0 被禁用 —— 这 1 点就永久丢了。静态断言 app.js 的三处下限。
+    app_js = (SCRIPT.parent.parent / "web" / "app.js").read_text(encoding="utf-8")
+    check("角色卡：前端减号下限是 base 不是 min（防点数永久丢失回归）",
+          "minus.disabled = cardDraft[a.key] <= a.base" in app_js
+          and "Math.max(a.base, Math.min(a.max, cur + delta))" in app_js
+          and "minus.disabled = cardDraft[a.key] <= a.min" not in app_js)
+
     # ---- 缓存：同一份剧本内容只分析一次 ----
     store_now = ScriptStore(SCRIPT, label="sample_script.json")
     key_a = cc.card_key(store_now)

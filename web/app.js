@@ -1906,7 +1906,7 @@
     var next = {};
     (card.attributes || []).forEach(function (a) {
       var v = cardDraft[a.key];
-      next[a.key] = typeof v === "number" ? Math.max(a.min, Math.min(a.max, v)) : a.base;
+      next[a.key] = typeof v === "number" ? Math.max(a.base, Math.min(a.max, v)) : a.base;
     });
     cardDraft = next;
   }
@@ -1967,7 +1967,10 @@
     minus.type = "button";
     minus.className = "btn ghost step";
     minus.textContent = "−";
-    minus.disabled = cardDraft[a.key] <= a.min;
+    // 下限是 base 不是 min（2026-10-21 修）：base 白送、扣不回来。以前只卡 min，
+    // 点数花满后点减号能把属性压到 base 以下——used 被 max(0, v-base) 钳住不回升，
+    // 加号又因剩余 0 被禁用，这 1 点就永久丢了。
+    minus.disabled = cardDraft[a.key] <= a.base;
     minus.onclick = function () { bumpCard(a, -1); };
 
     var v = document.createElement("span");
@@ -1987,7 +1990,8 @@
 
   function bumpCard(a, delta) {
     var cur = typeof cardDraft[a.key] === "number" ? cardDraft[a.key] : a.base;
-    var next = Math.max(a.min, Math.min(a.max, cur + delta));
+    // 下限 base（不是 min）：与提交校验一致，base 是白送的、减不回点数
+    var next = Math.max(a.base, Math.min(a.max, cur + delta));
     if (next === cur) return;
     if (delta > 0 && cardLeft() <= 0) { cardMsg("点数用完了，先减掉某项再加", "bad"); return; }
     cardDraft[a.key] = next;

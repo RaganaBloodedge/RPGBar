@@ -657,6 +657,34 @@ async def run_unit_agents():
           "可走的方向：" in adv_user and "可尝试的检定：" in adv_user, adv_user[:160])
     check("小助手：user 消息不含 DM 内幕（dm_notes）", "dm_notes" not in adv_user, "")
 
+    # --- 5b. 小助手：user 消息带「最近发生」（有档案时），合法选项带触发说法 ---
+    class _FakeCh:
+        def digest(self, n):
+            return "【最近发生】李维 尝试：我说服老周"
+
+    adv_user_h = adv.build_user_message(
+        AdvisorContext(state=GameState(store, start), chronicle=_FakeCh())
+    )
+    check("小助手：有档案时 user 消息带「最近发生」",
+          "最近发生：" in adv_user_h and "说服老周" in adv_user_h, adv_user_h[:140])
+    check("小助手：无档案时不出现剧情块", "最近发生：" not in adv_user, "")
+    check("小助手：合法选项带触发说法（建议措辞可贴近它）",
+          "触发说法" in adv_user_h, adv_user_h[adv_user_h.find("可走的方向："):][:120])
+    check("小助手：user 消息不带出口 label 原文（防照抄）",
+          "钻进石门，走进甬道" not in adv_user_h, adv_user_h[adv_user_h.find("可走的方向："):][:120])
+
+    # 校验层确定性过滤：照抄 label / 不足 8 字的建议被丢弃
+    fake_ctx = AdvisorContext(state=GameState(store, start))
+    raw = {"options": ["钻进石门", "询问卡特", "顺着门楣浮雕查看被敲掉的毒牙"]}
+    from server.agents import advisor as advisors_mod
+    v = advisors_mod._advise_validate(adv, raw, fake_ctx)
+    check("小助手：校验层丢弃照抄清单原文的短语",
+          v["options"] == ["顺着门楣浮雕查看被敲掉的毒牙"], str(v))
+    raw2 = {"options": ["钻进石门下墓，顺着拖痕找", "用风灯照亮夜空"]}
+    v2 = advisors_mod._advise_validate(adv, raw2, fake_ctx)
+    check("小助手：校验层只留含触发词的建议（机制可达）",
+          v2["options"] == ["钻进石门下墓，顺着拖痕找"], str(v2))
+
     # --- 6. 小助手：接了模型走工具循环，没接就显式失败（取消脚本化兜底） ---
     s6 = GameState(store, start)
     s6.add_player("A", {"cls": "法师"})

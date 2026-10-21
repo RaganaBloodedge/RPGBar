@@ -1174,7 +1174,9 @@ class Room:
         )
         try:
             agent = self.advisor(name)
-            res = await agent.suggest(AdvisorContext(state=self.state, player_name=name))
+            res = await agent.suggest(
+                AdvisorContext(state=self.state, player_name=name, chronicle=self.chronicle)
+            )
             await self.send_to(
                 ws,
                 {

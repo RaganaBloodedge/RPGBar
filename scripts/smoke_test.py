@@ -632,7 +632,7 @@ async def run_unit_agents():
         dice_seed(20261009)
         fake4 = FakeProvider([_reply(tool_call("roll_check", {"check_id": first_check})), _reply(tool_call("finish", {"narration": "你仔细查看。"}))])
         ctx4 = NarratorContext(state=s4, player_name="A")
-        await NarratorAgent(store, fake4).run(ctx4, "检查")
+        await NarratorAgent(store, fake4).run(ctx4, "我说服老周")
         dice_evs = [e for e in ctx4.events if e.get("type") == "dice"]
         check("Agent：roll_check 由服务端投骰并产出 dice 事件", len(dice_evs) == 1, str(ctx4.events)[:100])
         check("Agent：投骰结果不由模型编造（含真实 roll 值）", bool(dice_evs) and isinstance(dice_evs[0].get("roll"), int), str(dice_evs)[:80])
@@ -1059,7 +1059,7 @@ async def run_unit_chronicle():
             _reply(tool_call("finish", {"narration": "卡特点了点头——你发现了铭文的秘密。"})),
         ])
         ctx_f = NarratorContext(state=st_f, player_name="测试员")
-        res_f = await NarratorAgent(l1, fp).run(ctx_f, "我凑近看看浮雕")
+        res_f = await NarratorAgent(l1, fp).run(ctx_f, "我向卡特打听铭文的来历")
         check("护栏：检定失败却写成成功 → 丢掉模型那段",
               res_f.text == "" and "失败" in getattr(res_f, "drop_reason", ""),
               f"text={res_f.text!r} reason={getattr(res_f, 'drop_reason', '')}")
@@ -1105,6 +1105,92 @@ async def run_unit_chronicle():
         check("护栏：没有档案可抄时不会误判", res_h.text != "", res_h.text[:24])
     finally:
         narrator_mod.dice.roll_check = _orig_roll
+
+    # --- 12. 检定关键词门：动作不命中触发说法 → 拒绝投骰并列出触发说法 ---
+    st_k = GameState(l1, l1_start)
+    st_k.add_player("测试员", {})
+    fp_k = FakeProvider([
+        _reply(tool_call("roll_check", {"check_id": "ask_patron"})),
+        _reply(tool_call("finish", {"narration": "你在原地蹦了两下，没人理你。"})),
+    ])
+    ctx_k = NarratorContext(state=st_k, player_name="测试员")
+    res_k = await NarratorAgent(l1, fp_k).run(ctx_k, "我在门口跳个舞")
+    step_k = next((s for s in res_k.steps if s.tool == "roll_check"), None)
+    check("检定门：动作不命中触发说法 → 拒绝投骰",
+          step_k is not None and "不匹配" in str(step_k.result.get("error", "")),
+          str(step_k.result if step_k else res_k.steps)[:120])
+    check("检定门：拒绝时列出该检定的触发说法",
+          step_k is not None and "打听" in step_k.result.get("triggered_by", []),
+          str(step_k.result if step_k else "")[:120])
+    check("检定门：被拒绝的检定不产生 dice 事件",
+          not any(e.get("type") == "dice" for e in ctx_k.events), str(ctx_k.events)[:80])
+    # 命中触发说法 → 正常投骰
+    st_k2 = GameState(l1, l1_start)
+    st_k2.add_player("测试员", {})
+    dice_seed(20261021)
+    fp_k2 = FakeProvider([
+        _reply(tool_call("roll_check", {"check_id": "ask_patron", "trigger": "打听"})),
+        _reply(tool_call("finish", {"narration": ""})),
+    ])
+    ctx_k2 = NarratorContext(state=st_k2, player_name="测试员")
+    await NarratorAgent(l1, fp_k2).run(ctx_k2, "我向卡特打听这座墓的来历")
+    check("检定门：命中触发说法 → 照常投骰",
+          any(e.get("type") == "dice" for e in ctx_k2.events), str(ctx_k2.events)[:80])
+    # 无 keywords 的检定不受门限制（向后兼容）
+    gate_store = ScriptStore(SCRIPT)
+    gate_checks = gate_store.scenes["gate"].get("checks", [])
+    has_kw = any(c.get("keywords") for c in gate_checks)
+    check("检定门：剧本声明 keywords 才生效（本剧本已声明）", has_kw, str(has_kw))
+
+    # --- 13. 元问题入口分流：不进模型，直接回固定答案 ---
+    st_m = GameState(l1, l1_start)
+    st_m.add_player("测试员", {})
+    fp_m = FakeProvider([_reply(tool_call("finish", {"narration": "不该被调用"}))])
+    res_m = await NarratorAgent(l1, fp_m).run(NarratorContext(state=st_m, player_name="测试员"), "能存档吗")
+    check("元问题：「能存档吗」入口直接回答，不调模型",
+          res_m.source == "system" and res_m.stopped == "meta" and "服务器内存" in res_m.text,
+          f"source={res_m.source} text={res_m.text[:40]!r}")
+    check("元问题：分流不消耗一次模型调用", len(fp_m.seen) == 0, str(fp_m.seen)[:80])
+    res_m2 = await NarratorAgent(l1, FakeProvider([_reply(tool_call("finish", {"narration": "x"}))])).run(
+        NarratorContext(state=GameState(l1, l1_start), player_name="测试员"), "你是AI吗")
+    check("元问题：「你是AI吗」也走分流",
+          res_m2.source == "system" and "AI 扮演" in res_m2.text, res_m2.text[:60])
+    # 行动型输入不被误伤（「我帮助卡特」含"帮助"但不是问规则）
+    check("元问题：戏内行动不误伤",
+          narrator_mod.meta_answer("我帮助卡特查看浮雕") == "", "")
+    check("元问题：长句不误伤",
+          narrator_mod.meta_answer("我仔细回忆此前的规则，看看能不能用上") == "", "")
+
+    # --- 14. 越界动作：入口判定 + user 消息硬指令 + 事后核对 ---
+    st_o = GameState(l1, l1_start)
+    st_o.add_player("测试员", {})
+    fp_o = FakeProvider([
+        _reply(tool_call("finish", {"narration": "你捡来枯枝生火，火堆很快燃了起来。"})),
+    ])
+    ctx_o = NarratorContext(state=st_o, player_name="测试员")
+    res_o = await NarratorAgent(l1, fp_o).run(ctx_o, "我生火取暖")
+    check("越界：入口判出越界动词", ctx_o.oob_verb == "生火", ctx_o.oob_verb)
+    msgs = NarratorAgent(l1, None).init_messages(ctx_o, "我生火取暖")
+    check("越界：user 消息带硬指令（不得描写成功）",
+          "越界动作" in msgs[-1]["content"] and "不得描写这个动作成功" in msgs[-1]["content"],
+          msgs[-1]["content"][-120:])
+    check("越界：旁白写成成功 → 丢掉",
+          res_o.text == "" and "越界" in getattr(res_o, "drop_reason", ""),
+          f"text={res_o.text[:30]!r} reason={getattr(res_o, 'drop_reason', '')}")
+    # 命中检定/出口关键词的动作不判越界
+    check("越界：动作命中触发说法时不判越界",
+          narrator_mod.out_of_bounds_verb("我砸开石像看看", l1.get_scene("guard_room")) == ""
+          if "guard_room" in l1.scenes else True, "")
+    # 旁白提到越界动词但没有成功断言（合法的拒绝写法）不丢
+    st_o2 = GameState(l1, l1_start)
+    st_o2.add_player("测试员", {})
+    fp_o2 = FakeProvider([
+        _reply(tool_call("finish", {"narration": "这里太潮了，生火是不可能的，你只能继续往前。"})),
+    ])
+    res_o2 = await NarratorAgent(l1, fp_o2).run(
+        NarratorContext(state=st_o2, player_name="测试员"), "我生火")
+    check("越界：正确的拒绝写法不会被丢",
+          res_o2.text != "" and not getattr(res_o2, "drop_reason", ""), res_o2.text[:30])
 
     # 清理
     for f in (jsonl, tmp / "c.meta.json", tmp / "v.jsonl", tmp / "v.meta.json",

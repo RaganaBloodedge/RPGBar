@@ -171,9 +171,17 @@ class ScriptStore:
             exits.append(f"{e['to']}({e['label']}｜{mark})")
         if exits:
             lines.append("出口：" + "；".join(exits))
-        checks = [f"{c['id']}({c['skill']} DC{c['dc']})" for c in s.get("checks", [])]
+        # 触发说法直接写进简报：模型该知道「ask_patron 要玩家话里带打听/来历才成立」，
+        # 否则它会把检定套在任何动作上（实测：单检定场景里跳舞也变学识检定）。
+        # 每个检定多花 10–20 token，换来的是省掉一次投错骰的返工。
+        checks = []
+        for c in s.get("checks", []):
+            kws = "/".join((c.get("keywords") or [])[:5])
+            checks.append(
+                f"{c['id']}({c['skill']} DC{c['dc']}" + (f"｜触发:{kws})" if kws else ")")
+            )
         if checks:
-            lines.append("可触发的检定：" + "；".join(checks))
+            lines.append("可触发的检定（仅当玩家动作命中触发说法时才能投骰）：" + "；".join(checks))
         return "\n".join(lines)
 
     def build_context(self, scene_id: str, action: str, k: int = 3, flags=None) -> str:

@@ -15,6 +15,7 @@
 `dm.py` 的确定性流水线去拼一段旁白冒充 DM，而是**直接失败** —— 界面会明说
 这一轮没有生成。要玩就必须有一个模型（本地引擎或云 API）。
 """
+import re
 from dataclasses import dataclass, field
 
 from .. import character_card, dice
@@ -31,6 +32,8 @@ class NarratorContext:
     events: list = field(default_factory=list)          # 待广播的事件（dice/system）
     narration_parts: list = field(default_factory=list)  # 系统自己产出的权威旁白
     npc_brief: str = ""  # 本轮涉及 NPC 的「人物卡 + 状态快照 + 反应采样结论」（不含记忆流水账）
+    user_action: str = ""  # 本轮玩家原话（工具要拿它做检定关键词匹配，模型传参不可信）
+    oob_verb: str = ""   # 非空 = 玩家动作被判定为越界（剧本机制之外），见 out_of_bounds_verb
 
 
 NARRATOR_JSON_HINT = {
@@ -48,16 +51,23 @@ _SUCCESS_WORDS = (
     "成功", "发现", "拿到", "得手", "打开", "推开", "抬起", "破解",
     "找到", "取下", "识破", "看穿", "撬开", "砸开",
 )
+# 越界动作的「做成了」写法跟检定成功不一样——是这套动词自己的完成态。
+# 「火堆燃了起来」「墙被挖开了」都不在通用表里，越界局要用这张表核对。
+_OOB_SUCCESS_WORDS = (
+    "点燃", "燃起", "燃了", "烧起来", "烧了起来", "生了", "烧旺",
+    "挖开", "凿开", "砸穿", "撬下", "升起",
+)
 _NEGATIONS = ("没", "未", "无", "不", "别")
 
 
-def asserts_success(text: str) -> str:
+def asserts_success(text: str, words=_SUCCESS_WORDS) -> str:
     """文本里有没有「做到了」的断言；排除「未能发现」「空无一物」这类否定/中性写法。
 
     命中就返回那个词（用于日志与测试），没命中返回空串。
     只看词前 4 个字里有没有否定词 —— 中文的否定几乎都贴着动词。
+    `words` 可换词表：越界动作核对时传 `_OOB_SUCCESS_WORDS`。
     """
-    for word in _SUCCESS_WORDS:
+    for word in words:
         i = text.find(word)
         while i >= 0:
             if not any(n in text[max(0, i - 4):i] for n in _NEGATIONS):
@@ -72,6 +82,61 @@ def echoes_text(text: str, source: str, probe: int = 40) -> bool:
     if len(src) < probe or not text:
         return False
     return src[:probe] in text
+
+
+# ---- 越界动作：剧本机制之外的「改造世界」型动词 ----
+# 生火、挖墙这类动作在剧本里没有对应机制（不是出口触发说法、也不挂任何检定），
+# 提示词只写了「别顺着他演」，但 4B 的实测是照写成功（「火堆燃起来了」）。
+# 与其靠模型自觉，不如**入口就判出来**：命中越界动词、且动作没碰到任何出口/检定
+# 关键词 → 在 user 消息里插一条硬指令，事后核对时旁白若把它写成成功就丢掉。
+_OOB_VERBS = ("生火", "点火", "挖", "凿", "砸墙", "撬墙", "拆墙", "砍墙", "烧掉")
+
+
+def out_of_bounds_verb(text: str, scene: dict) -> str:
+    """玩家动作是否越界。返回命中的越界动词（"" = 没越界）。
+
+    判定两步走：先看动作有没有命中**任何**出口/检定的触发说法（命中说明剧本
+    有机制接它，放行）；再匹配越界动词表。两边都不沾才判越界。
+    """
+    t = text or ""
+    if not t:
+        return ""
+    for thing in scene.get("exits", []) + scene.get("checks", []):
+        for k in thing.get("keywords", []) or []:
+            if k in t:
+                return ""
+    for v in _OOB_VERBS:
+        if v in t:
+            return v
+    return ""
+
+
+# ---- 元问题：入口直接分流，不进模型 ----
+# 「能存档吗」「你是 AI 吗」这类问题提示词里写了要答，实测 4B 仍然复读上一轮旁白
+# —— 对小模型来说，指令排在几十轮上下文深处就是没有。这类问题**根本不需要模型**：
+# 答案是确定的系统信息，入口用正则接住直接回，0 秒、0 token。
+# 输入长度卡 40 字：跑团里说「我帮助卡特」不该被「帮助」误伤 —— 元问题都很短。
+_META_PATTERNS = (
+    (r"存档|保存进度|存进度|接着上次|下次还能",
+     "（系统）本局进度保存在服务器内存中，服务器重启后不保留；掉线重连即可回到当前房间，不需要手动操作。"),
+    (r"你是(不是)?(ai|人工智能|机器人|真人)|人工智能|大模型|语言模型",
+     "（系统）是的，主持人由 AI 扮演：语言模型负责旁白与 NPC，骰子由服务器投掷，剧情严格按剧本推进。"),
+    (r"^(帮助|help)[吗?？!！.。]*$|怎么玩|规则是什么|怎么投骰|骰子怎么|有什么命令",
+     "（系统）直接用一句话描述你的行动即可，例如「我凑近看浮雕」。需要检定时服务器会自动投骰；"
+     "想去哪里就直接说。拿不准做什么，点输入框旁的小助手。"),
+)
+
+
+def meta_answer(text: str) -> str:
+    """玩家输入是不是元问题（规则/存档/身份）。是 → 返回固定答案；否 → 空串。"""
+    t = (text or "").strip()
+    if not t or len(t) > 40:
+        return ""
+    low = t.lower()
+    for pat, ans in _META_PATTERNS:
+        if re.search(pat, low):
+            return ans
+    return ""
 
 
 class NarratorAgent(Agent):
@@ -95,7 +160,24 @@ class NarratorAgent(Agent):
 
         丢掉不等于「没产出」：权威文案（检定结果 / 新场景原文）本来就是系统自己广播的，
         玩家一个字都不会少。宁可少一句衔接，也不给一句自相矛盾的话。
+
+        在进模型之前还有两道**确定性**分流（不花一次生成、不烧一个 token）：
+
+        - 元问题（存档 / 你是 AI / 规则）：答案固定，入口直接回，不进工具循环。
+          `source="system"`、`stopped="meta"`，界面不会把它当失败刷屏。
+        - 越界动作（生火、挖墙这类剧本机制外的事）：记在 `ctx.oob_verb` 上，
+          user 消息里追加硬指令（见 `build_user_message`），事后核对兜底（见 guard）。
         """
+        ctx.user_action = user_input or ""
+        meta = meta_answer(user_input)
+        if meta:
+            return AgentResult(
+                text=meta,
+                source="system",
+                stopped="meta",
+                data={"meta": True},
+            )
+        ctx.oob_verb = out_of_bounds_verb(ctx.user_action, ctx.state.current())
         before = ctx.state.current_scene
         res = await super().run(ctx, user_input)
         reason = self._guard_narration(ctx, res.text or "", before)
@@ -126,6 +208,12 @@ class NarratorAgent(Agent):
             for e in self.chronicle.entries[-4:]:
                 if e.get("kind") == "narration" and (e.get("text") or "").strip() == t:
                     return "与之前某轮的旁白逐字重复"
+        # 越界动作写成成功：入口已经判过越界（ctx.oob_verb），旁白里又出现了
+        # 那个动词本身 + 成功断言（「生火…火堆燃起来了」）。两个条件同时命中
+        # 才丢 —— 单看成功词会误伤「你发现墙上有火把架」这类合法补充。
+        oob = getattr(ctx, "oob_verb", "") or ""
+        if oob and oob in text and asserts_success(text, _OOB_SUCCESS_WORDS):
+            return f"越界动作（{oob}）被写成了成功"
         return ""
 
     # ---- 提示词 ----
@@ -174,13 +262,23 @@ class NarratorAgent(Agent):
         npc_block = f"\n【在场 NPC（人物卡）】\n{ctx.npc_brief}" if getattr(ctx, "npc_brief", "") else ""
         hist = self.chronicle.digest(6) if self.chronicle is not None else ""
         hist_block = f"\n【剧情档案（热层）】\n{hist}\n（需要更早的细节时用 recall_history 检索）" if hist else ""
+        oob = getattr(ctx, "oob_verb", "") or ""
+        oob_block = (
+            f"\n【系统判定：越界动作】\n"
+            f"玩家想做的是「{oob}」这类事 —— 它不是任何出口的触发说法，也不对应任何检定，"
+            "剧本没有给这个动作任何机制。旁白必须用一句话明确说明这里做不到（或没人理会），"
+            "然后把选择权交回给玩家。**不得描写这个动作成功**。\n"
+            if oob
+            else ""
+        )
         return (
             f"{self.store.build_context(state.current_scene, user_input, flags=state.flags)}\n\n"
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
             f"{hist_block}"
-            f"{npc_block}\n"
+            f"{npc_block}"
+            f"{oob_block}\n"
             f"玩家行动：{user_input}"
         )
 
@@ -268,8 +366,15 @@ class NarratorAgent(Agent):
             [
                 Tool(
                     "roll_check",
-                    "让服务端投掷某个检定并应用结果（可能获得线索）。这是唯一产生骰子结果的途径。",
-                    _obj({"check_id": str_prop("检定 id，见【当前场景】的检定列表")}, ["check_id"]),
+                    "让服务端投掷某个检定并应用结果（可能获得线索）。这是唯一产生骰子结果的途径。"
+                    "只能对玩家的动作确实命中触发说法的检定投骰，不得把检定套在无关动作上。",
+                    _obj(
+                        {
+                            "check_id": str_prop("检定 id，见【当前场景】的检定列表"),
+                            "trigger": str_prop("玩家行动中命中该检定触发说法的原话片段"),
+                        },
+                        ["check_id"],
+                    ),
                     self._t_roll_check,
                     read_only=False,
                 ),
@@ -357,7 +462,7 @@ class NarratorAgent(Agent):
             ]
         }
 
-    def _t_roll_check(self, ctx, check_id=""):
+    def _t_roll_check(self, ctx, check_id="", trigger=""):
         check_id = (check_id or "").strip()
         scene = ctx.state.current()
         check = next((c for c in scene.get("checks", []) if c["id"] == check_id), None)
@@ -366,6 +471,28 @@ class NarratorAgent(Agent):
                 "error": f"当前场景没有检定 {check_id}",
                 "available": [c["id"] for c in scene.get("checks", [])],
             }
+        # 关键词门：检定声明了自己的触发说法（keywords）时，玩家动作必须命中其一。
+        # 实测单检定场景里 4B 会把任何动作都套上它 —— 跳舞、骂脏话、看墙根全变成
+        # 「学识检定」。骰子一旦投出去就是权威结果，收不回来，所以这道门必须在
+        # **投骰之前**把无关动作拦下，并把它该被什么话触发告诉模型。
+        # 匹配范围 = 玩家原话（ctx.user_action）+ 模型补报的触发片段（trigger）；
+        # 只信模型传参不可靠，所以原话永远参与匹配。
+        kws = check.get("keywords") or []
+        if kws:
+            probe = f"{getattr(ctx, 'user_action', '') or ''} {trigger or ''}"
+            hits = [k for k in kws if k in probe]
+            if not hits:
+                return {
+                    "error": (
+                        f"检定 {check_id}（{check['skill']}）与玩家动作不匹配："
+                        "动作没有命中它的任何触发说法，不得投骰。"
+                    ),
+                    "triggered_by": kws,
+                    "note": (
+                        "要么确认玩家动作确实是在做这件事，换个贴切的说法重新调用；"
+                        "要么不用骰子，直接用旁白回应玩家的动作。"
+                    ),
+                }
         # 属性加值：谁能做成这件事，取决于**行动的人**自己的角色卡。
         # 没填卡 / 这个技能没映射到属性 ⇒ 加值 0，等同于原来的纯 d20 vs DC。
         card = getattr(self.store, "card_schema", None)

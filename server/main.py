@@ -1163,7 +1163,7 @@ class Room:
                 await self._maybe_summarize()
                 await self.send_state()
                 note = self._agent_note("dm", res)
-                if note["source"] != "llm":  # 正常走模型不必刷屏；退化必须可见
+                if note["source"] not in ("llm", "system"):  # 正常走模型（或元问题分流）不必刷屏；退化必须可见
                     await self.broadcast(note)
         finally:
             await self.broadcast({"type": "thinking", "active": False, "who": "dm"})
@@ -1189,7 +1189,7 @@ class Room:
                 },
             )
             note = self._agent_note("advisor", res)
-            if note["source"] != "llm":
+            if note["source"] not in ("llm", "system"):
                 await self.send_to(ws, note)
         finally:
             await self.send_to(ws, {"type": "thinking", "active": False, "who": "advisor"})
@@ -1198,9 +1198,10 @@ class Room:
     def _agent_note(who: str, res) -> dict:
         """把「这一轮到底有没有真跑到模型」整理成一条可下发的事件。
 
-        `AgentResult.source` 只有两种：llm（真的跑到了模型）/ failed（这一轮没有
-        产出，原因在 `error` 里）。2026-10-13 用户拍板取消脚本化兜底之后，不再有
-        "用剧本拼一段旁白冒充模型"这条路 —— 所以非 llm 时界面必须把失败明说出来。
+        `AgentResult.source` 只有三种：llm（真的跑到了模型）/ system（入口确定性
+        分流，如元问题直接回答）/ failed（这一轮没有产出，原因在 `error` 里）。
+        2026-10-13 用户拍板取消脚本化兜底之后，不再有"用剧本拼一段旁白冒充模型"
+        这条路 —— 所以非 llm/system 时界面必须把失败明说出来。
         """
         return {
             "type": "agent_note",

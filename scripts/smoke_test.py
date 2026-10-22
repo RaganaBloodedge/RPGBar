@@ -2043,24 +2043,29 @@ async def run_unit_engine():
     check("引擎：界面补丁对垃圾输入返回空",
           clean_engine_patch(None) == {} and clean_engine_patch("x") == {})
 
-    # 合并语义：engine_slot 覆盖槽位同名项、但**不改动原槽位**（它还要下发前端）
+    # 合并语义：**槽位显式值优先**，引擎段只补缺省；不改动原槽位（它还要下发前端）
     room = Room.__new__(Room)   # 绕过 __init__：这条断言只碰 _effective_slot
     room.engine_slot = {"enabled": True, "think": True, "context": 8192,
                         "max_tokens": 256, "backend": "gpu"}
     dm = {"kind": "engine", "think": False, "context": 1024, "model": "D:/w.gguf"}
     eff = room._effective_slot(dm)
-    check("引擎：界面设置覆盖槽位里的同名字段",
-          eff["think"] is True and eff["context"] == 8192 and eff["max_tokens"] == 256,
-          str(eff))
-    check("引擎：界面选的后端也并进槽位（跟着走到 build_provider）",
-          eff["backend"] == "gpu", repr(eff.get("backend")))
+    check("引擎：槽位显式写的字段优先于引擎段（按槽位分后端/上下文）",
+          eff["think"] is False and eff["context"] == 1024, str(eff))
+    check("引擎：槽位没写的字段用引擎段缺省",
+          eff["max_tokens"] == 256 and eff["backend"] == "gpu", str(eff))
     check("引擎：合并不改动原槽位",
           dm["think"] is False and dm["context"] == 1024, str(dm))
+    eff_cpu = room._effective_slot({"kind": "engine", "backend": "cpu", "context": 2048})
+    check("引擎：槽位可以单独指定 CPU 后端（DM 走 GPU、助手走 CPU 的前提）",
+          eff_cpu["backend"] == "cpu" and eff_cpu["context"] == 2048
+          and eff_cpu["max_tokens"] == 256, str(eff_cpu))
     check("引擎：非 engine 槽位原样返回",
           room._effective_slot({"kind": "cloud"}) == {"kind": "cloud"})
     room.engine_slot = {"enabled": False}
     check("引擎：界面关掉引擎后该槽位视为没模型",
           room._effective_slot({"kind": "engine"}) is None)
+    check("引擎：总开关关掉时，槽位写 enabled=True 也按关闭处理（不能按回去）",
+          room._effective_slot({"kind": "engine", "enabled": True}) is None)
 
     # 3. 槽位公开状态：带 engine 详情，且**不下发绝对路径**
     pub = describe_agents(

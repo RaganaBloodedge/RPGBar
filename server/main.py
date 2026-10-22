@@ -737,17 +737,28 @@ class Room:
 
     # ---- Agent 生命周期 ----
     def _effective_slot(self, slot):
-        """把「内置引擎」小节的设置并入 engine 槽位。
+        """把「内置引擎」小节的设置并入 engine 槽位 —— **引擎段只做缺省**。
 
-        并入**只发生在内存里的一次拷贝上**：槽位本身不动（它还要原样描述给前端），
-        引擎段里的本机路径也不会因此流出去。引擎被界面关掉时返回 None —— 调用方
-        按「这个槽位没有模型」处理（然后就显式失败，没有脚本化兜底）。
+        2026-10-22 改的合并方向（原来反着：引擎段无条件覆盖槽位）。原因：
+        8 GiB 卡上要「4B DM 走 GPU + 1.7B 助手走 CPU」，而后端 / 上下文本可以
+        按槽位分工 —— 被覆盖一次，槽位写的 backend 就永远无效，只能全 GPU 或全 CPU。
+        新语义三条：
+
+        - **槽位显式写了的键，槽位说了算**（backend / context / max_tokens / think / threads）；
+        - 槽位没写的键，用引擎段的缺省值（界面「内置引擎」改的缺省仍然生效）；
+        - `enabled` 是**总开关**，只认引擎段：它关掉 = 所有 engine 槽位都没有模型
+          （槽位不能反着开 —— 那会让「关掉内置引擎」变成可按住的开关）。
+
+        并入只发生在内存里的一次拷贝上：槽位本身不动（它还要原样描述给前端）。
         """
         if (slot.get("kind") or "off").lower() != "engine":
             return slot
+        if not self.engine_slot.get("enabled", True):
+            return None
         merged = dict(slot)
-        for key in ("enabled", "think", "context", "max_tokens", "backend"):
-            if key in self.engine_slot:
+        merged.setdefault("enabled", True)
+        for key in ("think", "context", "max_tokens", "backend", "threads"):
+            if key not in merged and key in self.engine_slot:
                 merged[key] = self.engine_slot[key]
         if not merged.get("enabled"):
             return None
@@ -1145,13 +1156,18 @@ class Room:
         await self.broadcast(
             {"type": "thinking", "active": True, "who": "dm", "label": "DM 正在推理剧情…"}
         )
+        t_round = time.time()
         try:
             async with self.lock:
                 before_scene = self.state.current_scene
                 self._chronicle_add(f"{name} 尝试：{text}", kind="action", actors=[name])
+                t_npc = time.time()
                 npc_brief = await self._npc_prepare(name, text)
                 ctx = NarratorContext(state=self.state, player_name=name, npc_brief=npc_brief)
                 res = await self.narrator().run(ctx, text)
+                print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
+                      f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"
+                      f" · 工具 {'/'.join(res.used_tools) or '无'}）", flush=True)
                 for ev in ctx.events:
                     await self.broadcast(ev)
                 parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]
@@ -1172,11 +1188,15 @@ class Room:
         await self.send_to(
             ws, {"type": "thinking", "active": True, "who": "advisor", "label": "助手正在思考…"}
         )
+        t_round = time.time()
         try:
             agent = self.advisor(name)
             res = await agent.suggest(
                 AdvisorContext(state=self.state, player_name=name, chronicle=self.chronicle)
             )
+            print(f"[RPGBar] 一轮 advisor {time.time()-t_round:5.1f}s"
+                  f"（生成 {len(res.steps)} 次 · 工具 {'/'.join(res.used_tools) or '无'}"
+                  f" · {len(res.data.get('options') or [])} 条建议）", flush=True)
             await self.send_to(
                 ws,
                 {

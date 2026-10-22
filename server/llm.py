@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 
 from . import engine as engine_mod
+from . import llamacpp as llamacpp_mod
 
 
 class ModelError(Exception):
@@ -335,6 +336,172 @@ class EngineProvider(LLMProvider):
         }
 
 
+class LlamaCppProvider(LLMProvider):
+    """llama.cpp 通道：拉起/共享 llama-server 子进程，OpenAI 兼容 HTTP 调用。
+
+    与 `OpenAICompatProvider` 的区别只有一点：**server 由我们自己管理** ——
+    首次生成时按需拉起（懒建，与 EngineProvider._ensure 同一个理由：
+    build_provider 在建房/改配置等多条路径上被调，不能每次都真拉进程），
+    close() 只减引用计数，最后一个使用者走人才停进程。
+
+    工具调用：`--jinja` + Qwen3 官方模板 ⇒ llama-server 直接返回 OpenAI 形状的
+    `tool_calls`（arguments 是 JSON 字符串）—— 与 agents/base.py 工具循环的期望
+    完全一致，**不需要** EngineProvider 那层 `{name, arguments}` 转换。
+
+    think 开关：Qwen3 模板吃 `chat_template_kwargs.enable_thinking`（请求级，
+    改设置立即生效）。`seed` 是 llama-server 的 32 位采样种子，随请求传。
+    """
+
+    name = "llamacpp"
+    supports_tools = True
+
+    def __init__(self, server_exe, model_path, *, backend="gpu", context=6144,
+                 max_tokens=512, temperature=0.8, seed=None, think=True,
+                 threads=0, label="llamacpp"):
+        self.server_exe = str(server_exe)
+        self.model_path = str(model_path)
+        self.backend = engine_mod.normalize_backend(backend, default="gpu")
+        self.context = int(context)
+        self.max_tokens = int(max_tokens)
+        self.temperature = float(temperature)
+        self.seed = None if seed is None else int(seed)
+        self.think = bool(think)
+        self.threads = int(threads)
+        self.label = label
+        self.name = f"llamacpp[{Path(self.model_path).stem}]"
+        self.last_usage: dict = {}
+
+        import httpx
+        self._httpx = httpx
+        self._client = None          # 懒建（要等端口确定）
+        self._base_url = ""
+        self._handle = None
+        self._init_lock = threading.Lock()
+
+    # ---- 生命周期 ----
+
+    def _ensure(self) -> str:
+        """懒建/共享 server，返回 base_url。必须在工作线程里调（会阻塞几秒）。
+
+        🔴 start 失败必须回收句柄并置 None：句柄是跨房间共享的（assistant 与
+        advisor、以及下一局的房间都可能拿到同一个），半途失败后残留一个
+        `非 None 的 _handle` 会让后续调用跳过初始化、拿 None 的 _client 去
+        post —— 症状是"秒失败且永不恢复"（2026-10-23 实测踩过）。
+        """
+        with self._init_lock:
+            if self._handle is None:
+                self._handle = llamacpp_mod.open_server(
+                    self.server_exe, self.model_path, backend=self.backend,
+                    context=self.context, threads=self.threads,
+                )
+                try:
+                    self._handle.start()
+                except Exception:
+                    self._handle.release()
+                    self._handle = None
+                    raise
+                self._base_url = self._handle.base_url
+                self._client = self._httpx.Client(timeout=600.0)
+                be = "GPU" if self.backend == "gpu" else "CPU"
+                print(f"[RPGBar] llama.cpp：{Path(self.model_path).name} · "
+                      f"{be} · ctx {self.context} · 端口 {self._handle.port}", flush=True)
+            return self._base_url
+
+    def _close_sync(self) -> None:
+        with self._init_lock:
+            if self._handle is not None:
+                try:
+                    self._handle.release()
+                finally:
+                    self._handle = None
+                    self._base_url = ""
+            if self._client is not None:
+                try:
+                    self._client.close()
+                finally:
+                    self._client = None
+
+    async def close(self):
+        await asyncio.to_thread(self._close_sync)
+
+    def __del__(self):
+        try:
+            self._close_sync()
+        except Exception:  # noqa: BLE001  解释器收尾时什么都可能缺，静默即可
+            pass
+
+    # ---- 生成 ----
+
+    @property
+    def needs_warmup(self) -> bool:
+        """server 还没拉起 = 首次调用要等模型加载（几秒到十几秒）。"""
+        return self._handle is None
+
+    def _run(self, messages, tools) -> dict:
+        """同步一轮（丢线程跑）。返回 OpenAI 形状的 message dict。"""
+        base = self._ensure()
+        payload = {
+            "model": "local",  # llama-server 只加载了一份模型，名字随便填
+            "messages": [dict(m) for m in messages],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "chat_template_kwargs": {"enable_thinking": self.think},
+        }
+        if tools:
+            payload["tools"] = tools
+        if self.seed is not None:
+            payload["seed"] = int(self.seed) & 0xFFFFFFFF
+        resp = None
+        for attempt in (1, 2):   # 404/5xx 重试一次：怀疑 llama-server 偶发路由抖动
+            resp = self._client.post(f"{base}/chat/completions", json=payload)
+            if resp.status_code < 400 or resp.status_code == 400:
+                break
+            if attempt == 1:
+                import time as _t
+                try:
+                    from .config import USER_DIR
+                    dump = USER_DIR / "Temp" / "_llamacpp_404_dump.json"
+                    dump.parent.mkdir(parents=True, exist_ok=True)
+                    dump.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                except Exception:  # noqa: BLE001  诊断用，失败不影响
+                    pass
+                _t.sleep(0.5)
+        if resp.status_code >= 400:
+            raise ModelError(f"llama-server HTTP {resp.status_code}: {resp.text[:200]}"
+                             f"（打到 {base}，句柄端口 {getattr(self._handle, 'port', '?')}）")
+        data = resp.json()
+        msg = data["choices"][0]["message"]
+        usage = data.get("usage") or {}
+        self.last_usage = {
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+        }
+        return msg
+
+    async def chat(self, messages, json_mode: bool = False) -> str:
+        # json_mode 收下不转发：输出格式靠 messages 里的 json_hint 约束（与引擎一致）
+        msg = await asyncio.to_thread(self._run, messages, None)
+        return msg.get("content") or ""
+
+    async def chat_with_tools(self, messages, tools) -> dict:
+        msg = await asyncio.to_thread(self._run, messages, tools)
+        return {"content": msg.get("content") or "", "tool_calls": msg.get("tool_calls") or []}
+
+    # ---- 界面用的状态 ----
+
+    def describe(self) -> dict:
+        return {
+            "model": Path(self.model_path).name,
+            "context": self.context,
+            "max_tokens": self.max_tokens,
+            "think": self.think,
+            "backend": self.backend,
+            "lib_backend": self.backend,   # llama-server 无"请求/实际"分叉
+            "port": self._handle.port if self._handle else None,
+            "usage": dict(self.last_usage),
+        }
+
+
 def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
     """由一个「模型槽位」配置构建 Provider；返回 None 表示**这个槽位没有模型**。
 
@@ -344,16 +511,21 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
       界面直接标出「本轮没有生成 + 原因」，不再拿编出来的文字盖住故障。
     - kind=cloud：必须有 api_key。
     - kind=local：不要求 api_key（本地服务一般不需要）。
-    - kind=engine：内置引擎，需要 `lib`（动态库）与 `model`（权重文件），二者在
-      `config.load_config()` 里已按 `engine` 段填好；缺一个就返回 None（＝当这个
-      槽位没接模型）。
+    - kind=llamacpp：把 llama-server.exe 作为**子进程**拉起、走 OpenAI 兼容 HTTP
+      （见 `llamacpp.py`）。2026-10-23 起游戏默认走这条路（自研引擎退役收藏，
+      代码路径保留 = "任何一台机器上都能静默缺席"）。
+      需要 `server`（llama-server 可执行文件，留空自动探测）与 `model`（GGUF 权重，
+      留空自动探测）；`backend`（cpu / gpu）决定 `-ngl 0 / 99`。
+    - kind=engine：内置引擎（已退役，见上），需要 `lib`（动态库）与 `model`
+      （权重文件），二者在 `config.load_config()` 里已按 `engine` 段填好；缺一个就
+      返回 None（＝当这个槽位没接模型）。
       `backend`（cpu / gpu）决定找**哪一份**库：gpu 先找 CUDA 版产物
       （`rpg_engine_cuda.dll`），找不到退回 CPU 版（不返回 None —— 那样就成了
       "没模型＝玩不了"，而 CPU 版其实能跑，见 `engine.find_lib`）。
 
     `seed` 是**运行时状态**而非配置，所以走形参而不是槽位字段 —— 槽位会原样下发
-    给前端，种子只该进服务端日志。目前只有 `kind=engine` 用它（引擎是纯函数，
-    不给种子则每局随机流相同）；云 / 本地服务的温度由对方服务端抽样，暂不转发。
+    给前端，种子只该进服务端日志。`kind=engine` 用它做纯函数采样；`llamacpp`
+    把它掩到 32 位传给 llama-server（对方是 32 位种子，长种子截断即可）。
     """
     if not isinstance(slot, dict):
         return None
@@ -384,6 +556,24 @@ def build_provider(slot, *, seed: int | None = None) -> LLMProvider | None:
             think=bool(slot.get("think", False)),
             label="engine",
             backend=backend,
+        )
+
+    if kind in ("llamacpp", "llama", "llama_cpp"):
+        server_exe = llamacpp_mod.find_llama_server((slot.get("server") or "").strip())
+        model_path = engine_mod.find_model((slot.get("model") or "").strip())
+        if server_exe is None or model_path is None:
+            return None
+        return LlamaCppProvider(
+            server_exe,
+            model_path,
+            backend=slot.get("backend") or "gpu",
+            context=int(slot.get("context") or 6144),
+            max_tokens=int(slot.get("max_tokens") or 512),
+            temperature=float(slot.get("temperature", 0.8)),
+            seed=seed,
+            think=bool(slot.get("think", False)),
+            threads=int(slot.get("threads") or 0),
+            label="llamacpp",
         )
 
     base_url = (slot.get("base_url") or "").strip()

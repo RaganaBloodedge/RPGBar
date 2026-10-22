@@ -38,6 +38,9 @@ Thumbs.db
 # 临时探针 / 排查脚本（不入库）
 Temp/
 
+# llama.cpp 源码与构建产物（体积大，不入库；llamacpp 通道自动探测这里）
+tools/
+
 # 部署标记文件
 *.genie
 

@@ -53,9 +53,15 @@ def _slot_public(slot, label) -> dict:
     kind = (slot.get("kind") or "off").lower()
     has_key = bool((slot.get("api_key") or "").strip())
     engine_detail = None
+    llamacpp_detail = None
     if kind == "engine":
         engine_detail = _engine_public(slot)
         ready = engine_detail["ready"]
+    elif kind in ("llamacpp", "llama", "llama_cpp"):
+        # 文件级探测（exe + 权重在不在），不拉进程 —— 与 engine 的"不为显示一行字
+        # 搬 1 GiB 权重上卡"同一个取舍。真正的就绪在首次生成时验证。
+        llamacpp_detail = _llamacpp_public(slot)
+        ready = llamacpp_detail["ready"]
     else:
         ready = kind == "local" or (kind == "cloud" and has_key)
     model = slot.get("model", "")
@@ -65,12 +71,16 @@ def _slot_public(slot, label) -> dict:
         # 看着像"没配上"，而其实引擎已经就绪。
         model = Path(model).name if model else ""
         model = model or (engine_detail or {}).get("model_name", "")
+    elif kind in ("llamacpp", "llama", "llama_cpp"):
+        # 同 engine：别把本机路径发给前端，回落到探测到的实际文件名
+        model = Path(model).name if model else ""
+        model = model or (llamacpp_detail or {}).get("model_name", "")
     out = {
         "label": label,
         "kind": kind,
-        # 内置引擎没有 base_url 这个概念（进程内直连）—— 槽位里那个是云通道留下的
+        # 内置引擎 / llama.cpp 都没有 base_url 这个概念 —— 槽位里那个是云通道留下的
         # 默认值，显示出去只会误导，这里置空。
-        "base_url": "" if kind == "engine" else slot.get("base_url", ""),
+        "base_url": "" if kind in ("engine", "llamacpp", "llama", "llama_cpp") else slot.get("base_url", ""),
         "model": model,
         "has_api_key": has_key,
         "ready": ready,
@@ -78,7 +88,29 @@ def _slot_public(slot, label) -> dict:
     }
     if engine_detail is not None:
         out["engine"] = engine_detail
+    if llamacpp_detail is not None:
+        out["llamacpp"] = llamacpp_detail
     return out
+
+
+def _llamacpp_public(slot) -> dict:
+    """llama.cpp 槽位的公开状态：只给布尔与文件名，不给绝对路径。"""
+    from ..engine import find_model
+    from ..llamacpp import find_llama_server
+
+    exe = find_llama_server((slot.get("server") or "").strip())
+    weights = find_model((slot.get("model") or "").strip())
+    from ..engine import normalize_backend
+    backend = normalize_backend(slot.get("backend") or "gpu", default="gpu")
+    return {
+        "server_ok": exe is not None,
+        "server_name": exe.name if exe is not None else "",
+        "model_ok": weights is not None,
+        "model_name": weights.name if weights is not None else "",
+        "context": int(slot.get("context") or 0),
+        "backend": backend,
+        "ready": exe is not None and weights is not None,
+    }
 
 
 def _engine_public(slot) -> dict:

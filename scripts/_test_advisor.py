@@ -47,7 +47,9 @@ async def main():
         async def suggest(tag):
             await ws.send(json.dumps({"type": "suggest"}))
             m = await drain_until("suggestions", 120)
-            print(f"\n== 建议[{tag}] source={m.get('agent', {}).get('source')}", flush=True)
+            ag = m.get("agent", {}) or {}
+            print(f"\n== 建议[{tag}] source={ag.get('source')}"
+                  f" stopped={ag.get('stopped')} err={ag.get('error') or '-'}", flush=True)
             for o in m.get("options", []):
                 print("  -", o, flush=True)
 

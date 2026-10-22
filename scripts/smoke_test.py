@@ -741,6 +741,37 @@ async def run_unit_agents():
     if p_local:
         await p_local.close()
 
+    # --- 9b. llamacpp 通道（全部离线：不拉子进程，构建是懒的） ---
+    from server import llamacpp as llm_cpp
+    from server.engine import find_model
+
+    exe = llm_cpp.find_llama_server()
+    check("llamacpp：自动探测到 llama-server（tools/src/）", exe is not None and exe.is_file(),
+          str(exe))
+    args_gpu = llm_cpp.server_args("m.gguf", 12345, ngl=99, context=6144)
+    check("llamacpp：启动参数含 -m/--port/-c/-ngl/--jinja",
+          all(a in args_gpu for a in ("-m", "m.gguf", "12345", "-c", "6144", "-ngl", "99", "--jinja")),
+          " ".join(args_gpu))
+    args_cpu = llm_cpp.server_args("m.gguf", 1, ngl=0, context=1)
+    check("llamacpp：-ngl 落在参数里且值随 backend 走",
+          args_cpu[args_cpu.index("-ngl") + 1] == "0" and args_gpu[args_gpu.index("-ngl") + 1] == "99",
+          " ".join(args_cpu))
+    check("llamacpp：server 路径写错 → build_provider None",
+          build_provider({"kind": "llamacpp", "server": "Z:/nope/llama-server.exe"}) is None, "")
+    weights = find_model("")   # 本机没权重时跳过构建断言（CI 友好）
+    if exe is not None and weights is not None:
+        p_lp = build_provider({"kind": "llamacpp", "server": str(exe),
+                               "model": str(weights), "backend": "gpu", "context": 6144})
+        check("llamacpp：构建成功且是懒的（不拉进程）",
+              p_lp is not None and p_lp._handle is None and p_lp.supports_tools, str(p_lp and p_lp.name))
+        check("llamacpp：describe 不含绝对路径",
+              "/" not in (p_lp.describe().get("model") or "") and "\\" not in (p_lp.describe().get("model") or ""),
+              str(p_lp.describe()))
+        await p_lp.close()   # 没拉过进程 → release 是安全的空操作
+        check("llamacpp：close 未拉进程时安全", True, "")
+    p_alias = build_provider({"kind": "llama", "server": "Z:/nope/llama-server.exe"})
+    check("llamacpp：kind 别名 llama 也认（但 server 不在 → None）", p_alias is None, "")
+
     # --- 10. 槽位清洗：白名单 + 类型 + 取值范围 ---
     from server.main import clean_slot_patch, merge_slot
 

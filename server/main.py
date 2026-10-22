@@ -72,6 +72,7 @@ HTTP 接口：
     POST /api/scripts/load     读取并切换「活动剧本」（新开的房间用它）
 """
 import asyncio
+import atexit
 import json
 import os
 import re
@@ -101,6 +102,7 @@ from .dm import DM
 from .embedding import get_embedder
 from .engine import BACKENDS, derive_seed, gpu_probe, normalize_backend
 from .llm import ToolCallingUnsupported, build_provider
+from . import llamacpp as llamacpp_mod
 from .lobby import (
     PHASE_PLAYING,
     PHASE_WAITING,
@@ -1301,6 +1303,9 @@ def gen_code():
 
 
 app = FastAPI(title="RPGBar", version=__version__)
+
+# llama.cpp 子进程随服务器退出收干净（引用归零才终止，见 llamacpp.shutdown_all）。
+atexit.register(llamacpp_mod.shutdown_all)
 
 
 @app.get("/api/version")

@@ -70,6 +70,25 @@ _TOOL_ERROR_ECHO = (
 )
 
 
+def _lcs_len(a: str, b: str) -> int:
+    """最长公共子串长度（只保留上一行，O(min) 内存；两串都截到 400 字）。"""
+    a, b = a[:400], b[:400]
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ai = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                if cur[j] > best:
+                    best = cur[j]
+        prev = cur
+    return best
+
+
 def asserts_success(text: str, words=_SUCCESS_WORDS) -> str:
     """文本里有没有「做到了」的断言；排除「未能发现」「空无一物」这类否定/中性写法。
 
@@ -154,13 +173,16 @@ class NarratorAgent(Agent):
     max_steps = 6
     json_hint = NARRATOR_JSON_HINT
 
-    def __init__(self, store, provider=None, npc=None, chronicle=None, kb=None, world=None):
+    def __init__(self, store, provider=None, npc=None, chronicle=None, kb=None, world=None,
+                 rules=None):
         super().__init__(provider)
         self.store = store
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
         self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
         # 编译器产出的知识库（五类容器）。有就多两个只读工具，没有就不加 —— 游戏照跑。
         self.kb = kb
+        # 判定引擎：按规则书的档案造骰子（COC=d100 掷低）。没档案就退回 d20。
+        self.rules = rules
         # 这局的世界层（独立库）。**它是"现场存在什么"的唯一权威** ——
         # 没有它，DM 只能靠聊天记录猜，玩家说"我打开门"它就顺着演。
         self.world = world
@@ -228,10 +250,10 @@ class NarratorAgent(Agent):
         if notes:
             a = re.sub(r"\s+", "", notes)
             b = re.sub(r"\s+", "", text)
-            for i in range(0, max(1, len(a) - 11)):
-                seg = a[i: i + 12]
-                if len(seg) == 12 and seg in b:
-                    return "把 DM 内幕念成了旁白"
+            # 12 字连续重合是"照抄"；但实测 4B 会加两个虚词改写（"码头方向确实有东西
+            # 从水里上来"），所以再补一条：最长公共子串 ≥ 8 字也算泄漏。
+            if _lcs_len(a, b) >= 8:
+                return "把 DM 内幕念成了旁白"
         if any(e.get("type") == "dice" and not e.get("success") for e in ctx.events):
             word = asserts_success(text)
             if word:
@@ -513,6 +535,9 @@ class NarratorAgent(Agent):
                         {
                             "check_id": str_prop("检定 id，见【当前场景】的检定列表"),
                             "trigger": str_prop("玩家行动中命中该检定触发说法的原话片段"),
+                            "difficulty": str_prop(
+                                "难度：regular / hard（困难）/ extreme（极限）；省略=常规。"
+                                "只有在玩家处境明显更难时才用 hard"),
                         },
                         ["check_id"],
                     ),
@@ -634,7 +659,23 @@ class NarratorAgent(Agent):
             ]
         }
 
-    def _t_roll_check(self, ctx, check_id="", trigger=""):
+    def _skill_value(self, ctx, skill: str) -> tuple[int, str]:
+        """这次检定用多少技能值。顺序：角色卡 → 规则书技能基础值 → 30（无源则说明）。"""
+        actor = ctx.state.players.get(ctx.player_name)
+        ch = (actor.character if actor else {}) or {}
+        for key in ("skills", "技能"):
+            block = ch.get(key)
+            if isinstance(block, dict):
+                v = block.get(skill)
+                if isinstance(v, (int, float)) and v > 0:
+                    return int(v), "角色卡"
+        if self.kb is not None and getattr(self.kb, "available", False) and hasattr(self.kb, "skill_value"):
+            v, src = self.kb.skill_value(skill)
+            if v:
+                return v, src
+        return 30, "默认（书里没有这条技能）"
+
+    def _t_roll_check(self, ctx, check_id="", trigger="", difficulty=""):
         check_id = (check_id or "").strip()
         scene = ctx.state.current()
         check = next((c for c in scene.get("checks", []) if c["id"] == check_id), None)
@@ -670,7 +711,13 @@ class NarratorAgent(Agent):
         card = getattr(self.store, "card_schema", None)
         actor = ctx.state.players.get(ctx.player_name)
         mod, attr = character_card.modifier_for(card, (actor.character if actor else {}), check["skill"])
-        r = dice.roll_check(check["skill"], check.get("dc", 10), mod=mod)
+        if self.rules is not None and getattr(self.rules, "is_d100", False):
+            value, source = self._skill_value(ctx, check["skill"])
+            r = self.rules.check(check["skill"], value,
+                                 difficulty=(difficulty or check.get("difficulty") or "regular"))
+            r["skill_source"] = source
+        else:
+            r = dice.roll_check(check["skill"], check.get("dc", 10), mod=mod)
         ok = r["success"]
         if ok and check.get("success_flag"):
             ctx.state.set_flag(check["success_flag"])
@@ -680,10 +727,15 @@ class NarratorAgent(Agent):
                 "type": "dice",
                 "player": ctx.player_name,
                 "skill": check["skill"],
-                "dc": r["dc"],
-                "roll": r["roll"],
-                "mod": r["mod"],
-                "total": r["total"],
+                "dice": r.get("dice") or "d20",
+                "dc": r.get("target"),
+                "roll": r.get("roll"),
+                "target": r.get("target"),
+                "level": r.get("level"),
+                "skill_value": r.get("skill_value"),
+                "skill_source": r.get("skill_source"),
+                "mod": r.get("mod", 0),
+                "total": r.get("total"),
                 "attr": attr,
                 "success": ok,
                 "flag": check.get("success_flag") if ok else None,
@@ -693,6 +745,7 @@ class NarratorAgent(Agent):
         return {
             "rolled": True,
             "success": ok,
+            "system": (self.rules.describe() if self.rules is not None else "d20"),
             # 把加值的来历告诉 DM：它可以据此说「你的学识让你看出了门道」，
             # 但照旧**不要在旁白里报数字**（提示词里那条硬边界不变）。
             "ability": f"{attr} {mod:+d}" if attr else "",

@@ -226,6 +226,20 @@ class KBStore:
             self._names = sorted(names, key=len, reverse=True)
         return self._names
 
+    def skill_value(self, name: str) -> tuple[int, str]:
+        """规则书里这条技能的基础值（"%"。查不到返回 (0, "")）。"""
+        kb = self.kb
+        if kb is None or not name:
+            return 0, ""
+        try:
+            card = kb.skill_card(name)
+            if "error" in card:
+                return 0, ""
+            m = re.search(r"(\d{1,3})", str(card.get("base_value") or ""))
+            return (int(m.group(1)), "规则书技能表") if m else (0, "")
+        except Exception:  # noqa: BLE001
+            return 0, ""
+
     def name_index(self) -> list[str]:
         """库里所有可查的名字（给"玩家提到的东西是否在书里"做比对用）。"""
         return list(self._name_index())

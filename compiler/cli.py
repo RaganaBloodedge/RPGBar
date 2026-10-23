@@ -535,6 +535,33 @@ def cmd_resume(args) -> int:
     return 0 if v.get("passed") else 2
 
 
+def cmd_ruleprofile(args) -> int:
+    """从规则书抽判定档案（骰子类型/方向/难度系数）。"""
+    from . import rules_profile
+
+    model = None
+    if not args.no_llm:
+        from .graph.llm_classify import get_default_model
+
+        model = get_default_model()
+    print(json.dumps(rules_profile.build(args.kb, model=model), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_sandbox(args) -> int:
+    """规则书 → 沙盒模组（场景图 + 检定 + kb 声明）。"""
+    from . import sandbox
+
+    model = None
+    if not args.no_llm:
+        from .graph.llm_classify import get_default_model
+
+        model = get_default_model()
+    stats = sandbox.build(args.kb, args.out, model=model)
+    print(json.dumps(stats, ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_containers(args) -> int:
     """阶段二：把五类容器物化出来（docs/知识库目标结构.md）。"""
     import os
@@ -751,6 +778,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("gate", help="看非游戏内容拦截清单与自查结果")
     p.add_argument("--kb", required=True)
     p.set_defaults(func=cmd_gate)
+
+    p = sub.add_parser("ruleprofile", help="从规则书抽判定档案（d100/d20、难度系数）")
+    p.add_argument("--kb", required=True, help="知识库目录（含 kb.sqlite）")
+    p.add_argument("--no-llm", action="store_true", help="不调用模型，只做文本检测")
+    p.set_defaults(func=cmd_ruleprofile)
+
+    p = sub.add_parser("sandbox", help="规则书 → 沙盒模组（场景图 + 检定 + kb 声明）")
+    p.add_argument("--kb", required=True, help="知识库目录（含 kb.sqlite）")
+    p.add_argument("--out", required=True, help="输出剧本 JSON（建议放 scripts/ 下）")
+    p.add_argument("--no-llm", action="store_true", help="不调用模型，只生成最小骨架")
+    p.set_defaults(func=cmd_sandbox)
 
     p = sub.add_parser("containers", help="★ 阶段二：把五类容器物化出来（规则树/技能/物品/NPC/世界观）")
     p.add_argument("--kb", required=True, help="知识库目录（含 kb.sqlite）")

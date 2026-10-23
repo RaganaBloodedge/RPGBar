@@ -383,6 +383,17 @@ class Room:
             self._kb = _kb_store(self.script_rel)
         except Exception:  # noqa: BLE001
             self._kb = None
+        # 判定引擎：读知识库目录旁的 rule_profile.json（COC → d100 掷低）。
+        # 没有档案就是 None，DM 退回 d20 —— 老剧本不受影响。
+        self.rules = None
+        try:
+            from .rules import Rules
+
+            self.rules = Rules.load(getattr(self._kb, "path", None))
+            if getattr(self, "rules", None) is not None:
+                print(f"[RPGBar] 判定档案：{self.rules.describe()}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[RPGBar] 判定档案加载失败（退回 d20）：{exc}")
         # 这局的世界层：独立库（data/worlds/<剧本>/<房间>.sqlite）。
         # 剧本只提供**种子场景**，之后世界怎么长由这一局自己记。
         self.world = None
@@ -820,7 +831,7 @@ class Room:
             self._narrator = NarratorAgent(
                 self.store, self._provider(self.dm_slot, "dm"),
                 npc=self.npc, chronicle=self.chronicle,
-                kb=self._kb, world=self.world,
+                kb=self._kb, world=self.world, rules=self.rules,
             )
         return self._narrator
 

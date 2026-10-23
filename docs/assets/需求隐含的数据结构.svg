@@ -1,0 +1,65 @@
+<svg viewBox="0 0 680 620" role="img" width="100%" xmlns="http://www.w3.org/2000/svg">
+<title>剧本知识库的隐含数据结构：章节粗分下五类各自的子结构</title>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<text class="th" x="340" y="28" text-anchor="middle" fill="#444441">目录/大标题粗分（章节 = 第一层）</text>
+<rect x="230" y="40" width="220" height="36" rx="10" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
+<text class="th" x="340" y="58" text-anchor="middle" dominant-baseline="central" fill="#0C447C">按章节分页 → 页内细分类</text>
+<line x1="340" y1="76" x2="340" y2="94" stroke="#888780" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="30" y="100" width="620" height="380" rx="20" fill="#F1EFE8" stroke="#888780" stroke-width="0.5"/>
+<text class="ts" x="340" y="120" text-anchor="middle" fill="#5F5E5A">第二层：五类 —— 每类不是一堆块，而是各自的数据结构</text>
+<rect x="48" y="138" width="188" height="160" rx="10" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5"/>
+<text class="th" x="142" y="156" text-anchor="middle" fill="#791F1F">规则类</text>
+<rect x="62" y="170" width="160" height="26" rx="6" fill="#FFFFFF" stroke="#F09595" stroke-width="0.5"/>
+<text class="ts" x="142" y="183" text-anchor="middle" dominant-baseline="central" fill="#501313">子类树：战斗 / 追逐 / …</text>
+<text class="ts" x="142" y="212" text-anchor="middle" fill="#501313">新规则类型 → 并行子类</text>
+<rect x="62" y="226" width="160" height="26" rx="6" fill="#FFFFFF" stroke="#F09595" stroke-width="0.5"/>
+<text class="ts" x="142" y="239" text-anchor="middle" dominant-baseline="central" fill="#501313">→ 编译出流程图</text>
+<rect x="252" y="138" width="188" height="160" rx="10" fill="#EAF3DE" stroke="#3B6D11" stroke-width="0.5"/>
+<text class="th" x="346" y="156" text-anchor="middle" fill="#27500A">玩家属性类</text>
+<rect x="264" y="170" width="164" height="26" rx="6" fill="#FFFFFF" stroke="#97C459" stroke-width="0.5"/>
+<text class="ts" x="346" y="183" text-anchor="middle" dominant-baseline="central" fill="#173404">状态：理智/力量… → 角色卡</text>
+<rect x="264" y="202" width="164" height="26" rx="6" fill="#FFFFFF" stroke="#97C459" stroke-width="0.5"/>
+<text class="ts" x="346" y="215" text-anchor="middle" dominant-baseline="central" fill="#173404">技能：名字+描述 → 直查</text>
+<rect x="264" y="234" width="164" height="26" rx="6" fill="#FFFFFF" stroke="#97C459" stroke-width="0.5"/>
+<text class="ts" x="346" y="247" text-anchor="middle" dominant-baseline="central" fill="#173404">关系：→ 关系图</text>
+<rect x="456" y="138" width="188" height="160" rx="10" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5"/>
+<text class="th" x="550" y="156" text-anchor="middle" fill="#854F0B">物品类</text>
+<rect x="470" y="170" width="160" height="26" rx="6" fill="#FFFFFF" stroke="#EF9F27" stroke-width="0.5"/>
+<text class="ts" x="550" y="183" text-anchor="middle" dominant-baseline="central" fill="#633806">以名字为索引</text>
+<rect x="470" y="202" width="160" height="26" rx="6" fill="#FFFFFF" stroke="#EF9F27" stroke-width="0.5"/>
+<text class="ts" x="550" y="215" text-anchor="middle" dominant-baseline="central" fill="#633806">查名 → 直接返回简介</text>
+<text class="ts" x="550" y="247" text-anchor="middle" fill="#854F0B">给 DM 读</text>
+<rect x="48" y="312" width="188" height="150" rx="10" fill="#FBEAF0" stroke="#993556" stroke-width="0.5"/>
+<text class="th" x="142" y="330" text-anchor="middle" fill="#72243E">NPC 类（只读）</text>
+<rect x="62" y="344" width="76" height="26" rx="6" fill="#FFFFFF" stroke="#ED93B1" stroke-width="0.5"/>
+<text class="ts" x="100" y="357" text-anchor="middle" dominant-baseline="central" fill="#4B1528">怪物</text>
+<rect x="146" y="344" width="76" height="26" rx="6" fill="#FFFFFF" stroke="#ED93B1" stroke-width="0.5"/>
+<text class="ts" x="184" y="357" text-anchor="middle" dominant-baseline="central" fill="#4B1528">人</text>
+<text class="ts" x="142" y="392" text-anchor="middle" fill="#4B1528">各自维护属性+能力</text>
+<text class="ts" x="142" y="412" text-anchor="middle" fill="#4B1528">DM 可立即搜索</text>
+<rect x="252" y="312" width="188" height="150" rx="10" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5"/>
+<text class="th" x="346" y="330" text-anchor="middle" fill="#3C3489">常识与世界观类</text>
+<rect x="264" y="344" width="164" height="26" rx="6" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="0.5"/>
+<text class="ts" x="346" y="357" text-anchor="middle" dominant-baseline="central" fill="#26215C">先总结摘要</text>
+<rect x="264" y="376" width="164" height="26" rx="6" fill="#FFFFFF" stroke="#AFA9EC" stroke-width="0.5"/>
+<text class="ts" x="346" y="389" text-anchor="middle" dominant-baseline="central" fill="#26215C">摘要下挂原文</text>
+<text class="ts" x="346" y="424" text-anchor="middle" fill="#3C3489">语义相似的新内容</text>
+<text class="ts" x="346" y="442" text-anchor="middle" fill="#3C3489">→ 补充到同一摘要下</text>
+<rect x="456" y="312" width="188" height="150" rx="10" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5"/>
+<text class="th" x="550" y="330" text-anchor="middle" fill="#085041">跨类检索层</text>
+<text class="ts" x="550" y="366" text-anchor="middle" fill="#04342C">DM/玩家聊到什么</text>
+<text class="ts" x="550" y="386" text-anchor="middle" fill="#04342C">语义近似即命中</text>
+<rect x="480" y="404" width="60" height="24" rx="6" fill="#FFFFFF" stroke="#5DCAA5" stroke-width="0.5"/>
+<text class="ts" x="510" y="416" text-anchor="middle" dominant-baseline="central" fill="#085041">RAG</text>
+<rect x="552" y="404" width="60" height="24" rx="6" fill="#FFFFFF" stroke="#5DCAA5" stroke-width="0.5"/>
+<text class="ts" x="582" y="416" text-anchor="middle" dominant-baseline="central" fill="#085041">BM25</text>
+<text class="ts" x="550" y="448" text-anchor="middle" fill="#04342C">返回：原文</text>
+<line x1="340" y1="480" x2="340" y2="504" stroke="#888780" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+<rect x="140" y="510" width="400" height="40" rx="10" fill="#FAECE7" stroke="#993C1D" stroke-width="0.5"/>
+<text class="th" x="340" y="530" text-anchor="middle" dominant-baseline="central" fill="#712B13">运行时：DM 按名字/语义即时查询，条目只读</text>
+<text class="ts" x="340" y="576" text-anchor="middle" fill="#5F5E5A">和现有实现的差别：现在是「块 + 扁平实体表」；需求是「每类有自己的组织方式和出口产物」</text>
+</svg>

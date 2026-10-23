@@ -39,6 +39,7 @@ class NarratorContext:
     world_present: str = ""  # 当前场景**真实存在**的东西（世界层）
     world_digest: str = ""   # 进度：第几轮/第几天/还没收束的线索/去过的地方
     world_unresolved: list = field(default_factory=list)  # 玩家提到、但现场/原文都没有的名词
+    world_move: str = ""     # 非空 = 服务端已经把队伍带到这个地点（要你描写它）
 
 
 NARRATOR_JSON_HINT = {
@@ -313,6 +314,9 @@ class NarratorAgent(Agent):
                 "（原文写到的物件要承认，原文没写的细节不要补）\n"
                 "3. 原文和周遭都没桌子，玩家说「我拿起桌上的钥匙」→「这里没有桌子，也没有钥匙。」\n"
                 "**判断顺序：先看场景原文 → 再看【现场】；两处都没有，就是不存在。**\n"
+                "- **但「去某个地方」不是断言、是移动**：沙盒模式下玩家说「去码头 / 回旅馆」，"
+                "用 travel(place=…, description=…) 当场长出新地点，**不要回「这里没有码头」**；"
+                "固定剧本模式才用 move_to。\n"
             )
         return (
             "你是一场中文文字跑团（TRPG）的主持人（DM）。\n"
@@ -378,6 +382,14 @@ class NarratorAgent(Agent):
         )
         present = getattr(ctx, "world_present", "") or ""
         present_block = (f"\n【现场】\n{present}\n" if present else "")
+        move = getattr(ctx, "world_move", "") or ""
+        move_block = (
+            f"\n【系统已经带队移动】玩家到了「{move}」。\n"
+            "这里还**没有描写**：请用 2–3 句写它现在的样子（第二人称、具体感官），"
+            "并用 declare 登记至少一个能看/能碰的东西。\n"
+            if move
+            else ""
+        )
         unresolved = getattr(ctx, "world_unresolved", None) or []
         unresolved_block = (
             "\n【未落地的指代】玩家提到了：" + "、".join(f"「{n}」" for n in unresolved[:4])
@@ -422,6 +434,7 @@ class NarratorAgent(Agent):
             f"{digest_block}"
             f"{present_block}"
             f"{unresolved_block}"
+            f"{move_block}"
             f"{npc_block}"
             f"{kb_block}"
             f"{oob_block}\n"
@@ -494,6 +507,20 @@ class NarratorAgent(Agent):
                 ]
             )
         if self.world is not None:
+            if (self.store.data or {}).get("sandbox"):
+                tools.append(
+                    Tool(
+                        "travel",
+                        "去一个新地方（沙盒模式）。你给出地名和 1–2 句场景描写，系统会把它登记成新地点。"
+                        "玩家说「去码头/回旅馆」时用它。",
+                        _obj({
+                            "place": str_prop("地名，如 码头 / 阿卡姆旅馆"),
+                            "description": str_prop("1–2 句场景原文，第二人称，有感官细节"),
+                        }, ["place"]),
+                        self._t_travel,
+                        read_only=False,
+                    )
+                )
             tools.extend([
                 Tool(
                     "declare",
@@ -585,6 +612,48 @@ class NarratorAgent(Agent):
             ]
         )
         return tools
+
+    def _t_travel(self, ctx, place="", description=""):
+        """沙盒里当场长出一个地点，并登记进世界层（剧本模式不许凭空长）。"""
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        place = (place or "").strip()[:20]
+        if not place:
+            return {"error": "请给出地名"}
+        row = self.world.con.execute(
+            "SELECT * FROM scene WHERE place=? OR label=?", (place, place)).fetchone()
+        if row:  # 去过的地方就回去，不重复建
+            sid = row["id"]
+            self.world.enter(sid)
+            ctx.state.enter(sid)
+            ctx.state.turn += 1
+            ctx.events.append({"type": "system", "text": f"回到：{place}"})
+            return {"ok": True, "scene_id": sid, "returned": True,
+                    "scene": self.store.scene_brief(sid, flags=ctx.state.flags)}
+        cur = ctx.state.current() or {}
+        if cur.get("exits") and not (self.store.data or {}).get("sandbox"):
+            return {"error": "本剧本是固定场景，请用 move_to（出口见【当前场景】）",
+                    "available": [e["to"] for e in cur.get("exits") or []]}
+        n = int(self.world.get("gen_count", "0") or 0) + 1
+        self.world.set("gen_count", n)
+        sid = f"gen{n}"
+        text = (description or "").strip()[:600] or f"{place}。"
+        scene = {
+            "id": sid, "chapter": 1, "title": place, "location": place,
+            "public_text": text, "dm_notes": "", "npcs": [], "keywords": [place],
+            "flags_required": [], "flags_set": [], "checks": [], "exits": [],
+        }
+        self.store.scenes[sid] = scene
+        self.world.add_scene(sid, place, place, text,
+                             parent=ctx.state.current_scene or "", source="generated")
+        self.world.enter(sid)
+        ctx.state.enter(sid)
+        ctx.state.turn += 1
+        ctx.events.append({"type": "system", "text": f"进入：{place}"})
+        ctx.narration_parts.append(text)
+        return {"ok": True, "scene_id": sid, "place": place,
+                "scene": self.store.scene_brief(sid, flags=ctx.state.flags),
+                "note": "新地点已登记进世界层。系统已广播场景原文，你只需补一句衔接。"}
 
     def _t_declare(self, ctx, name="", kind="object", detail=""):
         if self.world is None:

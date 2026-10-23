@@ -1244,12 +1244,33 @@ class Room:
                         kb_brief = ""
                 ctx = NarratorContext(state=self.state, player_name=name,
                                       npc_brief=npc_brief, kb_brief=kb_brief)
+                moved = ""
+                if self.world is not None and (self.store.data or {}).get("sandbox"):
+                    # **移动由服务端执行**：玩家说"去码头"，4B 会把它当断言然后否认
+                    # （实测回「这里没有码头」）。地名提取与建场景都是几何，不该赌模型。
+                    try:
+                        place = self.world.move_intent(text)
+                    except Exception:  # noqa: BLE001
+                        place = ""
+                    if place:
+                        sid = self.world.grow_place(place, parent=self.state.current_scene)
+                        self.store.scenes[sid] = {
+                            "id": sid, "chapter": 1, "title": place, "location": place,
+                            "public_text": "", "dm_notes": "", "npcs": [],
+                            "keywords": [place], "flags_required": [], "flags_set": [],
+                            "checks": [], "exits": [],
+                        }
+                        self.state.enter(sid)
+                        moved = place
+                        await self.broadcast({"type": "system", "text": f"进入：{place}"})
                 if self.world is not None:
                     self.world.bump_turn()
                     ctx.world_present = self.world.present_text()
                     ctx.world_digest = self.world.digest_text()
                     ctx.world_unresolved = self.world.unresolved(
                         text, kb_names=(self._kb.name_index() if self._kb else None))
+                if moved:
+                    ctx.world_move = moved
                 res = await self.narrator().run(ctx, text)
                 print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
                       f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"

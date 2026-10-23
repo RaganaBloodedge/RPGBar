@@ -294,3 +294,43 @@ class World:
             if len(out) >= 4:
                 break
         return out
+
+    # ---------------------------------------------------------------- 移动意图
+    # 非贪婪 + 前瞻："去码头看看" 要抓到"码头"而不是"码头看看"
+    _MOVE_RE = re.compile(
+        r"(?:我)?(?:要|想|准备|打算)?(?:去|前往|回到?|走进|进入|离开|赶到)(?:了)?\s*"
+        r"([\u4e00-\u9fa5A-Za-z0-9·]{2,8}?)"
+        r"(?=看看|转转|瞧瞧|一趟|那儿|那边|去吧|$|[\s，。！？,、])"
+    )
+    _MOVE_STOP = ("那个", "这个", "那间", "这间", "那边", "这边", "看看", "检查", "搜查",
+                  "找找", "问问", "哪", "什么")
+
+    def move_intent(self, text: str) -> str:
+        """玩家这句话里的"去哪儿"。返回地名，没有就空串。
+
+        为什么由服务端提取：4B 会把"去码头"当成"玩家断言有码头"然后否认
+        （实测回了「这里没有码头。你摸到的只有潮湿的石壁。」——连例句都照搬了）。
+        移动是**几何**，不该赌模型的语义判断。
+        """
+        m = self._MOVE_RE.search(text or "")
+        if not m:
+            return ""
+        place = m.group(1).strip()
+        if not place or any(w in place for w in self._MOVE_STOP):
+            return ""
+        if any(_key(place) == _key(e["name"]) for e in self.present()):
+            return ""  # 指的是现场已有的东西（"去那盏灯那儿"），不算换地点
+        return place[:12]
+
+    def grow_place(self, place: str, description: str = "", parent: str = "") -> str:
+        """长出一个新地点并进入（沙盒）。返回场景 id。"""
+        row = self.con.execute("SELECT id FROM scene WHERE place=? OR label=?", (place, place)).fetchone()
+        if row:
+            self.enter(row["id"])
+            return row["id"]
+        n = int(self.get("gen_count", "0") or 0) + 1
+        self.set("gen_count", n)
+        sid = f"gen{n}"
+        self.add_scene(sid, place, place, description or "", parent=parent, source="generated")
+        self.enter(sid)
+        return sid

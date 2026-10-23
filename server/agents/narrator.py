@@ -35,6 +35,9 @@ class NarratorContext:
     user_action: str = ""  # 本轮玩家原话（工具要拿它做检定关键词匹配，模型传参不可信）
     oob_verb: str = ""   # 非空 = 玩家动作被判定为越界（剧本机制之外），见 out_of_bounds_verb
     kb_brief: str = ""   # 知识库命中（玩家话里出现库里的名字时，确定性注入，不靠模型调工具）
+    world_present: str = ""  # 当前场景**真实存在**的东西（世界层）
+    world_digest: str = ""   # 进度：第几轮/第几天/还没收束的线索/去过的地方
+    world_unresolved: list = field(default_factory=list)  # 玩家提到、但现场/原文都没有的名词
 
 
 NARRATOR_JSON_HINT = {
@@ -151,13 +154,16 @@ class NarratorAgent(Agent):
     max_steps = 6
     json_hint = NARRATOR_JSON_HINT
 
-    def __init__(self, store, provider=None, npc=None, chronicle=None, kb=None):
+    def __init__(self, store, provider=None, npc=None, chronicle=None, kb=None, world=None):
         super().__init__(provider)
         self.store = store
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
         self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
         # 编译器产出的知识库（五类容器）。有就多两个只读工具，没有就不加 —— 游戏照跑。
         self.kb = kb
+        # 这局的世界层（独立库）。**它是"现场存在什么"的唯一权威** ——
+        # 没有它，DM 只能靠聊天记录猜，玩家说"我打开门"它就顺着演。
+        self.world = world
 
     async def run(self, ctx, user_input: str = "") -> AgentResult:
         """跑一轮，并在返回前**核一遍旁白与权威结果是否打架**。
@@ -216,6 +222,16 @@ class NarratorAgent(Agent):
         # 报错「当前场景没有检定 侦查，无法进行相关检定」直接当旁白说了出去。
         if any(h in text for h in _TOOL_ERROR_ECHO):
             return "复述了工具的报错"
+        # **DM 内幕被念出来**：场景的 dm_notes 是底牌。实测 4B 把
+        # 「这间石室没有门…绝对不要凭空给出一扇门」整段念给了玩家。
+        notes = (ctx.state.current() or {}).get("dm_notes") or ""
+        if notes:
+            a = re.sub(r"\s+", "", notes)
+            b = re.sub(r"\s+", "", text)
+            for i in range(0, max(1, len(a) - 11)):
+                seg = a[i: i + 12]
+                if len(seg) == 12 and seg in b:
+                    return "把 DM 内幕念成了旁白"
         if any(e.get("type") == "dice" and not e.get("success") for e in ctx.events):
             word = asserts_success(text)
             if word:
@@ -253,6 +269,28 @@ class NarratorAgent(Agent):
                 "但玩家明确问数据/规则（「伤害多少」「怎么判」）时可以简短报出并给出处。\n"
                 "- 查不到就说「书上没有记载」，**绝不编数值**。\n"
             )
+        world_block = ""
+        if self.world is not None:
+            world_block = (
+                "【世界状态是权威】\n"
+                "- 【现场】为空**不等于什么都没有**：场景原文里写到的物件照常存在。"
+                "【现场】列出的是**当前真实存在**的东西。玩家提到的东西如果【现场】没有、"
+                "规则书里也没有，就说明这里没有它 —— 用一句话说清（例如「这间石室里没有门」），"
+                "**不要顺着玩家把它演出来**。\n"
+                "- **动作的前提不成立时，第一句就说清楚**：玩家要开的门、要走的路根本不存在，"
+                "就明确说「这里没有门 / 这条路不通」，再给出现在能做的事，不要用气氛描写绕过去。\n"
+                "- 你旁白里**新出现**的物件/人物，必须先用 declare 登记；不登记，下一轮它就不存在，"
+                "前后会自相矛盾。\n"
+                "- 怪物、法术、关键道具只能来自知识库（kb_lookup），不能自己发明；"
+                "没有合适数值的东西，就不要让它出现。\n"
+                "【例子：玩家断言了不存在的东西】\n"
+                "1. 原文没写门，玩家说「我推开门」→「这里没有门。你摸到的只有潮湿的石壁。」\n"
+                "2. 原文写着「石壁上挂着一盏没油的青铜灯」，玩家问「灯座下的刻字是什么」→"
+                "灯**存在**、刻字**不存在**：「灯座上没有刻字，只有一层锈。」"
+                "（原文写到的物件要承认，原文没写的细节不要补）\n"
+                "3. 原文和周遭都没桌子，玩家说「我拿起桌上的钥匙」→「这里没有桌子，也没有钥匙。」\n"
+                "**判断顺序：先看场景原文 → 再看【现场】；两处都没有，就是不存在。**\n"
+            )
         return (
             "你是一场中文文字跑团（TRPG）的主持人（DM）。\n"
             "【你的职责】\n"
@@ -268,6 +306,7 @@ class NarratorAgent(Agent):
             "- 只有这几种才需要查：剧本别处的设定用 lookup_script；"
             "某个 NPC 的过往用 npc_card 或 recall_history；出场了剧本里没有的新 NPC 用 npc_introduce。\n"
             + kb_block
+            + world_block
             + "- 剧情明确产生新线索时才 set_flag。\n"
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
@@ -314,6 +353,19 @@ class NarratorAgent(Agent):
             if oob
             else ""
         )
+        present = getattr(ctx, "world_present", "") or ""
+        present_block = (f"\n【现场】\n{present}\n" if present else "")
+        unresolved = getattr(ctx, "world_unresolved", None) or []
+        unresolved_block = (
+            "\n【未落地的指代】玩家提到了：" + "、".join(f"「{n}」" for n in unresolved[:4])
+            + " —— 它们不在现场，也不在场景原文里（这是服务端比对出来的，不是猜测）。\n"
+            "  · 如果是玩家**凭空断言**的（刻字、钥匙、门），明确说没有，不要让它出现；\n"
+            "  · 如果只是**布景**（桌子、灯、脚印）且你确实要写它，先 declare 再写。\n"
+            if unresolved
+            else ""
+        )
+        digest = getattr(ctx, "world_digest", "") or ""
+        digest_block = (f"\n【进度】\n{digest}\n" if digest else "")
         kb = getattr(ctx, "kb_brief", "") or ""
         kb_block = (
             f"\n【知识库参考（规则书原文，用来裁定；不是剧本内容）】\n{kb}\n"
@@ -327,6 +379,9 @@ class NarratorAgent(Agent):
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
             f"{hist_block}"
+            f"{digest_block}"
+            f"{present_block}"
+            f"{unresolved_block}"
             f"{npc_block}"
             f"{kb_block}"
             f"{oob_block}\n"
@@ -398,6 +453,34 @@ class NarratorAgent(Agent):
                     ),
                 ]
             )
+        if self.world is not None:
+            tools.extend([
+                Tool(
+                    "declare",
+                    "把**你旁白里新出现**的物件/人物/线索登记进世界（不登记，下一轮它就不存在了）。"
+                    "要写「这里有一张木桌」，就先 declare(name=木桌, kind=object)。",
+                    _obj({
+                        "name": str_prop("名字，如 木桌 / 守墓人 / 血字"),
+                        "kind": str_prop("object / npc / creature / clue / door"),
+                        "detail": str_prop("一句描述，可选"),
+                    }, ["name"]),
+                    self._t_declare,
+                    read_only=False,
+                ),
+                Tool(
+                    "lookup_world",
+                    "查某个东西现在在不在、在哪（世界层）。玩家提到一个可能不存在的东西时先确认。只读。",
+                    _obj({"name": str_prop("要查的名字，如 门 / 青铜灯 / 守墓人")}, ["name"]),
+                    self._t_lookup_world,
+                ),
+                Tool(
+                    "advance_time",
+                    "推进游戏内时间（分钟）。调查/搜查/赶路各要多久，你按规则书估；系统负责昼夜与天数。",
+                    _obj({"minutes": int_prop("分钟数，1–240", 10),
+                          "reason": str_prop("为什么花这些时间")}, ["minutes"]),
+                    self._t_advance_time,
+                ),
+            ])
         if self.kb is not None and getattr(self.kb, "available", False):
             try:
                 from ..kb_tools import build_tools as _kb_tools
@@ -459,6 +542,37 @@ class NarratorAgent(Agent):
             ]
         )
         return tools
+
+    def _t_declare(self, ctx, name="", kind="object", detail=""):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        row = self.world.declare(name, kind=kind, detail=detail)
+        if not row:
+            return {"error": "登记失败：名字为空或没有当前场景"}
+        return {"ok": True, "entity": {"name": row["name"], "kind": row["kind"],
+                                       "detail": row["detail"]},
+                "note": "已登记进世界层，之后每一轮它都在【现场】里。"}
+
+    def _t_lookup_world(self, ctx, name=""):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        hit = self.world.find(name)
+        if not hit:
+            return {"exists": False, "note": f"世界层里没有「{name}」。不要顺着玩家把它演出来。"}
+        here = hit["scene_id"] == self.world.get("scene")
+        return {"exists": True, "here": here, "name": hit["name"], "kind": hit["kind"],
+                "detail": hit["detail"],
+                "note": "当前场景里确实有它。" if here else "它存在，但不在当前场景。"}
+
+    def _t_advance_time(self, ctx, minutes=10, reason=""):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        ev = self.world.advance(minutes)
+        if ev:
+            ctx.events.append(ev)
+        return {"ok": True, "turn": self.world.get("turn"), "day": self.world.get("day"),
+                "phase": self.world.get("phase"),
+                "note": ev["text"] if ev else f"过去 {minutes} 分钟。"}
 
     def _t_npc_card(self, ctx, name=""):
         if self.npc is None:
@@ -612,6 +726,11 @@ class NarratorAgent(Agent):
             }
         target = self.store.get_scene(scene_id)
         ctx.state.enter(scene_id)
+        if self.world is not None:
+            self.world.add_scene(scene_id, target.get("title") or scene_id,
+                                 target.get("location") or "", target.get("public_text") or "",
+                                 parent=ctx.state.current_scene, source="script")
+            self.world.enter(scene_id)
         ctx.state.turn += 1
         ctx.events.append({"type": "system", "text": f"进入：{target['title']}"})
         ctx.narration_parts.append(target.get("public_text", ""))

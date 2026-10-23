@@ -226,6 +226,10 @@ class KBStore:
             self._names = sorted(names, key=len, reverse=True)
         return self._names
 
+    def name_index(self) -> list[str]:
+        """库里所有可查的名字（给"玩家提到的东西是否在书里"做比对用）。"""
+        return list(self._name_index())
+
     def related(self, text: str, limit: int = 2) -> str:
         """**确定性注入**：玩家话里出现了库里的名字，就把条目直接摆到 DM 面前。
 

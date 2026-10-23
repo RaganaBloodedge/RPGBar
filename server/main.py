@@ -383,6 +383,17 @@ class Room:
             self._kb = _kb_store(self.script_rel)
         except Exception:  # noqa: BLE001
             self._kb = None
+        # 这局的世界层：独立库（data/worlds/<剧本>/<房间>.sqlite）。
+        # 剧本只提供**种子场景**，之后世界怎么长由这一局自己记。
+        self.world = None
+        try:
+            from .world import World
+
+            self.world = World.for_room(self.script_rel or "", code,
+                                        kb=(str(self._kb.path) if self._kb else ""))
+            self._seed_world()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[RPGBar] 世界层初始化失败（房间照常，DM 少了现场记忆）：{exc}")
         # ---- 大厅元数据（建房时由房主填，之后房主可以改）----
         # 建房参数先过 lobby.clean_create：它保证这里拿到的**一定是一套完整值**，
         # 而且人数上下限是按**本房间钉住的那份剧本**算的（剧本可选的 players 段，
@@ -788,12 +799,28 @@ class Room:
             return None
         return build_provider(slot, seed=derive_seed(self.seed, label))
 
+    def _seed_world(self) -> None:
+        """把剧本的起始场景写进世界层（只写一次；已有世界则原样恢复）。"""
+        w = self.world
+        if w is None or w.scene() is not None:
+            return
+        try:
+            sc = self.store.get_scene(self.store.start_scene)
+        except Exception:  # noqa: BLE001
+            sc = None
+        if not sc:
+            return
+        w.add_scene(sc["id"], sc.get("title") or sc["id"], sc.get("location") or "",
+                    sc.get("public_text") or "", source="script")
+        w.enter(sc["id"])
+        print(f"[RPGBar] 世界层就绪：{w.path}（起始场景 {sc['id']}）")
+
     def narrator(self) -> NarratorAgent:
         if self._narrator is None:
             self._narrator = NarratorAgent(
                 self.store, self._provider(self.dm_slot, "dm"),
                 npc=self.npc, chronicle=self.chronicle,
-                kb=self._kb,
+                kb=self._kb, world=self.world,
             )
         return self._narrator
 
@@ -1185,6 +1212,12 @@ class Room:
                         kb_brief = ""
                 ctx = NarratorContext(state=self.state, player_name=name,
                                       npc_brief=npc_brief, kb_brief=kb_brief)
+                if self.world is not None:
+                    self.world.bump_turn()
+                    ctx.world_present = self.world.present_text()
+                    ctx.world_digest = self.world.digest_text()
+                    ctx.world_unresolved = self.world.unresolved(
+                        text, kb_names=(self._kb.name_index() if self._kb else None))
                 res = await self.narrator().run(ctx, text)
                 print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
                       f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"

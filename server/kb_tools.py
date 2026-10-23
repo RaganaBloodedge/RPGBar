@@ -226,6 +226,15 @@ class KBStore:
             self._names = sorted(names, key=len, reverse=True)
         return self._names
 
+    @property
+    def rules_d100(self) -> bool:
+        from .rules import Rules
+
+        try:
+            return Rules.load(self.path).is_d100
+        except Exception:  # noqa: BLE001
+            return False
+
     def skill_value(self, name: str) -> tuple[int, str]:
         """规则书里这条技能的基础值（"%"。查不到返回 (0, "")）。"""
         kb = self.kb

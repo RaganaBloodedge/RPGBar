@@ -15,6 +15,7 @@
 `dm.py` 的确定性流水线去拼一段旁白冒充 DM，而是**直接失败** —— 界面会明说
 这一轮没有生成。要玩就必须有一个模型（本地引擎或云 API）。
 """
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -386,6 +387,22 @@ class NarratorAgent(Agent):
             if unresolved
             else ""
         )
+        bible_block = ""
+        if self.world is not None:
+            try:
+                raw = self.world.get("bible")
+                if raw:
+                    b = json.loads(raw)
+                    bible_block = (
+                        "\n【故事圣经】（本局常设，不是每轮现编）\n"
+                        f"年代地点：{b.get('era')} · {b.get('place')}\n"
+                        f"基调：{b.get('tone')}\n"
+                        f"本局可能出现的威胁：{'、'.join(b.get('monsters') or []) or '（未定）'}\n"
+                        f"禁忌：{'、'.join(b.get('forbidden') or []) or '无'}\n"
+                        f"核心冲突：{b.get('premise')}\n"
+                    )
+            except Exception:  # noqa: BLE001
+                bible_block = ""
         digest = getattr(ctx, "world_digest", "") or ""
         digest_block = (f"\n【进度】\n{digest}\n" if digest else "")
         kb = getattr(ctx, "kb_brief", "") or ""
@@ -401,6 +418,7 @@ class NarratorAgent(Agent):
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
             f"{hist_block}"
+            f"{bible_block}"
             f"{digest_block}"
             f"{present_block}"
             f"{unresolved_block}"

@@ -1,0 +1,47 @@
+{
+  "title": "判定档案回归 · 观察室",
+  "premise": "一间落满灰尘的观察室，用来验证检定按 d100 掷低。",
+  "system": "你是克苏鲁的呼唤的守秘人。",
+  "start_scene": "obs",
+  "players": {
+    "min": 1,
+    "max": 4,
+    "recommended": 1
+  },
+  "flags": {},
+  "kb": "coc7e-v3",
+  "scenes": [
+    {
+      "id": "obs",
+      "chapter": 1,
+      "title": "观察室",
+      "location": "阿卡姆 · 旧宅二楼",
+      "public_text": "窗玻璃上积着厚厚的灰，桌上摊着一本翻开的笔记，墨迹还没干透。",
+      "dm_notes": "笔记里记着昨夜的观测：码头方向有东西从水里上来。",
+      "npcs": [],
+      "keywords": [
+        "笔记",
+        "窗",
+        "码头"
+      ],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [
+        {
+          "id": "spot",
+          "skill": "侦查",
+          "dc": 13,
+          "keywords": [
+            "打量",
+            "观察",
+            "看看",
+            "检查"
+          ],
+          "success": "你发现笔记的下一页被撕掉了，残边还粘在装订线里。",
+          "fail": "灰尘太重，你什么都没看清。"
+        }
+      ],
+      "exits": []
+    }
+  ]
+}

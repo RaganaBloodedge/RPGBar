@@ -61,7 +61,12 @@ class OpenAICompatProvider(LLMProvider):
         self.label = label  # "cloud" / "local"
         self.name = f"openai-compat[{label}]"
         self._httpx = httpx
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # **本机端点必须绕开系统代理**：Windows 的 127.0.0.1:7890 代理会被 httpx 的
+        # trust_env 带进来，把打到 llama-server 的请求接走并回 502（llama-server 日志里
+        # 一个请求都看不到）。编译器那边已经踩过一次，这里同样要关。
+        host = (self.base_url or "").split("//")[-1].split("/")[0].split(":")[0]
+        trust_env = host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=trust_env)
 
     def _headers(self):
         h = {"Content-Type": "application/json"}

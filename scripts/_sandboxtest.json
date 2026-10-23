@@ -1,0 +1,30 @@
+{
+  "title": "沙盒开局 · 1925 阿卡姆",
+  "premise": "规则书沙盒：没有预设场景图，开局由 DM 读库后现铺。",
+  "system": "你是克苏鲁的呼唤的守秘人。",
+  "start_scene": "start",
+  "sandbox": true,
+  "kb": "coc7e-v3",
+  "players": {
+    "min": 1,
+    "max": 4,
+    "recommended": 1
+  },
+  "flags": {},
+  "scenes": [
+    {
+      "id": "start",
+      "chapter": 1,
+      "title": "开场（待铺）",
+      "location": "",
+      "public_text": "（这一局的开场由 DM 读库后生成。）",
+      "dm_notes": "",
+      "npcs": [],
+      "keywords": [],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [],
+      "exits": []
+    }
+  ]
+}

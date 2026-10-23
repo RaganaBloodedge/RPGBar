@@ -656,6 +656,27 @@ class Room:
                     "text": f"（剧本《{self.store.title}》建议至少 {self.min_players} 人，现在只有 {n} 人 —— 房主决定照常开始。）",
                 })
             await self.broadcast_room()
+            # ---- session zero：沙盒剧本开局前先读库、定调、铺场景 ----
+            try:
+                sandbox = bool((self.store.data or {}).get("sandbox")) or (
+                    self._kb is not None and not (self.store.data or {}).get("scenes"))
+                if sandbox and self.world is not None and not self.world.get("bible"):
+                    from .session_zero import prepare, summary_text
+
+                    await self.broadcast({"type": "thinking", "active": True, "who": "dm",
+                                          "label": "DM 正在读规则书、准备开局…"})
+                    try:
+                        bible = await prepare(self.store, self._kb, self.world,
+                                              self.narrator().provider)
+                        await self.broadcast({"type": "system",
+                                              "text": summary_text(bible)})
+                        if bible.get("hooks"):
+                            await self.broadcast({"type": "system", "text":
+                                                  "可动的方向：" + "；".join(bible["hooks"])})
+                    finally:
+                        await self.broadcast({"type": "thinking", "active": False, "who": "dm"})
+            except Exception as exc:  # noqa: BLE001  开局准备失败不该挡住开玩
+                print(f"[RPGBar] session zero 失败（照常开局）：{exc}")
             opening = self.state.current().get("public_text", "")
             if opening:
                 await self.broadcast({"type": "narration", "author": "DM", "text": opening})
@@ -1233,6 +1254,8 @@ class Room:
                 print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
                       f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"
                       f" · 工具 {'/'.join(res.used_tools) or '无'}）", flush=True)
+                if getattr(res, "drop_reason", ""):
+                    print(f"[RPGBar] 本轮旁白被丢弃：{res.drop_reason}", flush=True)
                 for ev in ctx.events:
                     await self.broadcast(ev)
                 parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]

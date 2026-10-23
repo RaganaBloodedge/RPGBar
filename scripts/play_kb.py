@@ -58,9 +58,14 @@ async def wait_turn(ws, timeout=900.0):
             narr = msg
             print(f"\n[DM] {msg.get('text')}")
         elif t == "dice":
-            print(f"[骰] {msg.get('label') or ''} → {msg.get('value')} {msg.get('level') or ''}")
+            print("[骰] " + json.dumps(
+                {k: msg.get(k) for k in ("skill", "dice", "roll", "target", "level",
+                                         "success", "skill_value", "skill_source", "attr")},
+                ensure_ascii=False))
+        elif t == "system":
+            print(f"[系统] {msg.get('text')}")
         elif t == "agent_note":
-            print(f"[#] {msg.get('text') or msg.get('note')}")
+            print("[#] " + json.dumps(msg, ensure_ascii=False)[:400])
         elif t == "thinking" and msg.get("who") == "dm" and not msg.get("active"):
             if narr:
                 break

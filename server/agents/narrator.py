@@ -34,6 +34,7 @@ class NarratorContext:
     npc_brief: str = ""  # 本轮涉及 NPC 的「人物卡 + 状态快照 + 反应采样结论」（不含记忆流水账）
     user_action: str = ""  # 本轮玩家原话（工具要拿它做检定关键词匹配，模型传参不可信）
     oob_verb: str = ""   # 非空 = 玩家动作被判定为越界（剧本机制之外），见 out_of_bounds_verb
+    kb_brief: str = ""   # 知识库命中（玩家话里出现库里的名字时，确定性注入，不靠模型调工具）
 
 
 NARRATOR_JSON_HINT = {
@@ -58,6 +59,12 @@ _OOB_SUCCESS_WORDS = (
     "挖开", "凿开", "砸穿", "撬下", "升起",
 )
 _NEGATIONS = ("没", "未", "无", "不", "别")
+
+# 工具报错的特征串：这些是「给你看的」，念给玩家等于把系统的拒绝当剧情。
+_TOOL_ERROR_ECHO = (
+    "没有检定", "没有这个检定", "无法进行相关检定", "请尝试其他动作",
+    "不得投骰", "参数错误", "该工具", "可用的检定",
+)
 
 
 def asserts_success(text: str, words=_SUCCESS_WORDS) -> str:
@@ -144,11 +151,13 @@ class NarratorAgent(Agent):
     max_steps = 6
     json_hint = NARRATOR_JSON_HINT
 
-    def __init__(self, store, provider=None, npc=None, chronicle=None):
+    def __init__(self, store, provider=None, npc=None, chronicle=None, kb=None):
         super().__init__(provider)
         self.store = store
         self.npc = npc  # NpcService（可空）；DM 只经它读人物卡，拿不到 NPC 的记忆流水账
         self.chronicle = chronicle  # Chronicle（可空）；DM 只经 recall_history 按需检索，改不了档案
+        # 编译器产出的知识库（五类容器）。有就多两个只读工具，没有就不加 —— 游戏照跑。
+        self.kb = kb
 
     async def run(self, ctx, user_input: str = "") -> AgentResult:
         """跑一轮，并在返回前**核一遍旁白与权威结果是否打架**。
@@ -181,6 +190,16 @@ class NarratorAgent(Agent):
         before = ctx.state.current_scene
         res = await super().run(ctx, user_input)
         reason = self._guard_narration(ctx, res.text or "", before)
+        if reason == "复述了工具的报错":
+            # 只重来一次：把"你刚才复述了系统报错"明确告诉模型，而不是留一段空白。
+            res2 = await super().run(ctx, user_input + "\n（提醒：不要提「检定」二字，直接回答玩家。）")
+            reason2 = self._guard_narration(ctx, res2.text or "", before)
+            if not reason2:
+                res2.data = {**(res.data or {}), "retried": True}
+                return res2
+            res.drop_reason = reason2
+            res.text = ""
+            return res
         if reason:
             res.drop_reason = reason
             res.text = ""
@@ -193,6 +212,10 @@ class NarratorAgent(Agent):
         # （`系统已广播新场景原文。甬道深处传来石门的低鸣…`）—— 玩家不该看见系统指令。
         if "系统已广播" in text or "你只需补一句" in text:
             return "把系统指令念成了旁白"
+        # 工具报错被原样念给玩家 —— 实测玩家问「我现在在哪儿」，DM 把 roll_check 的
+        # 报错「当前场景没有检定 侦查，无法进行相关检定」直接当旁白说了出去。
+        if any(h in text for h in _TOOL_ERROR_ECHO):
+            return "复述了工具的报错"
         if any(e.get("type") == "dice" and not e.get("success") for e in ctx.events):
             word = asserts_success(text)
             if word:
@@ -219,6 +242,17 @@ class NarratorAgent(Agent):
     # ---- 提示词 ----
     # 第一层：System prompt —— 只写「我是谁、我能做什么、我的边界」，与具体剧本无关。
     def system_prompt(self, ctx) -> str:
+        kb_block = ""
+        if self.kb is not None and getattr(self.kb, "available", False):
+            kb_block = (
+                "【规则书知识库（与剧本无关的通用资料）】\n"
+                "- 玩家问某个生物/物品/技能的**具体数值或规则**（它有多强、这枪伤害多少、"
+                "这个技能基础值多少、某条判定怎么做）→ 用 kb_lookup(名字)。\n"
+                "- 玩家问**世界观/设定**（这是哪个神话、典籍里写了什么、有什么传说）→ 用 kb_lore(主题)。\n"
+                "- 查到的数值**你自己用来裁定**；旁白里不主动报数字，"
+                "但玩家明确问数据/规则（「伤害多少」「怎么判」）时可以简短报出并给出处。\n"
+                "- 查不到就说「书上没有记载」，**绝不编数值**。\n"
+            )
         return (
             "你是一场中文文字跑团（TRPG）的主持人（DM）。\n"
             "【你的职责】\n"
@@ -233,7 +267,8 @@ class NarratorAgent(Agent):
             "- 要投骰：roll_check（检定 id 见【当前场景】）。\n"
             "- 只有这几种才需要查：剧本别处的设定用 lookup_script；"
             "某个 NPC 的过往用 npc_card 或 recall_history；出场了剧本里没有的新 NPC 用 npc_introduce。\n"
-            "- 剧情明确产生新线索时才 set_flag。\n"
+            + kb_block
+            + "- 剧情明确产生新线索时才 set_flag。\n"
             "【硬性边界】\n"
             "- 严格遵循给定的剧本，不得编造剧本之外的走向、NPC、物品或地点。\n"
             "- 骰子只能由 roll_check 产生，你不得编造任何骰子结果，也不要在旁白里报出数值。\n"
@@ -244,6 +279,14 @@ class NarratorAgent(Agent):
             "就用一句话说明这里做不到（或没人理他），然后把选择权交回给玩家。\n"
             "- **玩家问规则或元问题**（能不能存档、你是不是 AI、这关怎么过），"
             "用一句话直接回答，不要当没听见，也不要借机推进剧情或投骰。\n"
+            "- **玩家问「我在哪 / 这里是什么地方 / 周围有什么」**：用【当前场景】的地点与原文"
+            "直接回答（一两个具体细节即可），**不要调 roll_check，也不要提「检定」二字**。\n"
+            "- **旁白要有引导**：每段至少给一个可感知的细节（声音、气味、光影、 NPC 的小动作），"
+            "再留一个能让人动手的钩子（一扇半掩的门、一句没说完的话、地上的一道拖痕）。"
+            "不要只做判定或只回答一句话；也不要替玩家决定他做什么，更不要每轮都用"
+            "「你们要怎么做」收尾。\n"
+            "- **工具返回 error 时**：那是给你看的，直接用旁白回应玩家，"
+            "**绝不要把错误信息写进旁白**（写了会被系统丢掉并重来）。\n"
             "- 剧本中标注为「DM 内幕」的内容是你的底牌，不能直接说出口。\n"
             "- move_to / roll_check 调用后系统会自行广播权威结果，你的最终旁白只补一句衔接（可以留空）。\n"
         )
@@ -271,6 +314,13 @@ class NarratorAgent(Agent):
             if oob
             else ""
         )
+        kb = getattr(ctx, "kb_brief", "") or ""
+        kb_block = (
+            f"\n【知识库参考（规则书原文，用来裁定；不是剧本内容）】\n{kb}\n"
+            "（上面的数值/条目照用，旁白里不必逐字念；书里没有的就按规则临场裁定。）"
+            if kb
+            else ""
+        )
         return (
             f"{self.store.build_context(state.current_scene, user_input, flags=state.flags)}\n\n"
             f"当前场景：{state.current_scene} 地点：{cur.get('location', '')}\n"
@@ -278,6 +328,7 @@ class NarratorAgent(Agent):
             f"在场玩家：{players}"
             f"{hist_block}"
             f"{npc_block}"
+            f"{kb_block}"
             f"{oob_block}\n"
             f"玩家行动：{user_input}"
         )
@@ -347,6 +398,13 @@ class NarratorAgent(Agent):
                     ),
                 ]
             )
+        if self.kb is not None and getattr(self.kb, "available", False):
+            try:
+                from ..kb_tools import build_tools as _kb_tools
+
+                tools.extend(_kb_tools(self.kb))
+            except Exception:  # noqa: BLE001  知识库工具坏了不该拖垮 DM
+                pass
         if self.chronicle is not None:
             tools.append(
                 Tool(

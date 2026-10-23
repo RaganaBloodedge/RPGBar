@@ -369,10 +369,20 @@ def _polarity(text: str) -> float:
 
 
 class Room:
-    def __init__(self, code, script_store=None, create=None):
+    def __init__(self, code, script_store=None, create=None, script_rel=""):
         self.code = code
+        # 这个房间钉住的剧本（相对 scripts/ 的路径）—— 知识库按**剧本**取，不全局共用
+        self.script_rel = script_rel or ""
         # 房间在创建时「钉住」当时的活动剧本：之后服务端换剧本，进行中的对局不受影响。
         self.store = script_store or store
+        # 编译器产出的知识库（五类容器）。**整局共用**，DM 只经 kb_lookup/kb_lore 读它；
+        # 没编译过库的机器上这里是 None，DM 少两个工具，游戏照常跑。
+        try:
+            from .kb_tools import kb_store as _kb_store
+
+            self._kb = _kb_store(self.script_rel)
+        except Exception:  # noqa: BLE001
+            self._kb = None
         # ---- 大厅元数据（建房时由房主填，之后房主可以改）----
         # 建房参数先过 lobby.clean_create：它保证这里拿到的**一定是一套完整值**，
         # 而且人数上下限是按**本房间钉住的那份剧本**算的（剧本可选的 players 段，
@@ -782,7 +792,8 @@ class Room:
         if self._narrator is None:
             self._narrator = NarratorAgent(
                 self.store, self._provider(self.dm_slot, "dm"),
-                npc=self.npc, chronicle=self.chronicle
+                npc=self.npc, chronicle=self.chronicle,
+                kb=self._kb,
             )
         return self._narrator
 
@@ -1165,7 +1176,15 @@ class Room:
                 self._chronicle_add(f"{name} 尝试：{text}", kind="action", actors=[name])
                 t_npc = time.time()
                 npc_brief = await self._npc_prepare(name, text)
-                ctx = NarratorContext(state=self.state, player_name=name, npc_brief=npc_brief)
+                # 知识库命中：玩家话里出现库里名字就确定性注入（不等模型自己想起调工具）
+                kb_brief = ""
+                if getattr(self, "_kb", None) is not None:
+                    try:
+                        kb_brief = self._kb.related(text)
+                    except Exception:  # noqa: BLE001
+                        kb_brief = ""
+                ctx = NarratorContext(state=self.state, player_name=name,
+                                      npc_brief=npc_brief, kb_brief=kb_brief)
                 res = await self.narrator().run(ctx, text)
                 print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
                       f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"
@@ -1553,7 +1572,8 @@ async def ws_endpoint(ws: WebSocket):
                     print(f"[RPGBar] 忽略建房请求里无效的剧本：{script_rel!r}")
             if not code:
                 code = gen_code()
-            room = Room(code, room_store or store, create=create)
+            room = Room(code, room_store or store, create=create,
+                        script_rel=_rel_of(p) if (room_store is not None and script_rel) else (script_rel or ""))
             rooms[code] = room
             # 本局种子进日志、不进界面：要复现某一局的剧情就从这里取数
             # （同一个种子 + 同一串输入 → 同一条随机流 → 同一个故事）。

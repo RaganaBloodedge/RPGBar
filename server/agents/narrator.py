@@ -66,6 +66,13 @@ _OOB_SUCCESS_WORDS = (
 _NEGATIONS = ("没", "未", "无", "不", "别")
 
 # 工具报错的特征串：这些是「给你看的」，念给玩家等于把系统的拒绝当剧情。
+# 模型把**整段提示词**当旁白念了出来（实测第 4 轮把【故事圣经】【进度】全抄了一遍，
+# 而且上一轮的同类输出已经进了 chronicle，又被下一轮注入——会自我放大）。
+# "没有侦查检定 / 无法进行相关检定" 这类变体：4B 会改写错误信息，固定串抓不住
+_TOOL_ERROR_RE = re.compile(r"(没有|不存在)[^。！？]{0,10}检定|无法进行[^。！？]{0,8}检定|没有可用的检定")
+
+_PROMPT_ECHO = ("【当前场景】", "场景id=", "【剧情档案", "【故事圣经】", "【进度】", "玩家行动：")
+
 _TOOL_ERROR_ECHO = (
     "没有检定", "没有这个检定", "无法进行相关检定", "请尝试其他动作",
     "不得投骰", "参数错误", "该工具", "可用的检定",
@@ -220,9 +227,17 @@ class NarratorAgent(Agent):
         before = ctx.state.current_scene
         res = await super().run(ctx, user_input)
         reason = self._guard_narration(ctx, res.text or "", before)
-        if reason == "复述了工具的报错":
-            # 只重来一次：把"你刚才复述了系统报错"明确告诉模型，而不是留一段空白。
-            res2 = await super().run(ctx, user_input + "\n（提醒：不要提「检定」二字，直接回答玩家。）")
+        if reason:
+            # **任何**被护栏丢弃的旁白都重试一次，并把原因明确告诉模型——
+            # 直接留一段空白对玩家更糟（实测第 3 轮因为"雷同"被丢，玩家什么都没看到）。
+            hint = {
+                "复述了工具的报错": "不要提「检定」二字，也不要复述任何工具报错。",
+                "把上下文念了出来": "只写旁白本身，不要抄任何【】小节。",
+                "与上一轮旁白高度雷同": "换一个具体的细节写，不要重复上一轮的画面。",
+                "与之前某轮的旁白逐字重复": "换一个具体的细节写，不要重复之前的句子。",
+                "把 DM 内幕念成了旁白": "DM 内幕不能说出口，只写玩家能看见/听见的。",
+            }.get(reason, "换一种写法，直接给玩家一段新的旁白。")
+            res2 = await super().run(ctx, user_input + "\n（提醒：" + hint + "）")
             reason2 = self._guard_narration(ctx, res2.text or "", before)
             if not reason2:
                 res2.data = {**(res.data or {}), "retried": True}
@@ -230,9 +245,6 @@ class NarratorAgent(Agent):
             res.drop_reason = reason2
             res.text = ""
             return res
-        if reason:
-            res.drop_reason = reason
-            res.text = ""
         return res
 
     def _guard_narration(self, ctx, text: str, before_scene: str) -> str:
@@ -244,8 +256,10 @@ class NarratorAgent(Agent):
             return "把系统指令念成了旁白"
         # 工具报错被原样念给玩家 —— 实测玩家问「我现在在哪儿」，DM 把 roll_check 的
         # 报错「当前场景没有检定 侦查，无法进行相关检定」直接当旁白说了出去。
-        if any(h in text for h in _TOOL_ERROR_ECHO):
+        if any(h in text for h in _TOOL_ERROR_ECHO) or _TOOL_ERROR_RE.search(text):
             return "复述了工具的报错"
+        if any(h in text for h in _PROMPT_ECHO) or text.count("\n") > 8:
+            return "把上下文念了出来"
         # **DM 内幕被念出来**：场景的 dm_notes 是底牌。实测 4B 把
         # 「这间石室没有门…绝对不要凭空给出一扇门」整段念给了玩家。
         notes = (ctx.state.current() or {}).get("dm_notes") or ""
@@ -271,6 +285,12 @@ class NarratorAgent(Agent):
             for e in self.chronicle.entries[-4:]:
                 if e.get("kind") == "narration" and (e.get("text") or "").strip() == t:
                     return "与之前某轮的旁白逐字重复"
+            # 逐字相同抓不到"改写式复读"：实测第 3 轮把第 2 轮的画面整段搬了过来。
+            # 用 4-gram 覆盖率判：新旁白里有多少片段在上一轮里出现过。
+            last = next((e.get("text") or "" for e in reversed(self.chronicle.entries)
+                         if e.get("kind") == "narration"), "")
+            if last and _overlap_ratio(t, last) > 0.75 and len(t) > 40:
+                return "与上一轮旁白高度雷同"
         # 越界动作写成成功：入口已经判过越界（ctx.oob_verb），旁白里又出现了
         # 那个动词本身 + 成功断言（「生火…火堆燃起来了」）。两个条件同时命中
         # 才丢 —— 单看成功词会误伤「你发现墙上有火把架」这类合法补充。
@@ -305,6 +325,8 @@ class NarratorAgent(Agent):
                 "就明确说「这里没有门 / 这条路不通」，再给出现在能做的事，不要用气氛描写绕过去。\n"
                 "- 你旁白里**新出现**的物件/人物，必须先用 declare 登记；不登记，下一轮它就不存在，"
                 "前后会自相矛盾。\n"
+                "- 玩家发现新线索/接下委托/定下计划时，用 open_thread 记一条（还没了结的事）；"
+                "事情了结或放弃时用 close_thread 收掉。\n"
                 "- 怪物、法术、关键道具只能来自知识库（kb_lookup），不能自己发明；"
                 "没有合适数值的东西，就不要让它出现。\n"
                 "【例子：玩家断言了不存在的东西】\n"
@@ -541,6 +563,22 @@ class NarratorAgent(Agent):
                     self._t_lookup_world,
                 ),
                 Tool(
+                    "open_thread",
+                    "记下一条**还没了结**的线索/目标（玩家发现新线索、接受委托、定下计划时）。"
+                    "之后每轮都会在【进度】里提醒你它还没收束。",
+                    _obj({"title": str_prop("一句话，如 找到失踪的船员")}, ["title"]),
+                    self._t_open_thread,
+                    read_only=False,
+                ),
+                Tool(
+                    "close_thread",
+                    "收束一条线索（已了结或已放弃）。用线索标题的关键字即可。",
+                    _obj({"title": str_prop("线索标题关键字"), "status": str_prop("done / dropped")},
+                         ["title"]),
+                    self._t_close_thread,
+                    read_only=False,
+                ),
+                Tool(
                     "advance_time",
                     "推进游戏内时间（分钟）。调查/搜查/赶路各要多久，你按规则书估；系统负责昼夜与天数。",
                     _obj({"minutes": int_prop("分钟数，1–240", 10),
@@ -578,7 +616,9 @@ class NarratorAgent(Agent):
                     "只能对玩家的动作确实命中触发说法的检定投骰，不得把检定套在无关动作上。",
                     _obj(
                         {
-                            "check_id": str_prop("检定 id，见【当前场景】的检定列表"),
+                            "check_id": str_prop(
+                                "检定 id，见【当前场景】的检定列表；"
+                                "沙盒模式没有列表时，直接填技能名（如 侦查 / 聆听 / 图书馆使用）"),
                             "trigger": str_prop("玩家行动中命中该检定触发说法的原话片段"),
                             "difficulty": str_prop(
                                 "难度：regular / hard（困难）/ extreme（极限）；省略=常规。"
@@ -676,6 +716,26 @@ class NarratorAgent(Agent):
                 "detail": hit["detail"],
                 "note": "当前场景里确实有它。" if here else "它存在，但不在当前场景。"}
 
+    def _t_open_thread(self, ctx, title=""):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        title = (title or "").strip()[:80]
+        if not title:
+            return {"error": "请给出线索标题"}
+        tid = self.world.open_thread(title)
+        return {"ok": True, "id": tid,
+                "open_threads": [t["title"] for t in self.world.threads("open")]}
+
+    def _t_close_thread(self, ctx, title="", status="done"):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        row = self.world.close_thread(title, status)
+        if not row:
+            return {"error": f"没找到未收束的线索：{title}",
+                    "open_threads": [t["title"] for t in self.world.threads("open")]}
+        return {"ok": True, "closed": row["title"], "status": row["status"],
+                "open_threads": [t["title"] for t in self.world.threads("open")]}
+
     def _t_advance_time(self, ctx, minutes=10, reason=""):
         if self.world is None:
             return {"error": "这一局没有世界层"}
@@ -766,6 +826,25 @@ class NarratorAgent(Agent):
         check_id = (check_id or "").strip()
         scene = ctx.state.current()
         check = next((c for c in scene.get("checks", []) if c["id"] == check_id), None)
+        if not check and (self.store.data or {}).get("sandbox"):
+            # 沙盒没有预注册检定：**直接按技能名临场判**（skill 就是 check_id 的写法）。
+            # 这正是规则书该发挥作用的地方：技能值来自书，成功率来自判定档案。
+            value, source = self._skill_value(ctx, check_id)
+            r = (self.rules.check(check_id, value, difficulty=difficulty or "regular")
+                 if self.rules is not None else dice.roll_check(check_id, 12))
+            ok = r["success"]
+            ctx.events.append({
+                "type": "dice", "player": ctx.player_name, "skill": check_id,
+                "dice": r.get("dice") or "d20", "dc": r.get("target"), "roll": r.get("roll"),
+                "target": r.get("target"), "level": r.get("level"),
+                "skill_value": r.get("skill_value"), "skill_source": source,
+                "mod": r.get("mod", 0), "total": r.get("total"),
+                "attr": "", "success": ok, "flag": None,
+            })
+            return {"rolled": True, "success": ok,
+                    "system": (self.rules.describe() if self.rules is not None else "d20"),
+                    "note": ("成功。旁白可以写他做到了。" if ok else
+                             "**失败**。旁白必须写成「没做到 / 一无所获」，不得写出只有成功才会出现的结果。")}
         if not check:
             return {
                 "error": f"当前场景没有检定 {check_id}",
@@ -932,3 +1011,14 @@ def _parse_json(raw):
             return val if isinstance(val, dict) else {}
         except Exception:  # noqa: BLE001
             return {}
+
+
+def _overlap_ratio(a: str, b: str, n: int = 4) -> float:
+    """a 的 n-gram 有多少比例在 b 里出现过（改写式复读的判据）。"""
+    a = re.sub(r"\s+", "", a or "")
+    b = re.sub(r"\s+", "", b or "")
+    if len(a) < n or len(b) < n:
+        return 0.0
+    grams = [a[i:i + n] for i in range(0, len(a) - n + 1)]
+    hit = sum(1 for g in grams if g in b)
+    return hit / max(1, len(grams))

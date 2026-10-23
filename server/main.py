@@ -845,6 +845,11 @@ class Room:
         w.add_scene(sc["id"], sc.get("title") or sc["id"], sc.get("location") or "",
                     sc.get("public_text") or "", source="script")
         w.enter(sc["id"])
+        # 开局定在第一天 08:00（白天）。之后由 advance_time 推进昼夜与天数。
+        if not w.get("day"):
+            w.set("day", 1)
+            w.set("minutes", 8 * 60)
+            w.set("phase", "day")
         print(f"[RPGBar] 世界层就绪：{w.path}（起始场景 {sc['id']}）")
 
     def narrator(self) -> NarratorAgent:
@@ -1244,6 +1249,17 @@ class Room:
                         kb_brief = ""
                 ctx = NarratorContext(state=self.state, player_name=name,
                                       npc_brief=npc_brief, kb_brief=kb_brief)
+                # **状态问句直接由世界层回答**：问方位/进度不需要模型（也不会复读）
+                if self.world is not None:
+                    try:
+                        ans = self.world.state_answer(text)
+                    except Exception:  # noqa: BLE001
+                        ans = ""
+                    if ans:
+                        await self.broadcast({"type": "narration", "author": "DM", "text": ans})
+                        self._chronicle_add(ans, kind="narration")
+                        await self.send_state()
+                        return
                 moved = ""
                 if self.world is not None and (self.store.data or {}).get("sandbox"):
                     # **移动由服务端执行**：玩家说"去码头"，4B 会把它当断言然后否认

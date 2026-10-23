@@ -334,3 +334,56 @@ class World:
         self.add_scene(sid, place, place, description or "", parent=parent, source="generated")
         self.enter(sid)
         return sid
+
+    def close_thread(self, key: str, status: str = "done") -> dict | None:
+        """收束一条线索（按 id 或标题片段）。"""
+        key = (key or "").strip()
+        if not key:
+            return None
+        row = None
+        if key.isdigit():
+            row = self.con.execute("SELECT * FROM thread WHERE id=?", (int(key),)).fetchone()
+        if row is None:
+            row = self.con.execute(
+                "SELECT * FROM thread WHERE status='open' AND title LIKE ? ORDER BY id LIMIT 1",
+                (f"%{key}%",)).fetchone()
+        if row is None:
+            return None
+        self.con.execute("UPDATE thread SET status=? WHERE id=?",
+                         ("done" if status == "done" else "dropped", row["id"]))
+        self.con.commit()
+        return dict(self.con.execute("SELECT * FROM thread WHERE id=?", (row["id"],)).fetchone())
+
+    # ---------------------------------------------------------------- 状态问答
+    _WHERE_Q = re.compile(r"(在哪儿|在哪里|我在哪|这是哪里|这里是哪|什么地方|周围有什么|四周有什么|附近有什么)")
+    _PROGRESS_Q = re.compile(r"(还有什么|什么线索|下一步|该做什么|没弄明白|要做什么|进度)")
+
+    def state_answer(self, text: str) -> str:
+        """"我在哪/还剩什么"这类**事实问句**：直接由世界层回答，不调模型。
+
+        为什么不让 DM 答：实测问同一句，4B 会把上一轮的画面整段复述出来（被判雷同
+        丢掉，玩家就什么也看不到）。状态本来就是确定性的，查表比生成可靠。
+        """
+        t = text or ""
+        where = self._WHERE_Q.search(t)
+        prog = self._PROGRESS_Q.search(t)
+        if not (where or prog):
+            return ""
+        sc = self.scene() or {}
+        place = sc.get("place") or sc.get("label") or ""
+        lines = []
+        if where:
+            items = [e["name"] for e in self.present()[:5]]
+            lines.append(f"你在{place}。")
+            desc = re.sub(r"\s+", " ", sc.get("description") or "")
+            if desc:
+                lines.append(desc[:120])
+            if items:
+                lines.append("这里有你登记过的：" + "、".join(items) + "。")
+        if prog:
+            todo = [t2["title"] for t2 in self.threads("open")]
+            if todo:
+                lines.append("还没了结的事：" + "；".join(todo[:5]) + "。")
+            else:
+                lines.append("暂时没有记下的未了线索 —— 你可以从眼前的细节继续查。")
+        return "\n".join(lines)

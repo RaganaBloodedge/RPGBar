@@ -40,6 +40,9 @@ class NarratorContext:
     world_digest: str = ""   # 进度：第几轮/第几天/还没收束的线索/去过的地方
     world_unresolved: list = field(default_factory=list)  # 玩家提到、但现场/原文都没有的名词
     world_move: str = ""     # 非空 = 服务端已经把队伍带到这个地点（要你描写它）
+    forced_check_id: str = ""  # 服务端按玩家原话锁定的检定（模型不能绕过）
+    resolved_checks: set = field(default_factory=set)
+    move_used: bool = False    # 一次玩家行动最多推进一次场景
 
 
 NARRATOR_JSON_HINT = {
@@ -127,7 +130,11 @@ def echoes_text(text: str, source: str, probe: int = 40) -> bool:
 # 提示词只写了「别顺着他演」，但 4B 的实测是照写成功（「火堆燃起来了」）。
 # 与其靠模型自觉，不如**入口就判出来**：命中越界动词、且动作没碰到任何出口/检定
 # 关键词 → 在 user 消息里插一条硬指令，事后核对时旁白若把它写成成功就丢掉。
-_OOB_VERBS = ("生火", "点火", "挖", "凿", "砸墙", "撬墙", "拆墙", "砍墙", "烧掉")
+_OOB_VERBS = (
+    "生火", "点火", "挖", "凿", "砸墙", "撬墙", "拆墙", "砍墙", "烧掉",
+    "开枪", "射击", "攻击", "施法", "瞬移", "飞走", "跳过剧情", "直接到终点",
+    "直接到最后", "宣布我已经拿到", "宣布获得",
+)
 
 
 def out_of_bounds_verb(text: str, scene: dict) -> str:
@@ -603,6 +610,10 @@ class NarratorAgent(Agent):
                             "query": str_prop("检索关键词，如某个 NPC 的名字或一桩事件"),
                             "k": int_prop("返回条数", 3),
                             "actor": str_prop("只看与这个角色相关的记录，可选"),
+                            "after_turn": int_prop("只查不早于第几回合的记录，可选"),
+                            "before_turn": int_prop("只查不晚于第几回合的记录，可选"),
+                            "scene": str_prop("限定场景 id，可选"),
+                            "kinds": str_prop("事件类型，逗号分隔，如 dice,narration，可选"),
                         }
                     ),
                     self._t_recall_history,
@@ -776,10 +787,16 @@ class NarratorAgent(Agent):
             "npcs": [{"name": n["name"], "role": n["role"]} for n in s.get("npcs", [])],
         }
 
-    def _t_recall_history(self, ctx, query="", k=3, actor=""):
+    def _t_recall_history(self, ctx, query="", k=3, actor="", after_turn=None,
+                          before_turn=None, scene="", kinds=""):
         if self.chronicle is None:
             return {"error": "本局未启用剧情档案"}
-        hits = self.chronicle.search((query or "").strip(), k=k, actor=(actor or "").strip() or None)
+        kind_list = [x.strip() for x in str(kinds or "").split(",") if x.strip()]
+        hits = self.chronicle.search(
+            (query or "").strip(), k=k, actor=(actor or "").strip() or None,
+            after_turn=after_turn, before_turn=before_turn,
+            scene=(scene or "").strip() or None, kinds=kind_list or None,
+        )
         # 每条截 300 字：这是一次工具结果，会**留在 messages 里**跟着后续每一次生成
         # 重新 prefill（不像热层那样只回 6 条）。原来截 400 字 × 4 条 ≈ 1000 token。
         return {
@@ -789,6 +806,7 @@ class NarratorAgent(Agent):
                     "kind": h.get("kind"),
                     "scene": h.get("scene"),
                     "text": (h.get("text") or "")[:300],
+                    "ts": h.get("ts"),
                 }
                 for h in hits
             ],
@@ -824,6 +842,11 @@ class NarratorAgent(Agent):
 
     def _t_roll_check(self, ctx, check_id="", trigger="", difficulty=""):
         check_id = (check_id or "").strip()
+        if getattr(ctx, "forced_check_id", ""):
+            check_id = ctx.forced_check_id
+            trigger = getattr(ctx, "user_action", "")
+        if check_id in getattr(ctx, "resolved_checks", set()):
+            return {"error": "本轮这个检定已经由服务端完成，不要重复投骰；请直接 finish。"}
         scene = ctx.state.current()
         check = next((c for c in scene.get("checks", []) if c["id"] == check_id), None)
         if not check and (self.store.data or {}).get("sandbox"):
@@ -907,6 +930,7 @@ class NarratorAgent(Agent):
                 "flag": check.get("success_flag") if ok else None,
             }
         )
+        ctx.resolved_checks.add(check_id)
         ctx.narration_parts.append(outcome)
         return {
             "rolled": True,
@@ -929,6 +953,8 @@ class NarratorAgent(Agent):
         }
 
     def _t_move_to(self, ctx, scene_id=""):
+        if getattr(ctx, "move_used", False):
+            return {"error": "本轮已经移动过一次。一次玩家行动只能推进一个场景，请直接 finish。"}
         scene_id = (scene_id or "").strip()
         cur = ctx.state.current()
         ex = next((e for e in cur.get("exits", []) if e["to"] == scene_id), None)
@@ -951,6 +977,7 @@ class NarratorAgent(Agent):
                                  parent=ctx.state.current_scene, source="script")
             self.world.enter(scene_id)
         ctx.state.turn += 1
+        ctx.move_used = True
         ctx.events.append({"type": "system", "text": f"进入：{target['title']}"})
         ctx.narration_parts.append(target.get("public_text", ""))
         return {

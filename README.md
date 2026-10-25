@@ -344,7 +344,7 @@ RPGBAR_SCRIPT=scripts/totsk_l1.json python -m server.main
 
 | 剧本 | 文件 | 说明 |
 | --- | --- | --- |
-| **古堡秘宝**（默认） | `scripts/sample_script.json` | 原创。5 场景、2 NPC、多条检定与 flag 分支 |
+| **古堡秘宝** | `scripts/sample_script.json` | 原创。5 场景、2 NPC、多条检定与 flag 分支 |
 | **蛇王墓 · 第一层「假墓」** | `scripts/totsk_l1.json` | 改编自 Skerples 的 *Tomb of the Serpent Kings*。9 场景、12 线索、11 处检定 |
 
 > 《蛇王墓》是**改编作品，以 CC BY-NC-SA 4.0 提供**（不是本仓库的 MIT）：可自由分享/改编/翻译，但**不得商用**，且须署名原作者 Skerples。详见文件内的 `meta` 字段。

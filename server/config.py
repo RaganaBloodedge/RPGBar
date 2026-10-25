@@ -103,7 +103,8 @@ DEFAULTS = {
     "memory": {"chronicle": True, "summary_every": 8},
     "server": {"host": "0.0.0.0", "port": 8000},
     # 剧本文件（相对 RESOURCE_DIR；也可写绝对路径）
-    "script": "scripts/sample_script.json",
+    # 不预载任何剧本。剧本必须由建房者在大厅选择，或通过 RPGBAR_SCRIPT 显式指定。
+    "script": "",
 }
 
 

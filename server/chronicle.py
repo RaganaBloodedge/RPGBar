@@ -177,16 +177,33 @@ class Chronicle:
                 seen[a] = seen.get(a, 0) + 1
         return [a for a, _ in sorted(seen.items(), key=lambda x: -x[1])]
 
-    def search(self, query: str, k: int = 4, actor: str | None = None) -> list[dict]:
-        """混合检索：BM25 字面 + 向量语义，RRF 融合后取前 k 条。"""
+    def search(self, query: str, k: int = 4, actor: str | None = None,
+               *, before_turn: int | None = None, after_turn: int | None = None,
+               scene: str | None = None, kinds: list[str] | None = None) -> list[dict]:
+        """时序混合检索：先按事件时间/场景/类型过滤，再做 BM25 + 向量 RRF。
+
+        `turn` 是游戏内发生顺序，`ts` 只用于诊断，不作为剧情时间。
+        """
         if not self.entries:
             return []
         k = max(1, min(int(k or 4), 12))
         pool = range(len(self.entries))
+        if before_turn is not None:
+            pool = [i for i in pool if int(self.entries[i].get("turn", 0)) <= int(before_turn)]
+        if after_turn is not None:
+            pool = [i for i in pool if int(self.entries[i].get("turn", 0)) >= int(after_turn)]
+        if scene:
+            pool = [i for i in pool if self.entries[i].get("scene") == scene]
+        if kinds:
+            wanted = {str(x) for x in kinds}
+            pool = [i for i in pool if self.entries[i].get("kind") in wanted]
         if actor:
-            hit = [i for i, e in enumerate(self.entries) if self._mentions(e, actor)]
-            if len(hit) >= k:
-                pool = hit
+            # Keep every active temporal/scene/type constraint when applying
+            # the actor filter.  The old implementation replaced ``pool``
+            # with matches from the whole archive, leaking events from other
+            # turns and scenes into a filtered recall.
+            hit = [i for i in pool if self._mentions(self.entries[i], actor)]
+            pool = hit
         pool = list(pool)
 
         ranks: dict[int, float] = {}
@@ -194,7 +211,7 @@ class Chronicle:
             for rank, idx in enumerate(order):
                 ranks[idx] = ranks.get(idx, 0.0) + 1.0 / (RRF_K + rank + 1)
         if not ranks:  # 查询词太生僻 → 退化成「最近若干条」
-            return [self._view(e) for e in self.recent(k)]
+            return [self._view(self.entries[i]) for i in pool[-k:]]
         best = sorted(ranks.items(), key=lambda x: -x[1])[:k]
         out = []
         for idx, score in best:
@@ -237,6 +254,7 @@ class Chronicle:
             "scene": e.get("scene"),
             "actors": e.get("actors") or [],
             "text": e.get("text"),
+            "ts": e.get("ts"),
         }
 
     # ---- 摘要（滚动主线）----

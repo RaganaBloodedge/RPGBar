@@ -86,6 +86,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__, character_card
 from .agents import (
+    ActionJudgeAgent,
     AdvisorAgent,
     AdvisorContext,
     AssistantAgent,
@@ -167,6 +168,11 @@ def _safe_script_path(rel: str):
     """
     if not isinstance(rel, str) or not rel.strip() or rel != rel.strip():
         return None
+    # 客户端有的版本传 `foo.json`，有的传 `scripts/foo.json`；两者都表示
+    # 资源目录下的剧本，统一归一化后再做路径安全检查。
+    rel = rel.replace("\\", "/")
+    if rel.lower().startswith("scripts/"):
+        rel = rel[8:]
     parts = re.split(r"[\\/]+", rel)
     if any(p in ("..", "", ".") for p in parts):
         return None
@@ -216,9 +222,15 @@ def list_scripts() -> list:
 
 
 # ---- 活动剧本（room 创建时取用；切换只影响新开的房间）----
-active = {"path": _resolve_script(cfg.get("script") or "scripts/sample_script.json")}
-active["rel"] = _rel_of(active["path"])
-store = ScriptStore(active["path"], label=active["rel"])
+# 服务端启动时不再偷偷加载某个 demo。大厅必须让建房者选择剧本；
+# active/store 仍保留一个空文档，保证版本与大厅接口可以在“尚未选本”状态下工作。
+active = {"path": None, "rel": ""}
+if cfg.get("script"):
+    active["path"] = _resolve_script(cfg["script"])
+    active["rel"] = _rel_of(active["path"])
+    store = ScriptStore(active["path"], label=active["rel"])
+else:
+    store = ScriptStore.from_content('{"title":"未选择剧本","scenes":[]}', "")
 
 default_dm_slot = dict(cfg["models"]["dm"])
 default_advisor_slot = dict(cfg["models"]["advisor"])
@@ -234,7 +246,10 @@ SUMMARY_EVERY = max(2, int(MEM_CFG.get("summary_every", 8)))
 DATA_DIR = USER_DIR / "data"
 EMBEDDER = get_embedder() if CHRONICLE_ENABLED else None
 
-print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag / {len(store.chunk_list)} 个切片）")
+if active["path"] is None:
+    print("[RPGBar] 未加载默认剧本：请在大厅创建房间时选择剧本")
+else:
+    print(f"[RPGBar] 剧本：{store.title}（{len(store.scenes)} 场景 / {len(store.flag_ids)} 个 flag / {len(store.chunk_list)} 个切片）")
 for w in store.warnings:
     print(f"[RPGBar] 剧本提示：{w}")
 if CHRONICLE_ENABLED:
@@ -275,11 +290,18 @@ for key in ("dm", "advisor", "assistant"):
         print(f"[RPGBar] {a['label']}：未接模型（留空）—— 该 Agent 不产出内容")
 print("[RPGBar] 也可以在游戏内的「模型设置」里随时接入（云 API 或本地模型）。")
 
-# GPU 可用性**在启动时探一次**（用户拍板；结果进进程内缓存，界面复用同一份）。
-# 显式打出来是因为"没有独显的机器上 GPU 选项是灰的"这件事必须**有据可查** ——
-# 否则下一句就是"我明明有卡，怎么灰了"（判据见 engine.probe_gpu）。
-_gpu = gpu_probe()
-if _gpu["available"]:
+# GPU 可用性：旧的 rpg_engine 走 gpu_probe；llama.cpp 以槽位 backend 为准，
+# 不检查已退役的 rpg_engine_cuda.dll。
+_llama_gpu = any(
+    a.get("kind") in ("llamacpp", "llama", "llama_cpp")
+    and (a.get("llamacpp") or {}).get("backend") == "gpu"
+    and a.get("ready")
+    for a in _agents.values()
+)
+_gpu = {"available": True, "devices": 0, "compute_cap": "", "lib": ""} if _llama_gpu else gpu_probe()
+if _llama_gpu:
+    print("[RPGBar] llama.cpp GPU 后端已配置：首次生成时由 llama-server 验证 CUDA")
+elif _gpu["available"]:
     # 算力可能查不到（老驱动没有 cuDeviceComputeCapability）—— 那就只说设备数，
     # 不编一个"未知"出来（查不到 ≠ 有问题）。
     _cap = f" · 算力 {_gpu['compute_cap']}" if _gpu.get("compute_cap") else ""
@@ -290,7 +312,7 @@ else:
 
 
 # ---- 模型槽位的清洗与合并 ----
-ALLOWED_KINDS = ("off", "cloud", "local", "engine")
+ALLOWED_KINDS = ("off", "cloud", "local", "engine", "llamacpp", "llama", "llama_cpp")
 
 
 def clean_slot_patch(patch) -> dict:
@@ -902,12 +924,25 @@ class Room:
         """
         if status is None:
             status = describe_agents(self._effective_slot(self.dm_slot), None, None)
-        detail = (status.get("dm") or {}).get("engine") or {}
+        dm_status = status.get("dm") or {}
+        # 运行时默认通道是 llama.cpp；GPU 能力应以该槽位请求的后端为准。
+        # gpu_probe() 只检查已退役的 rpg_engine_cuda.dll，不能拿来判断
+        # llama-server 的 -ngl 99 是否可用，否则会把可用 GPU 误报成不可用。
+        detail = dm_status.get("engine") or dm_status.get("llamacpp") or {}
         eng = self.engine_slot
         req_backend = normalize_backend(
             detail.get("backend") or eng.get("backend")
         )
         gpu = gpu_probe()
+        if dm_status.get("kind") in ("llamacpp", "llama", "llama_cpp"):
+            gpu = {
+                "available": bool((dm_status.get("llamacpp") or {}).get("backend") == "gpu"
+                                   and (dm_status.get("llamacpp") or {}).get("ready")),
+                "reason": "llama.cpp GPU 后端将在首次生成时由 llama-server 验证"
+                          if not ((dm_status.get("llamacpp") or {}).get("ready")) else "",
+                "devices": 0,
+                "compute_cap": "",
+            }
         return {
             "enabled": bool(eng.get("enabled")),
             "think": bool(eng.get("think")),
@@ -1249,6 +1284,38 @@ class Room:
                         kb_brief = ""
                 ctx = NarratorContext(state=self.state, player_name=name,
                                       npc_brief=npc_brief, kb_brief=kb_brief)
+                # 独立行动裁定 Agent：只做语义归类，不持有任何写工具。
+                # 模型失败时继续使用现有确定性门，保证本地小模型不可用也能玩。
+                judge_provider = self.narrator().provider
+                judgement = await ActionJudgeAgent(
+                    judge_provider if judge_provider is not None
+                    and judge_provider.__class__.__module__.startswith("server.llm")
+                    else None
+                ).judge(self.state.current() or {}, text)
+                if judgement.source == "llm":
+                    if judgement.intent == "check" and any(
+                        c.get("id") == judgement.check_id for c in (self.state.current() or {}).get("checks", [])
+                    ):
+                        ctx.forced_check_id = judgement.check_id
+                    elif judgement.intent == "move" and any(
+                        e.get("to") == judgement.exit_scene for e in (self.state.current() or {}).get("exits", [])
+                    ):
+                        # 记录给模型，真正移动仍只能由 move_to 工具执行。
+                        ctx.world_digest = (ctx.world_digest + "\n行动裁定：玩家意图是移动到 "
+                                            + judgement.exit_scene).strip()
+                    elif judgement.intent == "blocked":
+                        ctx.oob_verb = text[:24]
+                # 触发词命中时由服务端锁定检定，避免模型把“观察/调查/寻找”
+                # 当成普通闲聊而漏投骰。若同一句命中多个检定，交给模型选择，
+                # 但单一命中必须执行。
+                current_scene = self.state.current() or {}
+                matched_checks = []
+                for check in current_scene.get("checks", []) or []:
+                    kws = check.get("keywords") or []
+                    if kws and any(str(k) in text for k in kws):
+                        matched_checks.append(check)
+                if len(matched_checks) == 1:
+                    ctx.forced_check_id = matched_checks[0].get("id", "")
                 # **状态问句直接由世界层回答**：问方位/进度不需要模型（也不会复读）
                 if self.world is not None:
                     try:
@@ -1278,6 +1345,7 @@ class Room:
                         }
                         self.state.enter(sid)
                         moved = place
+                        ctx.move_used = True
                         await self.broadcast({"type": "system", "text": f"进入：{place}"})
                 if self.world is not None:
                     self.world.bump_turn()
@@ -1295,9 +1363,22 @@ class Room:
                     print(f"[RPGBar] 本轮旁白被丢弃：{res.drop_reason}", flush=True)
                 for ev in ctx.events:
                     await self.broadcast(ev)
-                parts = [p.strip() for p in ctx.narration_parts if p and p.strip()]
+                # 系统已经广播的检定/场景权威文案不应被模型整段改写再播一次。
+                # 同一轮保留第一份事实，模型只补充不重复的衔接句。
+                parts = []
+                for raw in ctx.narration_parts:
+                    p = (raw or "").strip()
+                    if p and p not in parts:
+                        parts.append(p)
                 if res.text and res.text.strip():
-                    parts.append(res.text.strip())
+                    extra = res.text.strip()
+                    import difflib
+                    if not any(
+                        extra == p or extra in p or p in extra
+                        or difflib.SequenceMatcher(None, extra[:500], p[:500]).ratio() >= 0.72
+                        for p in parts
+                    ):
+                        parts.append(extra)
                 for p in parts:
                     await self.broadcast({"type": "narration", "author": "DM", "text": p})
                 self._chronicle_turn(ctx, name, before_scene, parts)
@@ -1437,7 +1518,7 @@ async def api_version():
     return {
         "name": "RPGBar",
         "version": __version__,
-        "script": store.title,
+        "script": store.title if active["path"] is not None else None,
         "script_path": active["rel"],
         "script_info": {
             "fmt": store.fmt,
@@ -1549,12 +1630,12 @@ async def api_rooms():
         "rooms": items,
         "waiting": sum(1 for r in items if r["phase"] == PHASE_WAITING),
         "active_script": active["rel"],
-        "active_title": store.title,
+        "active_title": store.title if active["path"] is not None else None,
         # 建房表单的缺省值：按当前「活动剧本」声明的人数算（剧本没写就是 1–4）
         "defaults": {
             "script": active["rel"],
-            "script_title": store.title,
-            "players": dict(store.players),
+            "script_title": store.title if active["path"] is not None else "请选择剧本",
+            "players": dict(store.players) if active["path"] is not None else {"min": 1, "max": 4, "recommended": 1},
         },
     }
 
@@ -1564,7 +1645,7 @@ async def api_scripts():
     """列出可用的剧本文件（scripts/ 目录下的 .json/.md/.txt）。"""
     return {
         "active": active["rel"],
-        "active_title": store.title,
+        "active_title": store.title if active["path"] is not None else None,
         "dirs": [str(d) for d in script_dirs()],
         "scripts": list_scripts(),
     }
@@ -1665,6 +1746,15 @@ async def ws_endpoint(ws: WebSocket):
             #  ② 输入了一个**还不存在**的房间码 —— 这是原有玩法（两个人各填同一个房号
             #     就能碰头），所以照旧允许，只是按默认设置建房（公开、1–4 人）。
             room_store = None
+            inline_content = create.get("content") if isinstance(create.get("content"), str) else ""
+            if inline_content.strip():
+                try:
+                    room_store = ScriptStore.from_content(
+                        inline_content,
+                        str(create.get("name") or "粘贴的剧本").strip()[:80],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[RPGBar] 忽略建房请求里的剧本内容：{type(exc).__name__}: {exc}")
             if isinstance(script_rel, str) and script_rel.strip():
                 p = _safe_script_path(script_rel)
                 if p is not None:
@@ -1674,8 +1764,16 @@ async def ws_endpoint(ws: WebSocket):
                         room_store = None
                 if room_store is None:
                     print(f"[RPGBar] 忽略建房请求里无效的剧本：{script_rel!r}")
+            if room_store is None and not (active["path"] is not None and not script_rel):
+                await ws.send_text(json.dumps({
+                    "type": "error",
+                    "message": "创建房间前请选择剧本。服务器不会自动加载 demo 剧本。",
+                }, ensure_ascii=False))
+                await ws.close()
+                return
             if not code:
                 code = gen_code()
+            # 没在 create 中传 path 时，才允许使用显式配置的活动剧本；默认没有活动剧本。
             room = Room(code, room_store or store, create=create,
                         script_rel=_rel_of(p) if (room_store is not None and script_rel) else (script_rel or ""))
             rooms[code] = room

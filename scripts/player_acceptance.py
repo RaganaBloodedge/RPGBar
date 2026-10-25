@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -124,6 +125,7 @@ async def run_cases(cases_path: str, url: str) -> int:
     data = json.loads(Path(cases_path).read_text(encoding="utf-8"))
     cases = data.get("cases", [])
     results = []
+    room_code = ""
     async with websockets.connect(url, max_size=8 * 1024 * 1024, ping_interval=10) as ws:
         await ws.send(json.dumps({"type": "join", "name": "验收玩家",
                                   "create": {"script": data["script"], "max_players": 1,
@@ -139,6 +141,8 @@ async def run_cases(cases_path: str, url: str) -> int:
                 tail = [m.get("type") for m in observed[-8:]]
                 raise RuntimeError(f"阶段 {phase} 等待事件超过 45 秒；最近事件={tail}")
             typ = msg.get("type")
+            if typ == "welcome":
+                room_code = str(msg.get("room") or room_code)
             if pending is not None:
                 observed.append(msg)
             if typ == "welcome" and not started:
@@ -201,7 +205,22 @@ async def run_cases(cases_path: str, url: str) -> int:
     print(f"执行 {len(results)} 条用例；通过 {passed} 条（{report['pass_rate']:.0%}）")
     print("边界观测：" + "，".join(f"{k}={v}" for k, v in totals.items()))
     print(f"逐条结果：{Path(cases_path).with_name(Path(cases_path).stem + '_results.json')}")
+    # 测试运行结束后保存同一局的世界状态与事件档案，方便复盘/恢复。
+    snapshot_dir = Path(cases_path).with_name(Path(cases_path).stem + "_snapshot")
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    if room_code:
+        script_stem = Path(data["script"]).stem
+        world = Path("data/worlds") / script_stem / f"{room_code}.sqlite"
+        chronicle = Path("data") / f"chronicle-{room_code}.jsonl"
+        for source in (world, chronicle):
+            if source.exists():
+                shutil.copy2(source, snapshot_dir / source.name)
+    (snapshot_dir / "events.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    report["room_code"] = room_code
+    report["snapshot_dir"] = str(snapshot_dir)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"汇总报告：{report_path}")
+    print(f"进度快照：{snapshot_dir}")
     return 0 if passed == len(results) else 4
 
 

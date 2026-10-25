@@ -8,10 +8,11 @@ from server.config import load_config
 from server.llm import build_provider
 
 
-PROMPT = """你是跑团验收评估 Agent。根据每条玩家行为和完整事件流，判断：
-1) 行为理解是否合理；2) 是否错误限制自由度；3) 是否错误推进剧情；4) 是否产生未确认事实；5) 旁白是否泄露内幕或重复。
-只输出 JSON 数组，每项：case_id、verdict（pass/fail/review）、issues（数组）、reason（不超过120字）。
-不要因为玩家行动没有对应检定就判错；先看事件中服务端是否实际改变状态。
+PROMPT = """你是跑团验收评估 Agent。根据每条玩家行为和完整事件流，先判断确定性事实，再评价语言质量。
+确定性事实优先看：dice 的 success、system 的移动文本、state 的 current_scene/flags，以及是否出现 agent_note error。
+判断：1) 行为理解是否合理；2) 是否错误限制自由度；3) 是否错误推进剧情；4) 是否产生未确认事实；5) 旁白是否泄露内幕或重复。
+只输出 JSON 数组，每项：case_id、verdict（pass/fail/review）、deterministic（对象，字段 state_ok/move_ok/facts_ok）、issues（数组）、reason（不超过120字）。
+不要因为玩家行动没有对应检定就判错；没有检定也可以是合理普通行动。不要把“没有使用固定拒绝词”当成错误。
 """
 
 async def main(path: str, out: str) -> int:

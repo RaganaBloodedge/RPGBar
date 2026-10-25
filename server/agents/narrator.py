@@ -399,7 +399,17 @@ class NarratorAgent(Agent):
         )
         npc_block = f"\n【在场 NPC（人物卡）】\n{ctx.npc_brief}" if getattr(ctx, "npc_brief", "") else ""
         hist = self.chronicle.digest(6) if self.chronicle is not None else ""
-        hist_block = f"\n【剧情档案（热层）】\n{hist}\n（需要更早的细节时用 recall_history 检索）" if hist else ""
+        hist_block = (
+            f"\n【内部记忆：只用于理解，不得直接输出】\n{hist}\n"
+            "以上是已经发生过的事实线索，不是本轮旁白草稿。不要引用、复述、概括或逐字改写；"
+            "只把它作为背景，回答玩家当前这句话。需要更早的细节时用 recall_history 检索。"
+        ) if hist else ""
+        authoritative = getattr(ctx, "narration_parts", None) or []
+        authority_block = (
+            "\n【本轮已确认事实】\n" + "\n".join(f"- {x}" for x in authoritative[-4:]) + "\n"
+            "这些是服务端已经广播的权威结果。只能补充感官和氛围，不能改写结果、追加相反结果，"
+            "或让失败看起来像成功。\n"
+        ) if authoritative else ""
         oob = getattr(ctx, "oob_verb", "") or ""
         oob_block = (
             f"\n【系统判定：越界动作】\n"
@@ -459,6 +469,7 @@ class NarratorAgent(Agent):
             f"已获得 flag：{sorted(state.flags) or '无'}\n"
             f"在场玩家：{players}"
             f"{hist_block}"
+            f"{authority_block}"
             f"{bible_block}"
             f"{digest_block}"
             f"{present_block}"

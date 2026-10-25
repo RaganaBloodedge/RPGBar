@@ -1372,7 +1372,36 @@ class Room:
                         parts.append(p)
                 if res.text and res.text.strip():
                     extra = res.text.strip()
+                    # 失败检定的结果已经是完整事实边界；模型追加的“也许成功了/
+                    # NPC 其实透露了线索”会把失败改写成成功，整段补写必须丢弃。
+                    failure_fact = any(
+                        marker in fact for fact in parts
+                        for marker in ("**失败**", "一无所获", "什么也没发现", "没有发现")
+                    )
+                    if failure_fact:
+                        extra = ""
                     import difflib
+                    # 4B 常会把 roll_check/move_to 的权威文案再完整改写一遍，
+                    # 仅比较整段文本会因后面多了氛围句而漏掉。按句比较，丢掉
+                    # 与服务端事实高度相似的句子，只保留真正新增的感官描写。
+                    authoritative_sentences = []
+                    for fact in parts:
+                        authoritative_sentences.extend(
+                            x.strip() for x in re.split(r"(?<=[。！？!?；;])", fact) if x.strip()
+                        )
+                    kept = []
+                    for sentence in re.split(r"(?<=[。！？!?；;])", extra):
+                        sentence = sentence.strip()
+                        if not sentence:
+                            continue
+                        if any(
+                            sentence == fact or sentence in fact or fact in sentence
+                            or difflib.SequenceMatcher(None, sentence[:180], fact[:180]).ratio() >= 0.62
+                            for fact in authoritative_sentences
+                        ):
+                            continue
+                        kept.append(sentence)
+                    extra = "".join(kept).strip()
                     if not any(
                         extra == p or extra in p or p in extra
                         or difflib.SequenceMatcher(None, extra[:500], p[:500]).ratio() >= 0.72

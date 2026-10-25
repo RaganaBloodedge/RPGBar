@@ -132,7 +132,10 @@ async def run_cases(cases_path: str, url: str) -> int:
         pending = None
         observed = []
         while cases or pending is not None:
-            msg = json.loads(await ws.recv())
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), 120))
+            except asyncio.TimeoutError:
+                raise RuntimeError("等待 DM 收尾事件超过 120 秒；请检查模型或服务端日志")
             typ = msg.get("type")
             if pending is not None:
                 observed.append(msg)

@@ -164,8 +164,28 @@ async def run_cases(cases_path: str, url: str) -> int:
                 pending = None
         Path(cases_path).with_name(Path(cases_path).stem + "_results.json").write_text(
             json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"执行 {len(results)} 条用例；结果已写入旁边的 *_results.json")
-    return 0
+    # 输出与剧本无关的边界指标，便于比较不同 Agent/提示词版本。
+    totals = {key: sum(1 for r in results if r.get("checks", {}).get(key))
+              for key in ("roll", "move", "no_move", "refuse", "no_tool",
+                          "answer_location", "no_secret", "no_duplicate")}
+    by_category = {}
+    for row in results:
+        category = row.get("case", {}).get("category", "ambiguous")
+        stat = by_category.setdefault(category, {"total": 0, "passed": 0})
+        stat["total"] += 1
+        if row.get("passed"):
+            stat["passed"] += 1
+    passed = sum(1 for r in results if r.get("passed"))
+    report = {"cases": len(results), "passed": passed, "pass_rate": round(passed / len(results), 4) if results else 0,
+              "observed": totals, "by_category": by_category,
+              "failures": [r["case"] for r in results if not r.get("passed")]}
+    report_path = Path(cases_path).with_name(Path(cases_path).stem + "_report.json")
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"执行 {len(results)} 条用例；通过 {passed} 条（{report['pass_rate']:.0%}）")
+    print("边界观测：" + "，".join(f"{k}={v}" for k, v in totals.items()))
+    print(f"逐条结果：{Path(cases_path).with_name(Path(cases_path).stem + '_results.json')}")
+    print(f"汇总报告：{report_path}")
+    return 0 if passed == len(results) else 4
 
 
 def main():

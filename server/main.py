@@ -1377,6 +1377,9 @@ class Room:
                     failure_fact = any(
                         marker in fact for fact in parts
                         for marker in ("**失败**", "一无所获", "什么也没发现", "没有发现")
+                    ) or any(
+                        ev.get("type") == "dice" and ev.get("success") is False
+                        for ev in ctx.events if isinstance(ev, dict)
                     )
                     if failure_fact:
                         extra = ""

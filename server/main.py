@@ -92,6 +92,7 @@ from .agents import (
     AssistantAgent,
     NarratorAgent,
     NarratorContext,
+    NarrationVerifierAgent,
     SummaryCtx,
     analyze_character_card,
     describe_agents,
@@ -1356,6 +1357,17 @@ class Room:
                 if moved:
                     ctx.world_move = moved
                 res = await self.narrator().run(ctx, text)
+                verifier = NarrationVerifierAgent(
+                    self.narrator().provider
+                    if self.narrator().provider is not None
+                    and self.narrator().provider.__class__.__module__.startswith("server.llm")
+                    else None
+                )
+                verification = await verifier.verify(ctx, text, res.text or "")
+                if not verification.accepted:
+                    # 权威事件仍然保留；只丢弃未经确认的模型补充。
+                    res.text = ""
+                    res.drop_reason = "旁白审查：" + "；".join(verification.issues)
                 print(f"[RPGBar] 一轮 dm {time.time()-t_round:5.1f}s"
                       f"（NPC 预备 {time.time()-t_npc:4.1f}s · 生成 {len(res.steps)} 次"
                       f" · 工具 {'/'.join(res.used_tools) or '无'}）", flush=True)

@@ -18,6 +18,7 @@ from .narrator import NarratorAgent, NarratorContext
 from .persona import AssistantAgent, SummaryCtx, analyze_character_card
 from .tool_agent import Task, ToolAgent, parse_json
 from .action_judge import ActionJudgeAgent, ActionJudgement
+from .narration_verifier import NarrationVerifierAgent, Verification
 
 __all__ = [
     "Agent",
@@ -29,6 +30,8 @@ __all__ = [
     "parse_json",
     "ActionJudgeAgent",
     "ActionJudgement",
+    "NarrationVerifierAgent",
+    "Verification",
     "NarratorAgent",
     "NarratorContext",
     "AdvisorAgent",

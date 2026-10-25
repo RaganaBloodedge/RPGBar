@@ -171,6 +171,14 @@ async def run_cases(cases_path: str, url: str) -> int:
                                 "events": observed[:]})
                 pending = None
                 phase = "waiting_next_action"
+                # ``room.phase=playing`` 只在开局广播一次。后续行动必须由本轮
+                # thinking=false 事件驱动，否则测试器会永远等待一个不会重复出现的
+                # room 事件，误判成服务端或模型卡死。
+                if cases:
+                    pending = cases.pop(0)
+                    observed = []
+                    phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
+                    await ws.send(json.dumps({"type": "action", "text": pending["text"]}, ensure_ascii=False))
         Path(cases_path).with_name(Path(cases_path).stem + "_results.json").write_text(
             json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     # 输出与剧本无关的边界指标，便于比较不同 Agent/提示词版本。

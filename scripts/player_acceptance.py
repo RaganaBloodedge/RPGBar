@@ -129,22 +129,26 @@ async def run_cases(cases_path: str, url: str) -> int:
                                   "create": {"script": data["script"], "max_players": 1,
                                               "visibility": "private"}}, ensure_ascii=False))
         started = False
+        phase = "joining"
         pending = None
         observed = []
         while cases or pending is not None:
             try:
-                msg = json.loads(await asyncio.wait_for(ws.recv(), 120))
+                msg = json.loads(await asyncio.wait_for(ws.recv(), 45))
             except asyncio.TimeoutError:
-                raise RuntimeError("等待 DM 收尾事件超过 120 秒；请检查模型或服务端日志")
+                tail = [m.get("type") for m in observed[-8:]]
+                raise RuntimeError(f"阶段 {phase} 等待事件超过 45 秒；最近事件={tail}")
             typ = msg.get("type")
             if pending is not None:
                 observed.append(msg)
             if typ == "welcome" and not started:
                 started = True
+                phase = "starting"
                 await ws.send(json.dumps({"type": "start"}))
             if typ == "room" and (msg.get("room") or {}).get("phase") == "playing" and pending is None:
                 pending = cases.pop(0)
                 observed = []
+                phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
                 await ws.send(json.dumps({"type": "action", "text": pending["text"]}, ensure_ascii=False))
             if typ == "thinking" and msg.get("who") == "dm" and msg.get("active") is False and pending:
                 types = {m.get("type") for m in observed}
@@ -163,8 +167,10 @@ async def run_cases(cases_path: str, url: str) -> int:
                 expected = pending.get("expect") or []
                 passed = all(checks.get(x, False) for x in expected)
                 results.append({"case": pending, "observed_types": sorted(types),
-                                "checks": checks, "passed": passed, "text": text[:1200]})
+                                "checks": checks, "passed": passed, "text": text[:1200],
+                                "events": observed[:]})
                 pending = None
+                phase = "waiting_next_action"
         Path(cases_path).with_name(Path(cases_path).stem + "_results.json").write_text(
             json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     # 输出与剧本无关的边界指标，便于比较不同 Agent/提示词版本。

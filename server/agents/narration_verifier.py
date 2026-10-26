@@ -51,6 +51,8 @@ class NarrationVerifierAgent:
         if self.provider is None or not self.is_risky(ctx, narration):
             return Verification()
         facts = [str(x) for x in (getattr(ctx, "narration_parts", None) or [])[-6:]]
+        facts.extend(json.dumps(x, ensure_ascii=False) for x in
+                     (getattr(ctx, "fact_events", None) or [])[-4:])
         try:
             raw = await self.provider.chat([{"role": "user", "content": self._prompt(facts, action, narration)}])
             text = (raw or "").strip().replace("```json", "").replace("```", "").strip()

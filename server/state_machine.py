@@ -27,6 +27,55 @@ class GameState:
         self.history = []
         self.turn = 0
         self.ended = False
+        self.fact_events = []  # 服务端确认的结构化事实；旁白不写入这里
+
+    def commit_event(self, event_type, *, actor="", target="", success=None,
+                     allow_generated=False, text=""):
+        """验证并提交一条事实事件。所有场景/flag 变化经此入口完成。
+
+        事件使用剧本提供的出口、检定和 flag；没有特定剧本的词表。
+        沙盒生成的地点由调用方先登记，再用 allow_generated 明确提交。
+        """
+        before = self.current_scene
+        flags_before = set(self.flags)
+        if event_type == "scene_entered":
+            current = self.current() or {}
+            exit_ = next((x for x in current.get("exits", []) if x.get("to") == target), None)
+            if not allow_generated:
+                if exit_ is None:
+                    raise ValueError(f"{target} 不是当前场景出口")
+                if exit_.get("condition") and exit_["condition"] not in self.flags:
+                    raise ValueError(f"出口条件未满足：{exit_['condition']}")
+            if not self.enter(target):
+                raise ValueError(f"无法进入场景：{target}")
+            self.turn += 1
+        elif event_type == "check_resolved":
+            check = next((c for c in (self.current() or {}).get("checks", [])
+                          if c.get("id") == target), None)
+            if check is None and not allow_generated:
+                raise ValueError(f"当前场景没有检定：{target}")
+            if success is None:
+                raise ValueError("检定事件缺少成功/失败结果")
+            if success and check and check.get("success_flag"):
+                self.flags.add(check["success_flag"])
+        elif event_type == "flag_added":
+            if target not in self.store.flag_ids:
+                raise ValueError(f"剧本未声明 flag：{target}")
+            self.flags.add(target)
+        else:
+            raise ValueError(f"未知事实事件：{event_type}")
+        event = {
+            "id": f"event_{len(self.fact_events) + 1:06d}",
+            "type": event_type, "turn": self.turn, "actor": actor,
+            "target": target, "scene_before": before,
+            "scene_after": self.current_scene,
+            "facts_added": sorted(self.flags - flags_before),
+            "facts_removed": [], "source": "server", "text": text,
+        }
+        if success is not None:
+            event["success"] = bool(success)
+        self.fact_events.append(event)
+        return event
 
     def add_player(self, name, character):
         p = Player(name, character, self.turn)

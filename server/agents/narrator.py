@@ -31,6 +31,7 @@ class NarratorContext:
     state: object
     player_name: str = "冒险者"
     events: list = field(default_factory=list)          # 待广播的事件（dice/system）
+    fact_events: list = field(default_factory=list)     # 本轮由 GameState 提交的权威事实
     narration_parts: list = field(default_factory=list)  # 系统自己产出的权威旁白
     npc_brief: str = ""  # 本轮涉及 NPC 的「人物卡 + 状态快照 + 反应采样结论」（不含记忆流水账）
     user_action: str = ""  # 本轮玩家原话（工具要拿它做检定关键词匹配，模型传参不可信）
@@ -407,6 +408,12 @@ class NarratorAgent(Agent):
             "只把它作为背景，回答玩家当前这句话。需要更早的细节时用 recall_history 检索。"
         ) if hist else ""
         authoritative = getattr(ctx, "narration_parts", None) or []
+        committed = getattr(ctx, "fact_events", None) or []
+        committed_block = (
+            "\n【本轮服务端事实事件】\n"
+            + json.dumps(committed[-4:], ensure_ascii=False)
+            + "\n这些事件决定场景、检定和 flag；旁白不得更改事件结果。\n"
+        ) if committed else ""
         authority_block = (
             "\n【本轮已确认事实】\n" + "\n".join(f"- {x}" for x in authoritative[-4:]) + "\n"
             "这些是服务端已经广播的权威结果。只能补充感官和氛围，不能改写结果、追加相反结果，"
@@ -472,6 +479,7 @@ class NarratorAgent(Agent):
             f"在场玩家：{players}"
             f"{hist_block}"
             f"{authority_block}"
+            f"{committed_block}"
             f"{bible_block}"
             f"{digest_block}"
             f"{present_block}"
@@ -688,9 +696,10 @@ class NarratorAgent(Agent):
             "SELECT * FROM scene WHERE place=? OR label=?", (place, place)).fetchone()
         if row:  # 去过的地方就回去，不重复建
             sid = row["id"]
+            fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
+                                          target=sid, allow_generated=True)
+            ctx.fact_events.append(fact)
             self.world.enter(sid)
-            ctx.state.enter(sid)
-            ctx.state.turn += 1
             ctx.events.append({"type": "system", "text": f"回到：{place}"})
             return {"ok": True, "scene_id": sid, "returned": True,
                     "scene": self.store.scene_brief(sid, flags=ctx.state.flags)}
@@ -710,9 +719,10 @@ class NarratorAgent(Agent):
         self.store.scenes[sid] = scene
         self.world.add_scene(sid, place, place, text,
                              parent=ctx.state.current_scene or "", source="generated")
+        fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
+                                      target=sid, allow_generated=True)
+        ctx.fact_events.append(fact)
         self.world.enter(sid)
-        ctx.state.enter(sid)
-        ctx.state.turn += 1
         ctx.events.append({"type": "system", "text": f"进入：{place}"})
         ctx.narration_parts.append(text)
         return {"ok": True, "scene_id": sid, "place": place,
@@ -869,6 +879,9 @@ class NarratorAgent(Agent):
             r = (self.rules.check(check_id, value, difficulty=difficulty or "regular")
                  if self.rules is not None else dice.roll_check(check_id, 12))
             ok = r["success"]
+            ctx.fact_events.append(ctx.state.commit_event(
+                "check_resolved", actor=ctx.player_name, target=check_id,
+                success=ok, allow_generated=True))
             ctx.events.append({
                 "type": "dice", "player": ctx.player_name, "skill": check_id,
                 "dice": r.get("dice") or "d20", "dc": r.get("target"), "roll": r.get("roll"),
@@ -921,8 +934,9 @@ class NarratorAgent(Agent):
         else:
             r = dice.roll_check(check["skill"], check.get("dc", 10), mod=mod)
         ok = r["success"]
-        if ok and check.get("success_flag"):
-            ctx.state.set_flag(check["success_flag"])
+        ctx.fact_events.append(ctx.state.commit_event(
+            "check_resolved", actor=ctx.player_name, target=check_id, success=ok,
+            text=check["success"] if ok else check["fail"]))
         outcome = check["success"] if ok else check["fail"]
         ctx.events.append(
             {
@@ -983,13 +997,14 @@ class NarratorAgent(Agent):
                 "required_flag": ex.get("condition"),
             }
         target = self.store.get_scene(scene_id)
-        ctx.state.enter(scene_id)
+        fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
+                                      target=scene_id, text=target.get("public_text", ""))
+        ctx.fact_events.append(fact)
         if self.world is not None:
             self.world.add_scene(scene_id, target.get("title") or scene_id,
                                  target.get("location") or "", target.get("public_text") or "",
                                  parent=ctx.state.current_scene, source="script")
             self.world.enter(scene_id)
-        ctx.state.turn += 1
         ctx.move_used = True
         ctx.events.append({"type": "system", "text": f"进入：{target['title']}"})
         ctx.narration_parts.append(target.get("public_text", ""))
@@ -1007,7 +1022,8 @@ class NarratorAgent(Agent):
         flag = (flag or "").strip()
         if flag not in self.store.flag_ids:
             return {"error": f"未知 flag：{flag}", "allowed": sorted(self.store.flag_ids)}
-        ctx.state.set_flag(flag)
+        ctx.fact_events.append(ctx.state.commit_event(
+            "flag_added", actor=ctx.player_name, target=flag))
         return {"ok": True, "flag": flag, "label": self.store.flag_label(flag)}
 
     def _t_finish(self, ctx, narration=""):
@@ -1023,7 +1039,7 @@ class NarratorAgent(Agent):
             self._t_move_to(ctx, move_to)
         for f in obj.get("set_flags") or []:
             if f in self.store.flag_ids:
-                ctx.state.set_flag(f)
+                self._t_set_flag(ctx, f)
         return obj
 
     # 这里原本有一个 `run()` override：没有 provider 时走 `dm.py` 的确定性流水线，

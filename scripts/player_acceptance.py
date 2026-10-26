@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import shutil
 import sys
@@ -134,6 +135,8 @@ async def run_cases(cases_path: str, url: str) -> int:
         phase = "joining"
         pending = None
         observed = []
+        latest_state = {}
+        before_state = {}
         while cases or pending is not None:
             try:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), 45))
@@ -141,6 +144,8 @@ async def run_cases(cases_path: str, url: str) -> int:
                 tail = [m.get("type") for m in observed[-8:]]
                 raise RuntimeError(f"阶段 {phase} 等待事件超过 45 秒；最近事件={tail}")
             typ = msg.get("type")
+            if typ == "state" and isinstance(msg.get("state"), dict):
+                latest_state = msg["state"]
             if typ == "welcome":
                 room_code = str(msg.get("room") or room_code)
             if pending is not None:
@@ -152,6 +157,7 @@ async def run_cases(cases_path: str, url: str) -> int:
             if typ == "room" and (msg.get("room") or {}).get("phase") == "playing" and pending is None:
                 pending = cases.pop(0)
                 observed = []
+                before_state = copy.deepcopy(latest_state)
                 phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
                 await ws.send(json.dumps({"type": "action", "text": pending["text"]}, ensure_ascii=False))
             if typ == "thinking" and msg.get("who") == "dm" and msg.get("active") is False and pending:
@@ -170,17 +176,39 @@ async def run_cases(cases_path: str, url: str) -> int:
                 }
                 states = [m.get("state") for m in observed if isinstance(m.get("state"), dict)]
                 final_state = states[-1] if states else {}
-                expected_state = pending.get("expected_state") or {}
+                facts = [m["event"] for m in observed
+                         if m.get("type") == "fact_event" and isinstance(m.get("event"), dict)]
+                pre = pending.get("precondition") or {}
+                expected_state = pending.get("expected") or pending.get("expected_state") or {}
+                forbidden = pending.get("forbidden") or {}
+                issues = []
+                test_error = False
+                if pre.get("scene") and before_state.get("current_scene") != pre["scene"]:
+                    test_error = True
+                    issues.append(f"用例前置场景不符：预期 {pre['scene']}，实际 {before_state.get('current_scene')}")
+                if not set(pre.get("flags") or []).issubset(before_state.get("flags") or []):
+                    test_error = True
+                    issues.append("用例前置 flag 不满足")
                 if expected_state.get("scene_after"):
                     checks["scene_after"] = final_state.get("current_scene") == expected_state["scene_after"]
-                if "turn_delta" in expected_state and states:
-                    # 由事件流中的 state 计算不了前态时，保留为可选诊断项。
-                    checks["state_observed"] = bool(final_state)
+                added_flags = set(final_state.get("flags") or []) - set(before_state.get("flags") or [])
+                committed_flags = {f for fact in facts for f in fact.get("facts_added", [])}
+                checks["event_state_consistent"] = added_flags == committed_flags
+                if expected_state.get("flags_added"):
+                    checks["flags_added"] = set(expected_state["flags_added"]).issubset(added_flags)
+                if forbidden.get("facts_added"):
+                    checks["forbidden_facts_absent"] = not (
+                        set(forbidden["facts_added"]) & committed_flags)
                 expected = pending.get("expect") or []
-                passed = all(checks.get(x, False) for x in expected)
+                checked = list(expected)
+                checked.extend(k for k in ("scene_after", "flags_added", "forbidden_facts_absent",
+                                            "event_state_consistent") if k in checks)
+                passed = None if test_error else all(checks.get(x, False) for x in checked)
                 results.append({"case": pending, "observed_types": sorted(types),
                                 "checks": checks, "passed": passed, "text": text[:1200],
-                                "events": observed[:], "final_state": final_state})
+                                "events": observed[:], "before_state": before_state,
+                                "final_state": final_state, "fact_events": facts,
+                                "test_error": test_error, "issues": issues})
                 pending = None
                 phase = "waiting_next_action"
                 # ``room.phase=playing`` 只在开局广播一次。后续行动必须由本轮
@@ -189,6 +217,7 @@ async def run_cases(cases_path: str, url: str) -> int:
                 if cases:
                     pending = cases.pop(0)
                     observed = []
+                    before_state = copy.deepcopy(latest_state)
                     phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
                     await ws.send(json.dumps({"type": "action", "text": pending["text"]}, ensure_ascii=False))
         Path(cases_path).with_name(Path(cases_path).stem + "_results.json").write_text(
@@ -204,10 +233,13 @@ async def run_cases(cases_path: str, url: str) -> int:
         stat["total"] += 1
         if row.get("passed"):
             stat["passed"] += 1
-    passed = sum(1 for r in results if r.get("passed"))
-    report = {"cases": len(results), "passed": passed, "pass_rate": round(passed / len(results), 4) if results else 0,
+    passed = sum(1 for r in results if r.get("passed") is True)
+    test_errors = sum(1 for r in results if r.get("test_error"))
+    report = {"cases": len(results), "passed": passed, "test_errors": test_errors,
+              "pass_rate": round(passed / len(results), 4) if results else 0,
               "observed": totals, "by_category": by_category,
-              "failures": [r["case"] for r in results if not r.get("passed")]}
+              "failures": [r["case"] for r in results if r.get("passed") is False],
+              "test_error_cases": [r["case"] for r in results if r.get("test_error")]}
     report_path = Path(cases_path).with_name(Path(cases_path).stem + "_report.json")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"执行 {len(results)} 条用例；通过 {passed} 条（{report['pass_rate']:.0%}）")
@@ -229,7 +261,7 @@ async def run_cases(cases_path: str, url: str) -> int:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"汇总报告：{report_path}")
     print(f"进度快照：{snapshot_dir}")
-    return 0 if passed == len(results) else 4
+    return 0 if passed + test_errors == len(results) else 4
 
 
 def main():

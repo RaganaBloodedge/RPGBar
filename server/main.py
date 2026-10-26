@@ -1192,22 +1192,20 @@ class Room:
         """一回行动结束后，把本轮的权威结果（场景/骰点/旁白）记进档案。"""
         if self.chronicle is None:
             return
-        if self.state.current_scene != before_scene:
-            cur = self.state.current()
-            self._chronicle_add(
-                f"队伍进入「{cur.get('title', self.state.current_scene)}」（{self.state.current_scene}）",
-                kind="scene",
-                scene=self.state.current_scene,
+        for fact in ctx.fact_events:
+            label = fact.get("text") or (
+                f"{fact['actor']} {fact['type']} {fact['target']}"
+                + (f"：{'成功' if fact['success'] else '失败'}" if "success" in fact else "")
             )
-        for ev in ctx.events:
-            if ev.get("type") == "dice":
-                dc = f"DC{ev['dc']} " if ev.get("dc") else ""
-                res = "成功" if ev.get("success") else "失败"
-                self._chronicle_add(
-                    f"{ev.get('player', name)} 的 {ev.get('skill', '')} 检定 {dc}掷出 {ev.get('roll')}，{res}",
-                    kind="dice",
-                    actors=[ev.get("player", name)],
-                )
+            self.chronicle.add(
+                label, entry=fact["id"] + "-" + self.code,
+                turn=fact["turn"], kind="event", scene=fact["scene_after"],
+                actors=[fact["actor"]] if fact.get("actor") else [],
+                event_type=fact["type"], facts_added=fact["facts_added"],
+                facts_removed=fact["facts_removed"], source="server",
+                scene_before=fact["scene_before"], scene_after=fact["scene_after"],
+                target=fact["target"], success=fact.get("success"),
+            )
         for p in parts:
             self._chronicle_add(p, kind="narration")
 
@@ -1344,7 +1342,9 @@ class Room:
                             "keywords": [place], "flags_required": [], "flags_set": [],
                             "checks": [], "exits": [],
                         }
-                        self.state.enter(sid)
+                        ctx.fact_events.append(self.state.commit_event(
+                            "scene_entered", actor=name, target=sid,
+                            allow_generated=True))
                         moved = place
                         ctx.move_used = True
                         await self.broadcast({"type": "system", "text": f"进入：{place}"})
@@ -1373,6 +1373,8 @@ class Room:
                       f" · 工具 {'/'.join(res.used_tools) or '无'}）", flush=True)
                 if getattr(res, "drop_reason", ""):
                     print(f"[RPGBar] 本轮旁白被丢弃：{res.drop_reason}", flush=True)
+                for fact in ctx.fact_events:
+                    await self.broadcast({"type": "fact_event", "event": fact})
                 for ev in ctx.events:
                     await self.broadcast(ev)
                 # 系统已经广播的检定/场景权威文案不应被模型整段改写再播一次。

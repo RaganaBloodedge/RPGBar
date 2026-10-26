@@ -192,7 +192,10 @@ async def run_cases(cases_path: str, url: str) -> int:
                 if expected_state.get("scene_after"):
                     checks["scene_after"] = final_state.get("current_scene") == expected_state["scene_after"]
                 added_flags = set(final_state.get("flags") or []) - set(before_state.get("flags") or [])
-                committed_flags = {f for fact in facts for f in fact.get("facts_added", [])}
+                # 世界实体事实（entity:xxx）不属于 GameState.flags；不能把它们
+                # 混入 flag 增量比较，否则合法的 declare 会被误报为状态不一致。
+                committed_flags = {f for fact in facts for f in fact.get("facts_added", [])
+                                   if not str(f).startswith(("entity:", "world_time:", "thread:"))}
                 checks["event_state_consistent"] = added_flags == committed_flags
                 if expected_state.get("flags_added"):
                     checks["flags_added"] = set(expected_state["flags_added"]).issubset(added_flags)

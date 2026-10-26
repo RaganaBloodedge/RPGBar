@@ -30,6 +30,10 @@ def main() -> int:
                                target="search_tapestry", success=True)
     assert "found_secret_door" in check["facts_added"]
     assert "found_secret_door" in state.flags
+    world_event = state.commit_event("time_advanced", actor="玩家", target="10",
+                                     text="过去 10 分钟", facts_added=["world_time:1:10"])
+    assert world_event["type"] == "time_advanced"
+    assert world_event["facts_added"] == ["world_time:1:10"]
     state.commit_event("scene_entered", actor="玩家", target="secret_room")
     assert state.current_scene == "secret_room"
 

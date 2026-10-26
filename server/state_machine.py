@@ -30,7 +30,8 @@ class GameState:
         self.fact_events = []  # 服务端确认的结构化事实；旁白不写入这里
 
     def commit_event(self, event_type, *, actor="", target="", success=None,
-                     allow_generated=False, text=""):
+                     allow_generated=False, text="", facts_added=None,
+                     facts_removed=None):
         """验证并提交一条事实事件。所有场景/flag 变化经此入口完成。
 
         事件使用剧本提供的出口、检定和 flag；没有特定剧本的词表。
@@ -62,6 +63,10 @@ class GameState:
             if target not in self.store.flag_ids:
                 raise ValueError(f"剧本未声明 flag：{target}")
             self.flags.add(target)
+        elif event_type in {"entity_declared", "time_advanced", "thread_opened",
+                            "thread_closed", "npc_introduced", "world_changed"}:
+            # 世界层的事实由 World 模块先完成确定性写入，这里统一登记事件。
+            pass
         else:
             raise ValueError(f"未知事实事件：{event_type}")
         event = {
@@ -69,8 +74,8 @@ class GameState:
             "type": event_type, "turn": self.turn, "actor": actor,
             "target": target, "scene_before": before,
             "scene_after": self.current_scene,
-            "facts_added": sorted(self.flags - flags_before),
-            "facts_removed": [], "source": "server", "text": text,
+            "facts_added": list(facts_added) if facts_added is not None else sorted(self.flags - flags_before),
+            "facts_removed": list(facts_removed or []), "source": "server", "text": text,
         }
         if success is not None:
             event["success"] = bool(success)

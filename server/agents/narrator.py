@@ -735,6 +735,9 @@ class NarratorAgent(Agent):
         row = self.world.declare(name, kind=kind, detail=detail)
         if not row:
             return {"error": "登记失败：名字为空或没有当前场景"}
+        ctx.fact_events.append(ctx.state.commit_event(
+            "entity_declared", actor=ctx.player_name, target=row["name"],
+            text=row["detail"], facts_added=[f"entity:{row['name']}"]))
         return {"ok": True, "entity": {"name": row["name"], "kind": row["kind"],
                                        "detail": row["detail"]},
                 "note": "已登记进世界层，之后每一轮它都在【现场】里。"}
@@ -757,6 +760,9 @@ class NarratorAgent(Agent):
         if not title:
             return {"error": "请给出线索标题"}
         tid = self.world.open_thread(title)
+        ctx.fact_events.append(ctx.state.commit_event(
+            "thread_opened", actor=ctx.player_name, target=title,
+            text=f"开启线索：{title}", facts_added=[f"thread:{title}"]))
         return {"ok": True, "id": tid,
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 
@@ -767,6 +773,9 @@ class NarratorAgent(Agent):
         if not row:
             return {"error": f"没找到未收束的线索：{title}",
                     "open_threads": [t["title"] for t in self.world.threads("open")]}
+        ctx.fact_events.append(ctx.state.commit_event(
+            "thread_closed", actor=ctx.player_name, target=row["title"],
+            text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"]))
         return {"ok": True, "closed": row["title"], "status": row["status"],
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 
@@ -776,6 +785,11 @@ class NarratorAgent(Agent):
         ev = self.world.advance(minutes)
         if ev:
             ctx.events.append(ev)
+            ctx.fact_events.append(ctx.state.commit_event(
+                "time_advanced", actor=ctx.player_name, target=str(minutes),
+                text=ev.get("text", ""), facts_added=[
+                    f"world_time:{self.world.get('day')}:{self.world.get('turn')}"
+                ]))
         return {"ok": True, "turn": self.world.get("turn"), "day": self.world.get("day"),
                 "phase": self.world.get("phase"),
                 "note": ev["text"] if ev else f"过去 {minutes} 分钟。"}

@@ -907,7 +907,10 @@ class NarratorAgent(Agent):
         # 只信模型传参不可靠，所以原话永远参与匹配。
         kws = check.get("keywords") or []
         if kws:
-            probe = f"{getattr(ctx, 'user_action', '') or ''} {trigger or ''}"
+            # trigger 是模型自报的解释，不能凭它把任意事实问句变成检定。
+            # 只有玩家原话命中剧本声明的触发说法，或服务端提前设置
+            # forced_check_id，才允许掷骰。
+            probe = getattr(ctx, "user_action", "") or ""
             hits = [k for k in kws if k in probe]
             if not hits:
                 return {

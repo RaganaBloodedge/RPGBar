@@ -1291,8 +1291,14 @@ class Room:
                     and judge_provider.__class__.__module__.startswith("server.llm")
                     else None
                 ).judge(self.state.current() or {}, text)
+                # 回顾/事实问句优先走状态与记忆回答，不能被模型误判成当前场景检定。
+                # 这是语言意图边界，不依赖任何剧本关键词。
+                fact_question = bool(re.search(
+                    r"(?:刚才|之前|此前).{0,8}(?:发生了什么|做了什么|发生过什么)|"
+                    r"记得吗|回忆一下", text or ""
+                ))
                 if judgement.source == "llm":
-                    if judgement.intent == "check" and any(
+                    if judgement.intent == "check" and not fact_question and any(
                         c.get("id") == judgement.check_id for c in (self.state.current() or {}).get("checks", [])
                     ):
                         ctx.forced_check_id = judgement.check_id
@@ -1309,12 +1315,22 @@ class Room:
                 # 但单一命中必须执行。
                 current_scene = self.state.current() or {}
                 matched_checks = []
+                npc_names = {
+                    str(n.get("name") or "") for n in current_scene.get("npcs", []) or []
+                    if isinstance(n, dict)
+                }
                 for check in current_scene.get("checks", []) or []:
                     kws = check.get("keywords") or []
-                    if kws and any(str(k) in text for k in kws):
+                    # NPC 名称本身只是目标，不足以证明玩家正在执行该检定。
+                    # 例如“我问老周刚才发生了什么”不能因为命中“老周”就触发说服检定。
+                    semantic_hits = [k for k in kws if str(k) in text and str(k) not in npc_names]
+                    if semantic_hits:
                         matched_checks.append(check)
                 if len(matched_checks) == 1:
                     ctx.forced_check_id = matched_checks[0].get("id", "")
+                if fact_question:
+                    # 回顾问题的优先级高于任何单个 NPC/物件命中，禁止本轮投骰。
+                    ctx.forced_check_id = ""
                 # **状态问句直接由世界层回答**：问方位/进度不需要模型（也不会复读）
                 if self.world is not None:
                     try:

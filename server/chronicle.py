@@ -129,6 +129,14 @@ class Chronicle:
         scene: str = "",
         actors: list[str] | None = None,
         entry: str | None = None,
+        event_type: str | None = None,
+        facts_added: list[str] | None = None,
+        facts_removed: list[str] | None = None,
+        source: str = "server",
+        scene_before: str = "",
+        scene_after: str = "",
+        target: str = "",
+        success: bool | None = None,
     ) -> dict | None:
         """追加一条档案。同内容重复写入会被幂等跳过（返回 None）。"""
         text = (text or "").strip()
@@ -145,7 +153,18 @@ class Chronicle:
             "actors": list(actors or []),
             "text": text,
             "ts": round(time.time(), 3),
+            # 事件字段可选，兼容旧的旁白/骰点 JSONL；新事件优先使用这些
+            # 结构化事实，文本仅作为给模型和玩家看的辅助描述。
+            "event_type": event_type or kind,
+            "facts_added": list(facts_added or []),
+            "facts_removed": list(facts_removed or []),
+            "source": source or "server",
+            "scene_before": scene_before or "",
+            "scene_after": scene_after or "",
+            "target": target or "",
         }
+        if success is not None:
+            obj["success"] = bool(success)
         self.entries.append(obj)
         self._ids.add(eid)
         self._corpus.append(_tokenize(self._index_text(obj)))
@@ -247,7 +266,7 @@ class Chronicle:
         return [i for i, s in scored if s > 0.2]
 
     def _view(self, e: dict) -> dict:
-        return {
+        view = {
             "id": e.get("id"),
             "turn": e.get("turn"),
             "kind": e.get("kind"),
@@ -255,7 +274,17 @@ class Chronicle:
             "actors": e.get("actors") or [],
             "text": e.get("text"),
             "ts": e.get("ts"),
+            "event_type": e.get("event_type") or e.get("kind"),
+            "facts_added": e.get("facts_added") or [],
+            "facts_removed": e.get("facts_removed") or [],
+            "source": e.get("source") or "server",
+            "scene_before": e.get("scene_before") or "",
+            "scene_after": e.get("scene_after") or "",
+            "target": e.get("target") or "",
         }
+        if "success" in e:
+            view["success"] = bool(e["success"])
+        return view
 
     # ---- 摘要（滚动主线）----
     def set_summary(self, text: str, upto_turn: int = -1) -> None:

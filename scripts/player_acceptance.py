@@ -168,11 +168,19 @@ async def run_cases(cases_path: str, url: str) -> int:
                     "no_tool": "dice" not in types and not any(m.get("type") == "system" and "进入" in str(m.get("text")) for m in observed),
                     "no_secret": not any(x in text for x in ("DM内幕", "内幕", "绝对不要")),
                 }
+                states = [m.get("state") for m in observed if isinstance(m.get("state"), dict)]
+                final_state = states[-1] if states else {}
+                expected_state = pending.get("expected_state") or {}
+                if expected_state.get("scene_after"):
+                    checks["scene_after"] = final_state.get("current_scene") == expected_state["scene_after"]
+                if "turn_delta" in expected_state and states:
+                    # 由事件流中的 state 计算不了前态时，保留为可选诊断项。
+                    checks["state_observed"] = bool(final_state)
                 expected = pending.get("expect") or []
                 passed = all(checks.get(x, False) for x in expected)
                 results.append({"case": pending, "observed_types": sorted(types),
                                 "checks": checks, "passed": passed, "text": text[:1200],
-                                "events": observed[:]})
+                                "events": observed[:], "final_state": final_state})
                 pending = None
                 phase = "waiting_next_action"
                 # ``room.phase=playing`` 只在开局广播一次。后续行动必须由本轮

@@ -64,7 +64,8 @@ class GameState:
                 raise ValueError(f"剧本未声明 flag：{target}")
             self.flags.add(target)
         elif event_type in {"entity_declared", "time_advanced", "thread_opened",
-                            "thread_closed", "npc_introduced", "world_changed"}:
+                            "thread_closed", "npc_introduced", "relation_changed",
+                            "world_changed"}:
             # 世界层的事实由 World 模块先完成确定性写入，这里统一登记事件。
             pass
         else:

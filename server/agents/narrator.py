@@ -591,6 +591,19 @@ class NarratorAgent(Agent):
                     self._t_lookup_world,
                 ),
                 Tool(
+                    "set_relation",
+                    "记录本局已经在行动或对话中明确观察到的关系变化。只记录新证据，"
+                    "不要把知识库的静态关系重复写入本局；这是事实事件，不是剧情裁定。",
+                    _obj({
+                        "src": str_prop("关系一方，如 玩家 / 守墓人"),
+                        "dst": str_prop("关系另一方"),
+                        "relationship": str_prop("关系，如 信任 / 敌对 / 同僚 / 欠债"),
+                        "reason": str_prop("本轮可见的证据或对话摘要"),
+                    }, ["src", "dst", "relationship"]),
+                    self._t_set_relation,
+                    read_only=False,
+                ),
+                Tool(
                     "open_thread",
                     "记下一条**还没了结**的线索/目标（玩家发现新线索、接受委托、定下计划时）。"
                     "之后每轮都会在【进度】里提醒你它还没收束。",
@@ -752,6 +765,21 @@ class NarratorAgent(Agent):
         return {"exists": True, "here": here, "name": hit["name"], "kind": hit["kind"],
                 "detail": hit["detail"],
                 "note": "当前场景里确实有它。" if here else "它存在，但不在当前场景。"}
+
+    def _t_set_relation(self, ctx, src="", dst="", relationship="", reason=""):
+        if self.world is None:
+            return {"error": "这一局没有世界层"}
+        row = self.world.set_relation(src, dst, relationship, reason)
+        if not row:
+            return {"error": "关系三元组不完整"}
+        fact = ctx.state.commit_event(
+            "relation_changed", actor=ctx.player_name,
+            target=f"{row['src']}|{row['rel']}|{row['dst']}", text=row.get("reason", ""),
+            facts_added=[f"relation:{row['src']}|{row['rel']}|{row['dst']}"],
+        )
+        ctx.fact_events.append(fact)
+        return {"ok": True, "relation": row,
+                "note": "已记录为本局动态关系；剧本知识库中的静态关系未被修改。"}
 
     def _t_open_thread(self, ctx, title=""):
         if self.world is None:

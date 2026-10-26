@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS entity(
     UNIQUE(scene_id, name, kind));
 CREATE TABLE IF NOT EXISTS entity_fact(
     entity_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT, quote TEXT, source TEXT);
+-- 运行期关系边：与编译器 KB 的 pc_relation（静态种子图）严格分开。
+CREATE TABLE IF NOT EXISTS relation(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, src TEXT NOT NULL, dst TEXT NOT NULL,
+    rel TEXT NOT NULL, status TEXT DEFAULT 'active', source TEXT DEFAULT 'dm',
+    first_turn INTEGER DEFAULT 0, updated_turn INTEGER DEFAULT 0,
+    reason TEXT DEFAULT '', UNIQUE(src, dst, rel));
 CREATE TABLE IF NOT EXISTS thread(
     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, status TEXT DEFAULT 'open',
     opened_turn INTEGER DEFAULT 0, note TEXT DEFAULT '');
@@ -177,6 +183,37 @@ class World:
             "INSERT INTO entity_fact(entity_id,key,value,quote,source) VALUES(?,?,?,?,?)",
             (entity_id, key[:40], str(value)[:120], quote[:200], source))
         self.con.commit()
+
+    # ---------------------------------------------------------------- 运行期关系
+    def set_relation(self, src: str, dst: str, rel: str, reason: str = "") -> dict:
+        """登记本局观察到的关系变化；不修改 KB 的静态关系图。"""
+        src, dst, rel = (str(x or "").strip()[:80] for x in (src, dst, rel))
+        if not src or not dst or not rel:
+            return {}
+        turn = int(self.get("turn", "0") or 0)
+        self.con.execute(
+            "INSERT INTO relation(src,dst,rel,source,first_turn,updated_turn,reason) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(src,dst,rel) DO UPDATE SET "
+            "status='active', updated_turn=excluded.updated_turn, reason=excluded.reason",
+            (src, dst, rel, "dm", turn, turn, (reason or "")[:240]),
+        )
+        self.con.commit()
+        row = self.con.execute(
+            "SELECT * FROM relation WHERE src=? AND dst=? AND rel=?", (src, dst, rel)
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def relations(self, name: str = "", limit: int = 20) -> list[dict]:
+        name = (name or "").strip()
+        if name:
+            rows = self.con.execute(
+                "SELECT * FROM relation WHERE src=? OR dst=? ORDER BY id DESC LIMIT ?",
+                (name, name, max(1, min(int(limit), 50))),
+            )
+        else:
+            rows = self.con.execute("SELECT * FROM relation ORDER BY id DESC LIMIT ?",
+                                    (max(1, min(int(limit), 50)),))
+        return [dict(r) for r in rows]
 
     # ---------------------------------------------------------------- 线索
     def open_thread(self, title: str, note: str = "") -> int:

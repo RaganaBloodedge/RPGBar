@@ -152,6 +152,10 @@ class KBStore:
                 continue
             hits.append((k, card))
         if not hits:
+            # 关系图可能只有边、没有完整 NPC 卡片，仍需把它交给 DM。
+            rel = self.relations(name)
+            if rel:
+                return rel
             # **语义兜底**：名字索引没命中时退回 BM25+向量检索（玩家说的常是口语，
             # 例如"点38左轮" vs 表里的".38左轮手枪"），把最接近的原文给模型，并说明这是模糊命中。
             try:
@@ -196,6 +200,16 @@ class KBStore:
                 lines.append(f"  · {f['key']} = {f['value']}{dice}")
             for a in (card.get("abilities") or [])[:6]:
                 lines.append(f"  · 能力 {a['name']}：{re.sub(r'\s+', ' ', a['text'])[:60]}")
+            # 这是编译器关系图的静态事实，只用于理解 NPC 关系；不能当作本局
+            # 关系状态。动态敌对/信任/死亡等变化必须来自 WorldState 事件。
+            for r in (card.get("relations") or [])[:8]:
+                other = r.get("dst") if r.get("src") == card.get("name") else r.get("src")
+                rel = str(r.get("rel") or "未知关系").strip()
+                quote = re.sub(r"\s+", " ", str(r.get("quote") or ""))[:90]
+                line = f"  · 剧本关系：{card['name']}—[{rel}]—{other}"
+                if quote:
+                    line += f"（依据：{quote}）"
+                lines.append(line)
             return "\n".join(lines)
         if kind == "item":
             lines = [f"【物品】{card['name']}（p{card.get('page')}）"]
@@ -215,13 +229,25 @@ class KBStore:
             kb = self.kb
             names: set[str] = set()
             if kb is not None:
-                for row in kb.con.execute(
-                    "SELECT name FROM item UNION SELECT name FROM npc "
-                    "UNION SELECT name FROM pc_skill UNION SELECT title FROM rule_entry"
-                ):
-                    n = (row[0] or "").strip()
-                    if len(n) >= 2:
-                        names.add(n)
+                queries = ["SELECT name FROM item", "SELECT name FROM npc",
+                           "SELECT name FROM pc_skill", "SELECT title FROM rule_entry"]
+                try:
+                    has_rel = kb.con.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pc_relation'"
+                    ).fetchone()
+                except Exception:
+                    has_rel = None
+                if has_rel:
+                    queries += ["SELECT src FROM pc_relation", "SELECT dst FROM pc_relation"]
+                for sql in queries:
+                    try:
+                        rows = kb.con.execute(sql)
+                    except Exception:
+                        continue
+                    for row in rows:
+                        n = (row[0] or "").strip()
+                        if len(n) >= 2:
+                            names.add(n)
             # 长名优先：这样"深潜者"不会被"深潜"抢先，".38(9mm)左轮"也不会被"左轮"抢先
             self._names = sorted(names, key=len, reverse=True)
         return self._names
@@ -252,6 +278,33 @@ class KBStore:
     def name_index(self) -> list[str]:
         """库里所有可查的名字（给"玩家提到的东西是否在书里"做比对用）。"""
         return list(self._name_index())
+
+    def relations(self, name: str, limit: int = 12) -> str:
+        """读取切分器产出的静态关系边；本局变化以事件/WorldState 为准。"""
+        kb = self.kb
+        name = (name or "").strip()
+        if kb is None or not name:
+            return ""
+        try:
+            rows = kb.con.execute(
+                "SELECT src,dst,rel,quote FROM pc_relation "
+                "WHERE src=? OR dst=? OR src LIKE ? OR dst LIKE ? "
+                "ORDER BY id LIMIT ?",
+                (name, name, f"%{name}%", f"%{name}%", max(1, min(int(limit), 30))),
+            ).fetchall()
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        lines = [f"【剧本静态关系图】与「{name}」相关的关系边（只读）"]
+        for row in rows:
+            quote = re.sub(r"\s+", " ", str(row["quote"] or ""))[:100]
+            line = f"  · {row['src']} —[{row['rel'] or '未知关系'}]— {row['dst']}"
+            if quote:
+                line += f"；依据：{quote}"
+            lines.append(line)
+        lines.append("  （本局关系变化以服务端事件和 WorldState 为准。）")
+        return "\n".join(lines)
 
     def related(self, text: str, limit: int = 2) -> str:
         """**确定性注入**：玩家话里出现了库里的名字，就把条目直接摆到 DM 面前。

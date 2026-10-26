@@ -248,9 +248,20 @@ class KB:
             "SELECT key,value,dice,quote FROM npc_field WHERE npc_id=?", (row["id"],))]
         abilities = [dict(r) for r in self.con.execute(
             "SELECT name,text,quote FROM npc_ability WHERE npc_id=?", (row["id"],))]
+        # pc_relation 是切分阶段产出的静态关系图。它和本局的 entity_state
+        # 有意分开：这里返回的是剧本事实，运行时关系变化由事件/世界层记录。
+        relations = []
+        try:
+            relations = [dict(r) for r in self.con.execute(
+                "SELECT src,dst,rel,quote FROM pc_relation "
+                "WHERE src=? OR dst=? ORDER BY id LIMIT 20",
+                (row["name"], row["name"]),
+            )]
+        except Exception:  # 兼容尚未重编译、没有关系表的旧知识库
+            relations = []
         return {"name": row["name"], "etype": row["etype"], "page": row["page"],
                 "readonly": True, "fields": fields, "abilities": abilities,
-                "source": self._block_of(row["block_id"])}
+                "relations": relations, "source": self._block_of(row["block_id"])}
 
     def rule_card(self, name: str) -> dict:
         """规则：名字 → 子类 + 判定步骤 + 流程图。"""

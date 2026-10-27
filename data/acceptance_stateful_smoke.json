@@ -1,0 +1,21 @@
+{
+  "script": "scripts/sample_script.json",
+  "title": "状态感知验收烟测",
+  "cases": [
+    {
+      "id": "hall_search",
+      "text": "我掀开门厅右侧的挂毯仔细看看",
+      "category": "check_action",
+      "precondition": {"scene": "hall"},
+      "expect": ["roll"]
+    },
+    {
+      "id": "gate_enter",
+      "text": "我推开铁门进入门厅",
+      "category": "move",
+      "precondition": {"scene": "gate"},
+      "expected_state": {"scene_after": "hall"},
+      "expect": ["move"]
+    }
+  ]
+}

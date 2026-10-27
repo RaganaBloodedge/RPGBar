@@ -210,13 +210,29 @@ def _script_entry(path: Path) -> dict:
     }
 
 
-def list_scripts() -> list:
+def _is_internal_script(path: Path) -> bool:
+    """测试夹具和开发辅助文件不进入玩家建房下拉框。
+
+    这是文件命名约定，不是剧本内容规则；它们仍可通过精确路径被 inspect/load，
+    方便开发回归测试而不污染真实玩家的剧本选择。
+    """
+    stem = path.stem.lower()
+    return (
+        stem.startswith("_")
+        or stem.startswith("test_")
+        or (stem.startswith("play_") and path.suffix.lower() in {".txt", ".log"})
+    )
+
+
+def list_scripts(include_internal: bool = False) -> list:
     seen, items = set(), []
     for d in script_dirs():
         if not d.exists():
             continue
         for p in sorted(d.iterdir()):
-            if p.is_file() and p.suffix.lower() in SCRIPT_SUFFIX and p.name not in seen:
+            if (p.is_file() and p.suffix.lower() in SCRIPT_SUFFIX
+                    and p.name not in seen
+                    and (include_internal or not _is_internal_script(p))):
                 seen.add(p.name)
                 items.append(_script_entry(p))
     return items
@@ -1750,13 +1766,13 @@ async def api_rooms():
 
 
 @app.get("/api/scripts")
-async def api_scripts():
+async def api_scripts(include_internal: bool = False):
     """列出可用的剧本文件（scripts/ 目录下的 .json/.md/.txt）。"""
     return {
         "active": active["rel"],
         "active_title": store.title if active["path"] is not None else None,
         "dirs": [str(d) for d in script_dirs()],
-        "scripts": list_scripts(),
+        "scripts": list_scripts(include_internal=include_internal),
     }
 
 

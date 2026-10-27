@@ -97,6 +97,8 @@ from .agents import (
     analyze_character_card,
     describe_agents,
 )
+from .action_validation import candidates as action_candidates
+from .action_validation import validate as validate_action
 from .chronicle import Chronicle
 from .config import RESOURCE_DIR, USER_DIR, load_config
 from .dice import roll
@@ -1324,22 +1326,9 @@ class Room:
                 # 先用剧本切分产出的 keywords 形成候选集合，交给 4B 做语义确认。
                 # 这不是通用词表：候选完全来自当前剧本的 checks/exits。
                 current_scene = self.state.current() or {}
-                scene_npc_names = {
-                    str(n.get("name") or "") for n in current_scene.get("npcs", []) or []
-                    if isinstance(n, dict)
-                }
-                judge_context["candidate_checks"] = [
-                    {"id": c.get("id"), "skill": c.get("skill")}
-                    for c in current_scene.get("checks", []) or []
-                    if any(str(k) in text and str(k) not in scene_npc_names
-                           for k in (c.get("keywords") or []))
-                ]
-                judge_context["candidate_exits"] = [
-                    {"to": e.get("to"), "label": e.get("label"),
-                     "condition": e.get("condition")}
-                    for e in current_scene.get("exits", []) or []
-                    if any(str(k) in text for k in (e.get("keywords") or []))
-                ]
+                candidate_checks, candidate_exits = action_candidates(current_scene, text)
+                judge_context["candidate_checks"] = candidate_checks
+                judge_context["candidate_exits"] = candidate_exits
                 # 独立行动裁定 Agent：只做语义归类，不持有任何写工具。
                 # 模型失败时继续使用现有确定性门，保证本地小模型不可用也能玩。
                 judge_provider = self.narrator().provider
@@ -1354,39 +1343,16 @@ class Room:
                     r"(?:刚才|之前|此前).{0,8}(?:发生了什么|做了什么|发生过什么)|"
                     r"记得吗|回忆一下", text or ""
                 ))
-                if judgement.source == "llm":
-                    if judgement.intent == "check" and judgement.confidence >= 0.55 and not fact_question and any(
-                        c.get("id") == judgement.check_id for c in (self.state.current() or {}).get("checks", [])
-                    ):
-                        ctx.forced_check_id = judgement.check_id
-                    elif judgement.intent == "move" and judgement.confidence >= 0.55 and any(
-                        e.get("to") == judgement.exit_scene for e in (self.state.current() or {}).get("exits", [])
-                    ):
-                        # 记录给模型，真正移动仍只能由 move_to 工具执行。
-                        ctx.world_digest = (ctx.world_digest + "\n行动裁定：玩家意图是移动到 "
-                                            + judgement.exit_scene).strip()
-                    elif judgement.intent == "blocked" and judgement.confidence >= 0.70:
-                        ctx.oob_verb = text[:24]
-                # 触发词命中时由服务端锁定检定，避免模型把“观察/调查/寻找”
-                # 当成普通闲聊而漏投骰。若同一句命中多个检定，交给模型选择，
-                # 但单一命中必须执行。
-                matched_checks = []
-                npc_names = {
-                    str(n.get("name") or "") for n in current_scene.get("npcs", []) or []
-                    if isinstance(n, dict)
-                }
-                for check in current_scene.get("checks", []) or []:
-                    kws = check.get("keywords") or []
-                    # NPC 名称本身只是目标，不足以证明玩家正在执行该检定。
-                    # 例如“我问老周刚才发生了什么”不能因为命中“老周”就触发说服检定。
-                    semantic_hits = [k for k in kws if str(k) in text and str(k) not in npc_names]
-                    if semantic_hits:
-                        matched_checks.append(check)
-                if len(matched_checks) == 1:
-                    ctx.forced_check_id = matched_checks[0].get("id", "")
-                if fact_question:
-                    # 回顾问题的优先级高于任何单个 NPC/物件命中，禁止本轮投骰。
-                    ctx.forced_check_id = ""
+                plan = validate_action(current_scene, text, judgement, fact_question)
+                if plan.intent == "check":
+                    ctx.forced_check_id = plan.check_id
+                elif plan.intent == "move":
+                    # 记录给模型，真正移动仍只能由 move_to 工具执行。
+                    ctx.world_digest = (ctx.world_digest + "\n行动裁定：玩家意图是移动到 "
+                                        + plan.exit_scene).strip()
+                elif plan.intent == "blocked":
+                    ctx.oob_verb = text[:24]
+                # 候选、目标合法性和事实问句优先级已经由 action_validation 统一处理。
                 # **状态问句直接由世界层回答**：问方位/进度不需要模型（也不会复读）
                 if self.world is not None:
                     try:

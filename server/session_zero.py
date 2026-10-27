@@ -125,7 +125,7 @@ async def prepare(store, kb, world, provider=None, play=None) -> dict:
                   .replace("{monsters}", "、".join(meta["monsters"]) or "（无）")
                   .replace("{skills}", "、".join(meta["skills"]) or "（无）")
                   .replace("{items}", "、".join(meta["items"]) or "（无）")
-                  .replace("{rules}", meta.get("play_rules") or meta["rules"])
+                  .replace("{rules}", meta.get("play_rules") or meta["rules"]))
         try:
             text = await provider.chat([{"role": "user", "content": prompt}], json_mode=True)
             raw = json.loads(text if isinstance(text, str) else str(text))

@@ -1292,9 +1292,9 @@ class Room:
                         judge_context["present_entities"] = [
                             {"name": e.get("name"), "kind": e.get("kind"),
                              "detail": e.get("detail", "")}
-                            for e in self.world.present()
+                            for e in self.world.present()[:12]
                         ]
-                        judge_context["dynamic_relations"] = self.world.relations()
+                        judge_context["dynamic_relations"] = self.world.relations(limit=8)
                     except Exception:  # noqa: BLE001
                         pass
                 if getattr(self, "_kb", None) is not None:
@@ -1303,16 +1303,34 @@ class Room:
                                  (self.state.current() or {}).get("npcs", [])
                                  if isinstance(n, dict)}
                         names.update(str(e.get("name") or "") for e in judge_context["present_entities"])
-                        names.add(text)
                         rel_lines = []
                         for rel_name in names:
                             if rel_name:
-                                raw_rel = self._kb.relations(rel_name, limit=8)
+                                raw_rel = self._kb.relations(rel_name, limit=4)
                                 if raw_rel:
                                     rel_lines.append(raw_rel)
                         judge_context["static_relations"] = rel_lines[:8]
                     except Exception:  # noqa: BLE001
                         pass
+                # 先用剧本切分产出的 keywords 形成候选集合，交给 4B 做语义确认。
+                # 这不是通用词表：候选完全来自当前剧本的 checks/exits。
+                current_scene = self.state.current() or {}
+                scene_npc_names = {
+                    str(n.get("name") or "") for n in current_scene.get("npcs", []) or []
+                    if isinstance(n, dict)
+                }
+                judge_context["candidate_checks"] = [
+                    {"id": c.get("id"), "skill": c.get("skill")}
+                    for c in current_scene.get("checks", []) or []
+                    if any(str(k) in text and str(k) not in scene_npc_names
+                           for k in (c.get("keywords") or []))
+                ]
+                judge_context["candidate_exits"] = [
+                    {"to": e.get("to"), "label": e.get("label"),
+                     "condition": e.get("condition")}
+                    for e in current_scene.get("exits", []) or []
+                    if any(str(k) in text for k in (e.get("keywords") or []))
+                ]
                 # 独立行动裁定 Agent：只做语义归类，不持有任何写工具。
                 # 模型失败时继续使用现有确定性门，保证本地小模型不可用也能玩。
                 judge_provider = self.narrator().provider
@@ -1328,22 +1346,21 @@ class Room:
                     r"记得吗|回忆一下", text or ""
                 ))
                 if judgement.source == "llm":
-                    if judgement.intent == "check" and not fact_question and any(
+                    if judgement.intent == "check" and judgement.confidence >= 0.55 and not fact_question and any(
                         c.get("id") == judgement.check_id for c in (self.state.current() or {}).get("checks", [])
                     ):
                         ctx.forced_check_id = judgement.check_id
-                    elif judgement.intent == "move" and any(
+                    elif judgement.intent == "move" and judgement.confidence >= 0.55 and any(
                         e.get("to") == judgement.exit_scene for e in (self.state.current() or {}).get("exits", [])
                     ):
                         # 记录给模型，真正移动仍只能由 move_to 工具执行。
                         ctx.world_digest = (ctx.world_digest + "\n行动裁定：玩家意图是移动到 "
                                             + judgement.exit_scene).strip()
-                    elif judgement.intent == "blocked":
+                    elif judgement.intent == "blocked" and judgement.confidence >= 0.70:
                         ctx.oob_verb = text[:24]
                 # 触发词命中时由服务端锁定检定，避免模型把“观察/调查/寻找”
                 # 当成普通闲聊而漏投骰。若同一句命中多个检定，交给模型选择，
                 # 但单一命中必须执行。
-                current_scene = self.state.current() or {}
                 matched_checks = []
                 npc_names = {
                     str(n.get("name") or "") for n in current_scene.get("npcs", []) or []

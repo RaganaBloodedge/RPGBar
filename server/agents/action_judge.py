@@ -35,7 +35,8 @@ class ActionJudgeAgent:
         context = context or {}
         view = {
             "title": scene.get("title"), "location": scene.get("location"),
-            "public_text": scene.get("public_text"), "keywords": scene.get("keywords", []),
+            "public_text": str(scene.get("public_text") or "")[:700],
+            "keywords": (scene.get("keywords") or [])[:24],
             "checks": [{"id": c.get("id"), "skill": c.get("skill"),
                         "keywords": c.get("keywords", [])} for c in scene.get("checks", [])],
             "exits": [{"to": e.get("to"), "label": e.get("label"),
@@ -49,6 +50,8 @@ class ActionJudgeAgent:
             "present_entities": context.get("present_entities", []),
             "static_relations": context.get("static_relations", []),
             "dynamic_relations": context.get("dynamic_relations", []),
+            "candidate_checks": context.get("candidate_checks", []),
+            "candidate_exits": context.get("candidate_exits", []),
         }
         return (
             "你是跑团行动裁定器。只根据当前场景判断玩家意图，不写旁白，不做骰子，不改状态。\n"
@@ -56,6 +59,7 @@ class ActionJudgeAgent:
             "check 时给当前场景已有的 check id，move 时给当前场景已有出口 to，否则留空；"
             "blocked 表示玩家要求的事没有剧本机制或前提。不要因为动作听起来激烈就判 blocked，"
             "必须依据当前场景和出口/检定列表。\n"
+            "服务端候选只是缩小范围，不是最终裁定；候选为空时仍可判 normal_action 或 ambiguous。\n"
             f"当前场景：{json.dumps(view, ensure_ascii=False)}\n"
             f"当前运行时实体与关系：{json.dumps(runtime, ensure_ascii=False)}\n"
             "关系图只用于理解人物背景；动态关系必须以运行时事实为准。\n"

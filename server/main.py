@@ -1283,6 +1283,36 @@ class Room:
                         kb_brief = ""
                 ctx = NarratorContext(state=self.state, player_name=name,
                                       npc_brief=npc_brief, kb_brief=kb_brief)
+                # 行动裁定器接收切分器和世界层的结构化接口：场景 NPC、现场实体、
+                # 静态关系边、以及本局已经提交的动态关系。它不再只看玩家原话。
+                judge_context = {"present_entities": [], "static_relations": [],
+                                 "dynamic_relations": []}
+                if self.world is not None:
+                    try:
+                        judge_context["present_entities"] = [
+                            {"name": e.get("name"), "kind": e.get("kind"),
+                             "detail": e.get("detail", "")}
+                            for e in self.world.present()
+                        ]
+                        judge_context["dynamic_relations"] = self.world.relations()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if getattr(self, "_kb", None) is not None:
+                    try:
+                        names = {str(n.get("name") or "") for n in
+                                 (self.state.current() or {}).get("npcs", [])
+                                 if isinstance(n, dict)}
+                        names.update(str(e.get("name") or "") for e in judge_context["present_entities"])
+                        names.add(text)
+                        rel_lines = []
+                        for rel_name in names:
+                            if rel_name:
+                                raw_rel = self._kb.relations(rel_name, limit=8)
+                                if raw_rel:
+                                    rel_lines.append(raw_rel)
+                        judge_context["static_relations"] = rel_lines[:8]
+                    except Exception:  # noqa: BLE001
+                        pass
                 # 独立行动裁定 Agent：只做语义归类，不持有任何写工具。
                 # 模型失败时继续使用现有确定性门，保证本地小模型不可用也能玩。
                 judge_provider = self.narrator().provider
@@ -1290,7 +1320,7 @@ class Room:
                     judge_provider if judge_provider is not None
                     and judge_provider.__class__.__module__.startswith("server.llm")
                     else None
-                ).judge(self.state.current() or {}, text)
+                ).judge(self.state.current() or {}, text, context=judge_context)
                 # 回顾/事实问句优先走状态与记忆回答，不能被模型误判成当前场景检定。
                 # 这是语言意图边界，不依赖任何剧本关键词。
                 fact_question = bool(re.search(

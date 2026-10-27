@@ -31,12 +31,14 @@ GEN_PROMPT = """你是跑团游戏的验收设计 Agent。根据下面这份剧�
 text（玩家原话）、category（fact_question / normal_action / check_action / move /
 blocked_action / meta_question / ambiguous）、expect（数组，允许：no_tool、roll、move、
 no_move、state_change、refuse、answer_location、no_secret、no_duplicate）、
-reason（为什么应该这样判定）。
+precondition（可选：scene / flags）、expected_state（可选：scene_after / flags_added）、
+forbidden（可选：facts_added）、reason（为什么应该这样判定）。
 
 要求（必须生成至少 24 条，少于 24 条视为失败）：
 前 7 条必须按顺序各使用一次 category：fact_question、normal_action、check_action、
 move、blocked_action、meta_question、ambiguous；之后再扩展覆盖场景和出口。
 1. 每个场景至少一条；每个出口至少一条合法移动和一条未满足条件的尝试（如果有门控）。
+   每条行动都要标注实际需要的 scene/flags，不要假设前一条行动一定成功。
 2. 每个检定至少一条自然口语触发句，不能直接抄 keywords。
 3. 至少四条剧本外动作，动作必须从当前场景的物件和规则推导，不能使用固定词表。
 4. 至少三条“我在哪儿/周围有什么/刚才发生了什么”事实问题。
@@ -99,10 +101,22 @@ async def generate(script: str, out: str) -> int:
         if not isinstance(c, dict) or not str(c.get("text", "")).strip():
             continue
         expect = c.get("expect") if isinstance(c.get("expect"), list) else []
-        clean.append({"id": f"case_{len(clean)+1:03d}", "text": str(c["text"]).strip(),
-                      "category": str(c.get("category") or "ambiguous"),
-                      "expect": [str(x) for x in expect],
-                      "reason": str(c.get("reason") or "")[:200]})
+        row = {"id": f"case_{len(clean)+1:03d}", "text": str(c["text"]).strip(),
+               "category": str(c.get("category") or "ambiguous"),
+               "expect": [str(x) for x in expect],
+               "reason": str(c.get("reason") or "")[:200]}
+        pre = c.get("precondition") if isinstance(c.get("precondition"), dict) else {}
+        if pre:
+            row["precondition"] = {
+                "scene": str(pre.get("scene") or ""),
+                "flags": [str(x) for x in (pre.get("flags") or [])],
+            }
+        expected_state = c.get("expected_state") or c.get("expected")
+        if isinstance(expected_state, dict):
+            row["expected_state"] = expected_state
+        if isinstance(c.get("forbidden"), dict):
+            row["forbidden"] = c["forbidden"]
+        clean.append(row)
     counts = {}
     for c in clean:
         counts[c["category"]] = counts.get(c["category"], 0) + 1
@@ -121,6 +135,22 @@ async def generate(script: str, out: str) -> int:
     return 0
 
 
+def _case_compatible(case: dict, state: dict) -> bool:
+    """用真实 WorldState 过滤用例，避免路径错误被误报成 DM 失败。"""
+    pre = case.get("precondition") or {}
+    if pre.get("scene") and state.get("current_scene") != pre["scene"]:
+        return False
+    return set(pre.get("flags") or []).issubset(set(state.get("flags") or []))
+
+
+def _select_case(cases: list[dict], state: dict) -> tuple[dict | None, list[dict]]:
+    """从待测用例中选当前状态可执行的一条，返回被跳过的前置不符用例。"""
+    for i, case in enumerate(cases):
+        if _case_compatible(case, state):
+            return cases.pop(i), []
+    return (cases.pop(0), []) if cases else (None, [])
+
+
 async def run_cases(cases_path: str, url: str) -> int:
     import websockets
     data = json.loads(Path(cases_path).read_text(encoding="utf-8"))
@@ -137,6 +167,7 @@ async def run_cases(cases_path: str, url: str) -> int:
         observed = []
         latest_state = {}
         before_state = {}
+        skipped_cases = []
         while cases or pending is not None:
             try:
                 msg = json.loads(await asyncio.wait_for(ws.recv(), 45))
@@ -155,7 +186,10 @@ async def run_cases(cases_path: str, url: str) -> int:
                 phase = "starting"
                 await ws.send(json.dumps({"type": "start"}))
             if typ == "room" and (msg.get("room") or {}).get("phase") == "playing" and pending is None:
-                pending = cases.pop(0)
+                pending, skipped = _select_case(cases, latest_state)
+                skipped_cases.extend(skipped)
+                if pending is None:
+                    break
                 observed = []
                 before_state = copy.deepcopy(latest_state)
                 phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
@@ -218,7 +252,10 @@ async def run_cases(cases_path: str, url: str) -> int:
                 # thinking=false 事件驱动，否则测试器会永远等待一个不会重复出现的
                 # room 事件，误判成服务端或模型卡死。
                 if cases:
-                    pending = cases.pop(0)
+                    pending, skipped = _select_case(cases, latest_state)
+                    skipped_cases.extend(skipped)
+                    if pending is None:
+                        continue
                     observed = []
                     before_state = copy.deepcopy(latest_state)
                     phase = f"action:{pending.get('id', pending.get('text', '')[:12])}"
@@ -242,7 +279,8 @@ async def run_cases(cases_path: str, url: str) -> int:
               "pass_rate": round(passed / len(results), 4) if results else 0,
               "observed": totals, "by_category": by_category,
               "failures": [r["case"] for r in results if r.get("passed") is False],
-              "test_error_cases": [r["case"] for r in results if r.get("test_error")]}
+              "test_error_cases": [r["case"] for r in results if r.get("test_error")],
+              "skipped_incompatible_cases": skipped_cases}
     report_path = Path(cases_path).with_name(Path(cases_path).stem + "_report.json")
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"执行 {len(results)} 条用例；通过 {passed} 条（{report['pass_rate']:.0%}）")

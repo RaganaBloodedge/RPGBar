@@ -189,6 +189,21 @@ Verifier 不能修改状态、重新掷骰或推进剧情，只能接受或拒�
 
 ## 重要提交
 
+## 2026-10-27 增量进度
+
+- 验收器支持 `precondition.scene/flags`，会依据上一轮真实 `WorldState` 选择可执行用例；不会把前置场景不符的用例直接算成 DM 失败。
+- ActionJudge 输入新增切分场景中的 NPC、运行时实体、静态关系边和动态关系边，并返回 `confidence`。
+- 新增 `scripts/relation_graph_check.py`，验证 `pc_relation` 静态关系读取、World 动态关系持久化和 `relation_changed` 事实事件。
+- 新增 `data/acceptance_stateful_smoke.json`，状态感知烟测 2/2 通过。
+- 事实问句专项测试通过；完整 25 轮新服务测试因长回合响应超时未形成新报告，旧报告仍为 19/25，不能作为本轮改动后的成绩。
+
+最近提交：
+
+```text
+320f0b0  feat: make acceptance and action judging state aware
+e1500a3  test: add stateful acceptance smoke cases
+```
+
 ```text
 854e9bf  feat: agentize runtime and add temporal chronicle retrieval
 46c744b  test: report freedom and boundary acceptance metrics

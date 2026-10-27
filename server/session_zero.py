@@ -27,14 +27,14 @@ PROMPT = """你是《{title}》的守秘人。请用这本规则书的素材，d
 物品样例：{items}
 
 【要求】
-1. 定一个**具体的年代与地点**（例如 1925 年，马萨诸塞州阿卡姆），不要泛泛；
+1. 定一个**具体的年代与地点**，但不要默认 1925 年或阿卡姆；根据规则书素材和本局标题选择合适的时代与地点；
 2. 写 2–4 句场景原文：第二人称、有感官细节（声音/气味/光），留出可探索的空间；
 3. 给 DM 一句内幕：这里真正在发生什么；
 4. 给 3 个**可动手的钩子**（一句话一个：一扇门、一个眼神、地上的拖痕……）；
 5. `monsters` 只能从上面清单里挑，挑 2–3 个作为本局可能出现的威胁；
 6. 只输出 JSON，不要解释：
 
-{{"era":"1925 年 10 月","place":"阿卡姆 · 米斯卡托尼克河畔",
+ {{"era":"由本局素材决定的具体时代","place":"由本局素材决定的具体地点",
  "tone":"阴郁、克制，恐怖来自未知与代价",
  "premise":"一句话说清这局的核心冲突",
  "monsters":["深潜者"],
@@ -78,8 +78,8 @@ def _fallback(meta: dict, title: str) -> dict:
     monsters = meta.get("monsters") or []
     topics = meta.get("topics") or []
     return {
-        "era": "1920 年代",
-        "place": topics[0] if topics else "新英格兰 · 某座小镇",
+        "era": "规则书未指定时代",
+        "place": topics[0] if topics else "一处待探索的地点",
         "tone": "阴郁、克制；恐怖来自未知与代价",
         "premise": "一件看似平常的委托背后，有不该被打扰的东西。",
         "monsters": monsters[:2],
@@ -99,7 +99,7 @@ def _verify(raw: dict, meta: dict) -> dict:
         picked = list(monsters)[:2]
     hooks = [str(h)[:60] for h in (raw.get("hooks") or []) if str(h).strip()][:3]
     return {
-        "era": str(raw.get("era") or "1920 年代")[:30],
+        "era": str(raw.get("era") or "规则书未指定时代")[:30],
         "place": str(raw.get("place") or "")[:40],
         "tone": str(raw.get("tone") or "")[:60],
         "premise": str(raw.get("premise") or "")[:120],

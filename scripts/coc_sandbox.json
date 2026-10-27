@@ -1,0 +1,30 @@
+{
+  "title": "CoC 沙盒 · 1925 阿卡姆",
+  "premise": "基于 CoC 规则书的开放式沙盒；开局场景、人物和线索由守秘人结合规则书与玩家选择动态生成。",
+  "system": "你是克苏鲁的呼唤（CoC）的守秘人。",
+  "start_scene": "start",
+  "sandbox": true,
+  "kb": "coc7e-v3",
+  "players": {
+    "min": 1,
+    "max": 4,
+    "recommended": 1
+  },
+  "flags": {},
+  "scenes": [
+    {
+      "id": "start",
+      "chapter": 1,
+      "title": "开场（待铺）",
+      "location": "",
+      "public_text": "（这一局的开场由 DM 读库后生成。）",
+      "dm_notes": "",
+      "npcs": [],
+      "keywords": [],
+      "flags_required": [],
+      "flags_set": [],
+      "checks": [],
+      "exits": []
+    }
+  ]
+}

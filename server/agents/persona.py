@@ -241,10 +241,35 @@ CHARACTER_CARD_JSON_HINT = (
 
 
 def _card_user(agent, ctx) -> str:
-    return (
-        _script_digest(agent.store)
-        + "\n\n请判断这个剧本需不需要角色卡，并按上面的规则输出 JSON。"
-    )
+    store = agent.store
+    prompt = _script_digest(store)
+    if bool((getattr(store, "data", None) or {}).get("sandbox")):
+        # 沙盒没有预写 checks，不代表没有角色能力；它把检定和场景交给
+        # 规则书/Session Zero 动态生成。因此规则驱动沙盒必须先生成角色卡。
+        prompt += (
+            "\n\n【玩法约束】这是规则书驱动的沙盒。即使当前还没有预设场景和检定，"
+            "也必须生成角色卡；角色卡属性应来自规则书的角色创建字段，不能返回 required=false。"
+        )
+        # 将切分器/知识库已经产出的角色卡字段交给模型，避免 4B 自己发明一套
+        # D&D 属性；没有字段时才让它依据规则书摘要设计通用字段。
+        try:
+            from pathlib import Path
+            from ..kb_tools import kb_for_script
+            from compiler.retrieve import KB
+
+            rel = Path(str(getattr(store, "source", ""))).name
+            kb_path = kb_for_script(rel)
+            if kb_path:
+                kb = KB(str(kb_path), with_vec=False)
+                rows = kb.con.execute(
+                    "SELECT field_key,label,kind FROM pc_card_schema ORDER BY ord LIMIT 12"
+                ).fetchall()
+                fields = [f"{r['field_key']}（{r['label']}，{r['kind']}）" for r in rows]
+                if fields:
+                    prompt += "\n【规则书角色卡字段】" + "、".join(fields)
+        except Exception:  # noqa: BLE001
+            pass
+    return prompt + "\n\n请判断这个剧本需不需要角色卡，并按上面的规则输出 JSON。"
 
 
 def _card_validate(agent, data, ctx) -> dict:

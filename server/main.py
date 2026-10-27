@@ -580,6 +580,11 @@ class Room:
                 return
             key = character_card.card_key(self.store)
             cached = character_card.load_cached(key)
+            # 旧版本曾把 CoC 沙盒误缓存为 required=false；规则驱动沙盒必须
+            # 重新经过当前护栏分析，不能继续复用这个错误结论。
+            if ((self.store.data or {}).get("sandbox") and cached is not None
+                    and not cached.get("required")):
+                cached = None
             if cached is not None:
                 self._apply_card(cached)
                 await self.broadcast({"type": "character_schema", **self.card_public()})

@@ -275,7 +275,62 @@ def _card_user(agent, ctx) -> str:
 def _card_validate(agent, data, ctx) -> dict:
     # 真正的护栏在 character_card.normalize_card 里（区间、点数、skill_map 全部洗一遍）。
     # 它返回 {} = 洗不出来 → 这一轮算没产出，不拿假卡顶替。
-    return _normalize_card(data)
+    normalized = _normalize_card(data)
+    if not bool((getattr(agent.store, "data", None) or {}).get("sandbox")):
+        return normalized
+    # 规则驱动沙盒没有预写 checks，4B 很容易按“纯叙事”返回 required=false。
+    # 这里由玩法边界纠正，而不是让模型决定是否存在角色创建层。
+    if normalized.get("required"):
+        return normalized
+    attrs = _sandbox_attributes(agent.store)
+    if not attrs:
+        return {}
+    return _normalize_card({
+        "required": True,
+        "reason": "这是规则驱动的沙盒，需要先创建调查员角色卡。",
+        "total_points": 8,
+        "attributes": attrs,
+        "skill_map": [],
+    })
+
+
+def _sandbox_attributes(store) -> list[dict]:
+    """从规则库角色创建出口取沙盒属性，不把某个模组的属性写死。"""
+    fields = []
+    try:
+        from pathlib import Path
+        from ..kb_tools import kb_for_script
+        from compiler.retrieve import KB
+
+        rel = Path(str(getattr(store, "source", ""))).name
+        path = kb_for_script(rel)
+        if path:
+            kb = KB(str(path), with_vec=False)
+            rows = kb.con.execute(
+                "SELECT field_key,label FROM pc_card_schema ORDER BY ord LIMIT 8"
+            ).fetchall()
+            fields = [(str(r["field_key"] or r["label"] or "").strip(),
+                       str(r["label"] or r["field_key"] or "").strip()) for r in rows]
+            if len([x for x, _ in fields if x]) < 2:
+                rows = kb.con.execute(
+                    "SELECT key,label FROM pc_attribute WHERE key IS NOT NULL "
+                    "AND trim(key) <> '' LIMIT 12"
+                ).fetchall()
+                fields = [(str(r["key"] or r["label"] or "").strip(),
+                           str(r["label"] or r["key"] or "").strip()) for r in rows]
+    except Exception:  # noqa: BLE001
+        fields = []
+    out, seen = [], set()
+    for key, label in fields:
+        key = key[:12]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "desc": label[:40] or "规则书角色创建属性",
+                    "min": 8, "base": 10, "max": 16})
+        if len(out) >= 6:
+            break
+    return out
 
 
 CHARACTER_CARD_TASK = Task(

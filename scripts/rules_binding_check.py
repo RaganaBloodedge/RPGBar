@@ -7,6 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from server.kb_tools import kb_for_script
+from server.play_definition import PlayDefinition
+from server.rag import ScriptStore
 from server.rules import Rules
 
 
@@ -17,6 +19,10 @@ def main() -> int:
     assert Rules.load(coc_kb).is_d100, "CoC 沙盒没有使用 d100 规则档案"
     assert tomb_kb is None, "蛇王墓意外绑定了知识库"
     assert not Rules.load(tomb_kb).is_d100, "蛇王墓意外使用了 CoC d100"
+    coc = PlayDefinition.from_store("coc_sandbox.json", ScriptStore("scripts/coc_sandbox.json"))
+    tomb = PlayDefinition.from_store("totsk_l1.json", ScriptStore("scripts/totsk_l1.json"))
+    assert (coc.mode, coc.generation_policy) == ("sandbox", "session_zero")
+    assert (tomb.mode, tomb.generation_policy) == ("scenario", "prebuilt_scene_graph")
     print("rules binding: PASS (CoC=d100, Tomb=d20 fallback, KB isolated)")
     return 0
 

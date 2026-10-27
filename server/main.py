@@ -115,6 +115,7 @@ from .lobby import (
     password_ok,
 )
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
+from .play_definition import PlayDefinition
 from .rag import ScriptStore
 from .state_machine import GameState
 
@@ -195,33 +196,11 @@ def _script_entry(path: Path) -> dict:
         store = ScriptStore(path)
     except Exception as e:  # noqa: BLE001
         return {"path": rel, "file": path.name, "title": path.stem, "error": f"{type(e).__name__}: {e}"}
-    # 这里返回的是玩家可选的“玩法入口”元数据，而不是只暴露文件名。
-    # sandbox = 规则库驱动的动态开局；scenario = 已切分的固定冒险。
-    is_sandbox = bool((store.data or {}).get("sandbox"))
-    try:
-        from .kb_tools import kb_for_script
-        from .rules import Rules
-
-        kb_path = kb_for_script(rel)
-        rule_profile = Rules.load(kb_path)
-        rules_label = rule_profile.describe()
-    except Exception:  # noqa: BLE001
-        rules_label = "通用 d20 + DC"
+    play = PlayDefinition.from_store(rel, store)
     return {
-        "path": rel,
+        **play.to_public(),
         "file": path.name,
-        "title": store.title,
-        "mode": "sandbox" if is_sandbox else "scenario",
-        "mode_label": "沙盒玩法" if is_sandbox else "固定冒险",
-        "rules": rules_label,
-        "description": str((store.data or {}).get("premise") or "")[:180],
         "fmt": store.fmt,
-        "structured": store.doc.structured,
-        "scenes": len(store.scenes),
-        "flags": len(store.flag_ids),
-        "chunks": len(store.chunk_list),
-        # 人数声明：建房表单用它做「人数上限」的默认值（剧本可选段，缺省 1–4）
-        "players": dict(store.players),
         "warnings": store.warnings,
     }
 
@@ -430,6 +409,10 @@ class Room:
         self.script_rel = script_rel or ""
         # 房间在创建时「钉住」当时的活动剧本：之后服务端换剧本，进行中的对局不受影响。
         self.store = script_store or store
+        if not self.script_rel:
+            source = str(getattr(self.store, "source", "") or "")
+            self.script_rel = Path(source).name if source else ""
+        self.play = PlayDefinition.from_store(self.script_rel, self.store)
         # 编译器产出的知识库（五类容器）。**整局共用**，DM 只经 kb_lookup/kb_lore 读它；
         # 没编译过库的机器上这里是 None，DM 少两个工具，游戏照常跑。
         try:

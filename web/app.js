@@ -152,8 +152,10 @@
         lobbyScripts.forEach(function (s) {
           var opt = document.createElement("option");
           opt.value = s.path;
-          opt.textContent =
-            (s.title || s.file) + "（" + (s.scenes || 0) + " 场景 / " + (s.chunks || 0) + " 切片）";
+          var mode = s.mode_label || "剧本";
+          var rules = s.rules ? " · " + s.rules : "";
+          opt.textContent = mode + " · " + (s.title || s.file) + rules +
+            "（" + (s.scenes || 0) + " 场景 / " + (s.chunks || 0) + " 切片）";
           if (d.active && s.path === d.active) opt.selected = true;
           sel.appendChild(opt);
         });
@@ -1268,11 +1270,12 @@
     scripts.forEach(function (it) {
       var row = el("div", "script-item" + (it.path === (scriptInfo && scriptInfo.active) ? " active" : ""));
       var left = el("div");
-      left.appendChild(el("div", "name", it.title || it.file));
-      var meta = [it.path, it.structured ? "结构化" : "纯文本"]
+      left.appendChild(el("div", "name", (it.mode_label ? it.mode_label + " · " : "") + (it.title || it.file)));
+      var meta = [it.rules || "通用规则", it.structured ? "已切分场景图" : "文本切片"]
         .concat(it.error ? [it.error] : [it.scenes + " 场景", it.chunks + " 切片"])
         .join(" · ");
       left.appendChild(el("div", "meta", meta));
+      if (it.description) row.title = it.description;
       row.appendChild(left);
       row.appendChild(el("span", "tag", it.path === (scriptInfo && scriptInfo.active) ? "当前" : "可载入"));
       row.onclick = function () {

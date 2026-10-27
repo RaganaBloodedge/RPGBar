@@ -195,10 +195,26 @@ def _script_entry(path: Path) -> dict:
         store = ScriptStore(path)
     except Exception as e:  # noqa: BLE001
         return {"path": rel, "file": path.name, "title": path.stem, "error": f"{type(e).__name__}: {e}"}
+    # 这里返回的是玩家可选的“玩法入口”元数据，而不是只暴露文件名。
+    # sandbox = 规则库驱动的动态开局；scenario = 已切分的固定冒险。
+    is_sandbox = bool((store.data or {}).get("sandbox"))
+    try:
+        from .kb_tools import kb_for_script
+        from .rules import Rules
+
+        kb_path = kb_for_script(rel)
+        rule_profile = Rules.load(kb_path)
+        rules_label = rule_profile.describe()
+    except Exception:  # noqa: BLE001
+        rules_label = "通用 d20 + DC"
     return {
         "path": rel,
         "file": path.name,
         "title": store.title,
+        "mode": "sandbox" if is_sandbox else "scenario",
+        "mode_label": "沙盒玩法" if is_sandbox else "固定冒险",
+        "rules": rules_label,
+        "description": str((store.data or {}).get("premise") or "")[:180],
         "fmt": store.fmt,
         "structured": store.doc.structured,
         "scenes": len(store.scenes),

@@ -205,6 +205,8 @@ CHARACTER_CARD_SYSTEM = (
     "设计出这个本**真正用得上**的属性维度，并给出可自由分配的点数。\n"
     "【判断标准】\n"
     "- 本子有检定（战斗、学识、魅力……）、有需要不同人分工的挑战 ⇒ 需要角色卡。\n"
+    "- 规则驱动的沙盒没有预写场景检定时，必须结合规则库的角色创建字段、技能和玩法说明判断，"
+    "不能因为当前场景列表为空就直接判定不需要。\n"
     "- 纯叙事 / 纯解谜、成败与人物能力无关的本 ⇒ **不需要**：required 填 false，attributes 留空。\n"
     "- 拿不准时倾向「不需要」——多一张没人看的卡，比少一张更烦人。\n"
     "【设计规则】\n"
@@ -244,14 +246,11 @@ def _card_user(agent, ctx) -> str:
     store = agent.store
     prompt = _script_digest(store)
     if bool((getattr(store, "data", None) or {}).get("sandbox")):
-        # 沙盒没有预写 checks，不代表没有角色能力；它把检定和场景交给
-        # 规则书/Session Zero 动态生成。因此规则驱动沙盒必须先生成角色卡。
         prompt += (
-            "\n\n【玩法约束】这是规则书驱动的沙盒。即使当前还没有预设场景和检定，"
-            "也必须生成角色卡；角色卡属性应来自规则书的角色创建字段，不能返回 required=false。"
+            "\n\n【玩法模式】这是规则驱动的动态沙盒。请根据规则库的角色创建字段、"
+            "技能和本局玩法判断是否需要角色卡；不要只看当前是否有预设场景。"
         )
-        # 将切分器/知识库已经产出的角色卡字段交给模型，避免 4B 自己发明一套
-        # D&D 属性；没有字段时才让它依据规则书摘要设计通用字段。
+        # 这些字段只是证据，最终是否需要角色卡仍由 Agent 判断。
         try:
             from pathlib import Path
             from ..kb_tools import kb_for_script
@@ -266,7 +265,7 @@ def _card_user(agent, ctx) -> str:
                 ).fetchall()
                 fields = [f"{r['field_key']}（{r['label']}，{r['kind']}）" for r in rows]
                 if fields:
-                    prompt += "\n【规则书角色卡字段】" + "、".join(fields)
+                    prompt += "\n【规则书角色卡字段证据】" + "、".join(fields)
         except Exception:  # noqa: BLE001
             pass
     return prompt + "\n\n请判断这个剧本需不需要角色卡，并按上面的规则输出 JSON。"
@@ -275,62 +274,7 @@ def _card_user(agent, ctx) -> str:
 def _card_validate(agent, data, ctx) -> dict:
     # 真正的护栏在 character_card.normalize_card 里（区间、点数、skill_map 全部洗一遍）。
     # 它返回 {} = 洗不出来 → 这一轮算没产出，不拿假卡顶替。
-    normalized = _normalize_card(data)
-    if not bool((getattr(agent.store, "data", None) or {}).get("sandbox")):
-        return normalized
-    # 规则驱动沙盒没有预写 checks，4B 很容易按“纯叙事”返回 required=false。
-    # 这里由玩法边界纠正，而不是让模型决定是否存在角色创建层。
-    if normalized.get("required"):
-        return normalized
-    attrs = _sandbox_attributes(agent.store)
-    if not attrs:
-        return {}
-    return _normalize_card({
-        "required": True,
-        "reason": "这是规则驱动的沙盒，需要先创建调查员角色卡。",
-        "total_points": 8,
-        "attributes": attrs,
-        "skill_map": [],
-    })
-
-
-def _sandbox_attributes(store) -> list[dict]:
-    """从规则库角色创建出口取沙盒属性，不把某个模组的属性写死。"""
-    fields = []
-    try:
-        from pathlib import Path
-        from ..kb_tools import kb_for_script
-        from compiler.retrieve import KB
-
-        rel = Path(str(getattr(store, "source", ""))).name
-        path = kb_for_script(rel)
-        if path:
-            kb = KB(str(path), with_vec=False)
-            rows = kb.con.execute(
-                "SELECT field_key,label FROM pc_card_schema ORDER BY ord LIMIT 8"
-            ).fetchall()
-            fields = [(str(r["field_key"] or r["label"] or "").strip(),
-                       str(r["label"] or r["field_key"] or "").strip()) for r in rows]
-            if len([x for x, _ in fields if x]) < 2:
-                rows = kb.con.execute(
-                    "SELECT key,label FROM pc_attribute WHERE key IS NOT NULL "
-                    "AND trim(key) <> '' LIMIT 12"
-                ).fetchall()
-                fields = [(str(r["key"] or r["label"] or "").strip(),
-                           str(r["label"] or r["key"] or "").strip()) for r in rows]
-    except Exception:  # noqa: BLE001
-        fields = []
-    out, seen = [], set()
-    for key, label in fields:
-        key = key[:12]
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append({"key": key, "desc": label[:40] or "规则书角色创建属性",
-                    "min": 8, "base": 10, "max": 16})
-        if len(out) >= 6:
-            break
-    return out
+    return _normalize_card(data)
 
 
 CHARACTER_CARD_TASK = Task(

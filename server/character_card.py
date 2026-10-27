@@ -56,6 +56,7 @@ ATTR_HARD_MAX = 30
 MAX_KEY_LEN = 12
 MAX_DESC_LEN = 40
 MAX_REASON_LEN = 120
+CARD_SCHEMA_VERSION = "agent-judgement-v2"
 
 _DEFAULT_MIN = 8
 _DEFAULT_BASE = 10
@@ -349,7 +350,7 @@ def card_key(store) -> str:
     data = getattr(store, "data", None)
     if not isinstance(data, dict):
         data = {}
-    blob = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+    blob = CARD_SCHEMA_VERSION + "\n" + json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
     blob += "\n" + str(getattr(store, "title", "")) + "\n" + str(getattr(store, "system", ""))
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 

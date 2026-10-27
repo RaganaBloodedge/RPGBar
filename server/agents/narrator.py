@@ -745,12 +745,23 @@ class NarratorAgent(Agent):
     def _t_declare(self, ctx, name="", kind="object", detail=""):
         if self.world is None:
             return {"error": "这一局没有世界层"}
-        row = self.world.declare(name, kind=kind, detail=detail)
-        if not row:
+        target = (name or "").strip()[:40]
+        if not target or not ctx.state.current_scene:
             return {"error": "登记失败：名字为空或没有当前场景"}
-        ctx.fact_events.append(ctx.state.commit_event(
-            "entity_declared", actor=ctx.player_name, target=row["name"],
-            text=row["detail"], facts_added=[f"entity:{row['name']}"]))
+        fact = ctx.state.commit_event(
+            "entity_declared", actor=ctx.player_name, target=target,
+            text=(detail or "")[:200], facts_added=[f"entity:{target}"])
+        try:
+            row = self.world.declare(target, kind=kind, detail=detail)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            return {"error": f"登记失败：{type(exc).__name__}"}
+        if not row:
+            ctx.state.rollback_event(fact["id"])
+            return {"error": "登记失败：名字为空或没有当前场景"}
+        fact["target"] = row["name"]
+        fact["facts_added"] = [f"entity:{row['name']}"]
+        ctx.fact_events.append(fact)
         return {"ok": True, "entity": {"name": row["name"], "kind": row["kind"],
                                        "detail": row["detail"]},
                 "note": "已登记进世界层，之后每一轮它都在【现场】里。"}
@@ -769,14 +780,21 @@ class NarratorAgent(Agent):
     def _t_set_relation(self, ctx, src="", dst="", relationship="", reason=""):
         if self.world is None:
             return {"error": "这一局没有世界层"}
-        row = self.world.set_relation(src, dst, relationship, reason)
-        if not row:
-            return {"error": "关系三元组不完整"}
         fact = ctx.state.commit_event(
             "relation_changed", actor=ctx.player_name,
-            target=f"{row['src']}|{row['rel']}|{row['dst']}", text=row.get("reason", ""),
-            facts_added=[f"relation:{row['src']}|{row['rel']}|{row['dst']}"],
+            target=f"{src}|{relationship}|{dst}", text=(reason or "")[:240],
+            facts_added=[f"relation:{src}|{relationship}|{dst}"],
         )
+        try:
+            row = self.world.set_relation(src, dst, relationship, reason)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            return {"error": f"关系登记失败：{type(exc).__name__}"}
+        if not row:
+            ctx.state.rollback_event(fact["id"])
+            return {"error": "关系三元组不完整"}
+        fact["target"] = f"{row['src']}|{row['rel']}|{row['dst']}"
+        fact["facts_added"] = [f"relation:{row['src']}|{row['rel']}|{row['dst']}"]
         ctx.fact_events.append(fact)
         return {"ok": True, "relation": row,
                 "note": "已记录为本局动态关系；剧本知识库中的静态关系未被修改。"}
@@ -787,23 +805,41 @@ class NarratorAgent(Agent):
         title = (title or "").strip()[:80]
         if not title:
             return {"error": "请给出线索标题"}
-        tid = self.world.open_thread(title)
-        ctx.fact_events.append(ctx.state.commit_event(
+        fact = ctx.state.commit_event(
             "thread_opened", actor=ctx.player_name, target=title,
-            text=f"开启线索：{title}", facts_added=[f"thread:{title}"]))
+            text=f"开启线索：{title}", facts_added=[f"thread:{title}"])
+        try:
+            tid = self.world.open_thread(title)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            return {"error": f"开启线索失败：{type(exc).__name__}"}
+        if not tid:
+            ctx.state.rollback_event(fact["id"])
+            return {"error": "开启线索失败"}
+        ctx.fact_events.append(fact)
         return {"ok": True, "id": tid,
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 
     def _t_close_thread(self, ctx, title="", status="done"):
         if self.world is None:
             return {"error": "这一局没有世界层"}
-        row = self.world.close_thread(title, status)
+        candidates = self.world.threads("open")
+        row = next((r for r in candidates if title in r["title"]), None)
         if not row:
             return {"error": f"没找到未收束的线索：{title}",
-                    "open_threads": [t["title"] for t in self.world.threads("open")]}
-        ctx.fact_events.append(ctx.state.commit_event(
+                    "open_threads": [t["title"] for t in candidates]}
+        fact = ctx.state.commit_event(
             "thread_closed", actor=ctx.player_name, target=row["title"],
-            text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"]))
+            text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"])
+        try:
+            closed = self.world.close_thread(title, status)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            return {"error": f"收束线索失败：{type(exc).__name__}"}
+        if not closed:
+            ctx.state.rollback_event(fact["id"])
+            return {"error": "收束线索失败"}
+        ctx.fact_events.append(fact)
         return {"ok": True, "closed": row["title"], "status": row["status"],
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 

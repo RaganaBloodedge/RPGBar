@@ -88,6 +88,17 @@ class GameState:
         self.players[name] = p
         return p
 
+    def rollback_event(self, event_id: str) -> bool:
+        """撤销尚未广播的最后一个世界事实事件。
+
+        只允许回滚最后一条，避免把已经进入 Chronicle/客户端的事实改写。
+        用于跨 World SQLite 写入失败时保持事件流和世界层一致。
+        """
+        if not self.fact_events or self.fact_events[-1].get("id") != event_id:
+            return False
+        self.fact_events.pop()
+        return True
+
     def remove_player(self, name):
         self.players.pop(name, None)
 

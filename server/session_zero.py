@@ -112,9 +112,12 @@ def _verify(raw: dict, meta: dict) -> dict:
     }
 
 
-async def prepare(store, kb, world, provider=None) -> dict:
+async def prepare(store, kb, world, provider=None, play=None) -> dict:
     """跑一次 session zero，结果落进世界层并返回（可广播、可审查）。"""
     meta = _kb_brief(kb)
+    if play is not None:
+        meta["play_mode"] = getattr(play, "mode_label", "")
+        meta["play_rules"] = getattr(getattr(play, "rules", None), "profile", "")
     bible = None
     if provider is not None:
         prompt = (PROMPT.replace("{title}", store.title or "这本规则书")
@@ -122,7 +125,7 @@ async def prepare(store, kb, world, provider=None) -> dict:
                   .replace("{monsters}", "、".join(meta["monsters"]) or "（无）")
                   .replace("{skills}", "、".join(meta["skills"]) or "（无）")
                   .replace("{items}", "、".join(meta["items"]) or "（无）")
-                  .replace("{rules}", meta["rules"]))
+                  .replace("{rules}", meta.get("play_rules") or meta["rules"])
         try:
             text = await provider.chat([{"role": "user", "content": prompt}], json_mode=True)
             raw = json.loads(text if isinstance(text, str) else str(text))

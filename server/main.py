@@ -413,6 +413,8 @@ class Room:
             source = str(getattr(self.store, "source", "") or "")
             self.script_rel = Path(source).name if source else ""
         self.play = PlayDefinition.from_store(self.script_rel, self.store)
+        # Agent 只读这份玩法定义，不再各自从 data 推导 mode/rules。
+        self.store.play_definition = self.play
         # 编译器产出的知识库（五类容器）。**整局共用**，DM 只经 kb_lookup/kb_lore 读它；
         # 没编译过库的机器上这里是 None，DM 少两个工具，游戏照常跑。
         try:
@@ -704,7 +706,7 @@ class Room:
                                           "label": "DM 正在读规则书、准备开局…"})
                     try:
                         bible = await prepare(self.store, self._kb, self.world,
-                                              self.narrator().provider)
+                                              self.narrator().provider, play=self.play)
                         await self.broadcast({"type": "system",
                                               "text": summary_text(bible)})
                         if bible.get("hooks"):

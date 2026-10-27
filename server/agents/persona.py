@@ -245,11 +245,17 @@ CHARACTER_CARD_JSON_HINT = (
 def _card_user(agent, ctx) -> str:
     store = agent.store
     prompt = _script_digest(store)
-    if bool((getattr(store, "data", None) or {}).get("sandbox")):
+    play = getattr(store, "play_definition", None)
+    is_sandbox = bool(play and getattr(play, "mode", "") == "sandbox") or bool(
+        (getattr(store, "data", None) or {}).get("sandbox")
+    )
+    if is_sandbox:
         prompt += (
             "\n\n【玩法模式】这是规则驱动的动态沙盒。请根据规则库的角色创建字段、"
             "技能和本局玩法判断是否需要角色卡；不要只看当前是否有预设场景。"
         )
+        if play is not None:
+            prompt += f"\n规则档案：{getattr(getattr(play, 'rules', None), 'profile', '')}"
         # 这些字段只是证据，最终是否需要角色卡仍由 Agent 判断。
         try:
             from pathlib import Path

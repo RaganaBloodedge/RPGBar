@@ -696,8 +696,7 @@ class Room:
             await self.broadcast_room()
             # ---- session zero：沙盒剧本开局前先读库、定调、铺场景 ----
             try:
-                sandbox = bool((self.store.data or {}).get("sandbox")) or (
-                    self._kb is not None and not (self.store.data or {}).get("scenes"))
+                sandbox = self.play.generation_policy == "session_zero"
                 if sandbox and self.world is not None and not self.world.get("bible"):
                     from .session_zero import prepare, summary_text
 
@@ -987,15 +986,8 @@ class Room:
     def script_info(self) -> dict:
         """本房间所用剧本的概要（建房时钉住；之后换「活动剧本」不影响进行中的房间）。"""
         return {
-            "title": self.store.title,
-            "path": self.store.source,
+            **self.play.to_public(),
             "fmt": self.store.fmt,
-            "structured": bool(self.store.doc.structured),
-            "scenes": len(self.store.scenes),
-            "flags": len(self.store.flag_ids),
-            "chunks": len(self.store.chunk_list),
-            # 剧本声明的人数（可选段，缺省 1–4）——大厅建房时拿它当容量默认值
-            "players": dict(self.store.players),
             "warnings": list(self.store.warnings),
         }
 

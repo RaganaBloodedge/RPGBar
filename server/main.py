@@ -119,6 +119,7 @@ from .lobby import (
 from .npc import HELP_VERBS, HURT_VERBS, NpcService
 from .play_definition import PlayDefinition
 from .rag import ScriptStore
+from .script_knowledge import ScriptKnowledgeAdapter
 from .state_machine import GameState
 
 cfg = load_config()
@@ -425,6 +426,8 @@ class Room:
             self._kb = _kb_store(self.script_rel)
         except Exception:  # noqa: BLE001
             self._kb = None
+        self.knowledge = ScriptKnowledgeAdapter(self.store, self._kb)
+        self.store.script_knowledge = self.knowledge
         # 判定引擎：读知识库目录旁的 rule_profile.json（COC → d100 掷低）。
         # 没有档案就是 None，DM 退回 d20 —— 老剧本不受影响。
         self.rules = None
@@ -1314,49 +1317,22 @@ class Room:
                                       npc_brief=npc_brief, kb_brief=kb_brief)
                 # 行动裁定器接收切分器和世界层的结构化接口：场景 NPC、现场实体、
                 # 静态关系边、以及本局已经提交的动态关系。它不再只看玩家原话。
-                judge_context = {"present_entities": [], "static_relations": [],
-                                 "dynamic_relations": []}
-                if self.world is not None:
-                    try:
-                        judge_context["present_entities"] = [
-                            {"name": e.get("name"), "kind": e.get("kind"),
-                             "detail": e.get("detail", "")}
-                            for e in self.world.present()[:12]
-                        ]
-                        judge_context["dynamic_relations"] = self.world.relations(limit=8)
-                    except Exception:  # noqa: BLE001
-                        pass
-                if getattr(self, "_kb", None) is not None:
-                    try:
-                        names = {str(n.get("name") or "") for n in
-                                 (self.state.current() or {}).get("npcs", [])
-                                 if isinstance(n, dict)}
-                        names.update(str(e.get("name") or "") for e in judge_context["present_entities"])
-                        rel_lines = []
-                        for rel_name in names:
-                            if rel_name:
-                                raw_rel = self._kb.relations(rel_name, limit=4)
-                                if raw_rel:
-                                    rel_lines.append(raw_rel)
-                        judge_context["static_relations"] = rel_lines[:8]
-                    except Exception:  # noqa: BLE001
-                        pass
-                # 先用剧本切分产出的 keywords 形成候选集合，交给 4B 做语义确认。
-                # 这不是通用词表：候选完全来自当前剧本的 checks/exits。
                 current_scene = self.state.current() or {}
-                # ActionJudge/Validator 使用同一份由切分器派生的出口视图：除了
-                # 出口自身的触发词，还提供目标场景标题/地点/关键词，支持自然
-                # 语言描述目标地点而不引入全局同义词表。
+                # 所有静态行动证据统一由 ScriptKnowledgeAdapter 组装；World 只补
+                # 当前局的动态实体/关系，不把编译器状态表误当作本局事实。
+                evidence = self.knowledge.action_evidence(
+                    self.state.current_scene, flags=self.state.flags, world=self.world)
+                judge_context = {
+                    "present_entities": evidence.get("present_entities", []),
+                    "static_relations": self.knowledge.static_relations(
+                        [n.get("name") for n in evidence.get("npcs", [])]
+                        + [e.get("name") for e in evidence.get("present_entities", [])]
+                    ),
+                    "dynamic_relations": evidence.get("dynamic_relations", []),
+                    "candidate_checks": [], "candidate_exits": [],
+                }
                 current_scene = dict(current_scene)
-                enriched_exits = []
-                for exit_ in current_scene.get("exits", []) or []:
-                    item = dict(exit_)
-                    target = self.store.get_scene(str(item.get("to") or "")) or {}
-                    item["target_title"] = target.get("title", "")
-                    item["target_location"] = target.get("location", "")
-                    item["target_keywords"] = list(target.get("keywords") or [])[:12]
-                    enriched_exits.append(item)
-                current_scene["exits"] = enriched_exits
+                current_scene["exits"] = evidence.get("exits", [])
                 candidate_checks, candidate_exits = action_candidates(current_scene, text)
                 judge_context["candidate_checks"] = candidate_checks
                 judge_context["candidate_exits"] = candidate_exits

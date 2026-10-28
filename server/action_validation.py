@@ -34,7 +34,13 @@ def candidates(scene: dict, text: str) -> tuple[list[dict], list[dict]]:
                            "hits": hits})
     exits = []
     for exit_ in scene.get("exits", []) or []:
-        hits = [str(k) for k in (exit_.get("keywords") or []) if str(k) in text]
+        # 出口目标的标题/地点由 ScriptStore 从切分结果补入当前场景视图。
+        # 这让“回到古堡大门外”可以命中目标场景，而无需维护全局同义词表。
+        terms = list(exit_.get("keywords") or [])
+        terms.extend([exit_.get("label"), exit_.get("target_title"),
+                      exit_.get("target_location")])
+        terms.extend(exit_.get("target_keywords") or [])
+        hits = [str(k) for k in terms if k and str(k) in text]
         if hits:
             exits.append({"to": exit_.get("to", ""), "label": exit_.get("label", ""),
                           "condition": exit_.get("condition"), "hits": hits})

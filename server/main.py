@@ -1326,6 +1326,19 @@ class Room:
                 # 先用剧本切分产出的 keywords 形成候选集合，交给 4B 做语义确认。
                 # 这不是通用词表：候选完全来自当前剧本的 checks/exits。
                 current_scene = self.state.current() or {}
+                # ActionJudge/Validator 使用同一份由切分器派生的出口视图：除了
+                # 出口自身的触发词，还提供目标场景标题/地点/关键词，支持自然
+                # 语言描述目标地点而不引入全局同义词表。
+                current_scene = dict(current_scene)
+                enriched_exits = []
+                for exit_ in current_scene.get("exits", []) or []:
+                    item = dict(exit_)
+                    target = self.store.get_scene(str(item.get("to") or "")) or {}
+                    item["target_title"] = target.get("title", "")
+                    item["target_location"] = target.get("location", "")
+                    item["target_keywords"] = list(target.get("keywords") or [])[:12]
+                    enriched_exits.append(item)
+                current_scene["exits"] = enriched_exits
                 candidate_checks, candidate_exits = action_candidates(current_scene, text)
                 judge_context["candidate_checks"] = candidate_checks
                 judge_context["candidate_exits"] = candidate_exits

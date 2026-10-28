@@ -40,6 +40,8 @@ class ActionJudgeAgent:
             "checks": [{"id": c.get("id"), "skill": c.get("skill"),
                         "keywords": c.get("keywords", [])} for c in scene.get("checks", [])],
             "exits": [{"to": e.get("to"), "label": e.get("label"),
+                       "target_title": e.get("target_title"),
+                       "target_location": e.get("target_location"),
                        "keywords": e.get("keywords", []), "condition": e.get("condition")} 
                       for e in scene.get("exits", [])],
             # NPC/物件是切分剧本的结构化接口，不要只从玩家原话猜目标。

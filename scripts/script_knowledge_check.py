@@ -18,6 +18,9 @@ def main():
     # 没有 World 时适配器不伪造动态实体/关系。
     assert "present_entities" not in evidence
     assert "dynamic_relations" not in evidence
+    template = adapter.timeline_template()
+    assert template["source"] == "kb_template"
+    assert "events" in template and "entity_states" in template
     print("script knowledge adapter: PASS")
 
 

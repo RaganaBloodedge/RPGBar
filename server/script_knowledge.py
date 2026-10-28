@@ -54,3 +54,34 @@ class ScriptKnowledgeAdapter:
 
     def names(self) -> list[str]:
         return self.kb.name_index() if self.kb is not None else []
+
+    def timeline_template(self, campaign: str = "") -> dict:
+        """读取编译器可选的时间线模板，不把它当成本局动态事实。"""
+        if self.kb is None or not getattr(self.kb, "available", False):
+            return {"campaign": campaign, "events": [], "entity_states": [], "source": "kb_template"}
+        con = self.kb.kb.con
+        events, states = [], []
+        try:
+            if campaign:
+                rows = con.execute(
+                    "SELECT seq,kind,title,body,section_id,block_id,page,world_time,payload,irreversible "
+                    "FROM timeline_event WHERE campaign_id=? ORDER BY seq", (campaign,))
+            else:
+                rows = con.execute(
+                    "SELECT seq,kind,title,body,section_id,block_id,page,world_time,payload,irreversible "
+                    "FROM timeline_event ORDER BY campaign_id,seq")
+            events = [dict(r) for r in rows]
+        except Exception:  # 旧 KB 没有时间线表或表结构未完成
+            events = []
+        try:
+            sql = ("SELECT es.campaign_id,es.entity_id,e.name,e.etype,es.status,es.fields,es.updated_seq "
+                   "FROM entity_state es LEFT JOIN entity e ON e.id=es.entity_id")
+            args = ()
+            if campaign:
+                sql += " WHERE es.campaign_id=?"
+                args = (campaign,)
+            states = [dict(r) for r in con.execute(sql, args)]
+        except Exception:
+            states = []
+        return {"campaign": campaign, "events": events, "entity_states": states,
+                "source": "kb_template"}

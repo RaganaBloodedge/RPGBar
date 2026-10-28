@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from .. import character_card, dice
 from ..dm import DM  # 只为 DM._exit_ok（出口门控判定）；不再用它的脚本化流水线
+from ..fact_transaction import commit_world_event
 from .base import Agent, AgentResult, Tool, _obj, int_prop, str_prop
 
 
@@ -738,20 +739,14 @@ class NarratorAgent(Agent):
         target = (name or "").strip()[:40]
         if not target or not ctx.state.current_scene:
             return {"error": "登记失败：名字为空或没有当前场景"}
-        fact = ctx.state.commit_event(
-            "entity_declared", actor=ctx.player_name, target=target,
-            text=(detail or "")[:200], facts_added=[f"entity:{target}"])
-        try:
-            row = self.world.declare(target, kind=kind, detail=detail)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            return {"error": f"登记失败：{type(exc).__name__}"}
-        if not row:
-            ctx.state.rollback_event(fact["id"])
-            return {"error": "登记失败：名字为空或没有当前场景"}
-        fact["target"] = row["name"]
-        fact["facts_added"] = [f"entity:{row['name']}"]
-        ctx.fact_events.append(fact)
+        fact, row, error = commit_world_event(
+            ctx, "entity_declared", actor=ctx.player_name, target=target,
+            text=(detail or "")[:200], facts_added=[f"entity:{target}"],
+            mutation=lambda: self.world.declare(target, kind=kind, detail=detail),
+            decorate=lambda f, r: (f.update(target=r["name"], facts_added=[f"entity:{r['name']}"]))
+        )
+        if error:
+            return {"error": f"登记失败：{error}"}
         return {"ok": True, "entity": {"name": row["name"], "kind": row["kind"],
                                        "detail": row["detail"]},
                 "note": "已登记进世界层，之后每一轮它都在【现场】里。"}
@@ -770,22 +765,17 @@ class NarratorAgent(Agent):
     def _t_set_relation(self, ctx, src="", dst="", relationship="", reason=""):
         if self.world is None:
             return {"error": "这一局没有世界层"}
-        fact = ctx.state.commit_event(
-            "relation_changed", actor=ctx.player_name,
+        fact, row, error = commit_world_event(
+            ctx, "relation_changed", actor=ctx.player_name,
             target=f"{src}|{relationship}|{dst}", text=(reason or "")[:240],
             facts_added=[f"relation:{src}|{relationship}|{dst}"],
+            mutation=lambda: self.world.set_relation(src, dst, relationship, reason),
+            decorate=lambda f, r: (f.update(
+                target=f"{r['src']}|{r['rel']}|{r['dst']}",
+                facts_added=[f"relation:{r['src']}|{r['rel']}|{r['dst']}"]))
         )
-        try:
-            row = self.world.set_relation(src, dst, relationship, reason)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            return {"error": f"关系登记失败：{type(exc).__name__}"}
-        if not row:
-            ctx.state.rollback_event(fact["id"])
-            return {"error": "关系三元组不完整"}
-        fact["target"] = f"{row['src']}|{row['rel']}|{row['dst']}"
-        fact["facts_added"] = [f"relation:{row['src']}|{row['rel']}|{row['dst']}"]
-        ctx.fact_events.append(fact)
+        if error:
+            return {"error": f"关系登记失败：{error}"}
         return {"ok": True, "relation": row,
                 "note": "已记录为本局动态关系；剧本知识库中的静态关系未被修改。"}
 
@@ -795,18 +785,13 @@ class NarratorAgent(Agent):
         title = (title or "").strip()[:80]
         if not title:
             return {"error": "请给出线索标题"}
-        fact = ctx.state.commit_event(
-            "thread_opened", actor=ctx.player_name, target=title,
-            text=f"开启线索：{title}", facts_added=[f"thread:{title}"])
-        try:
-            tid = self.world.open_thread(title)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            return {"error": f"开启线索失败：{type(exc).__name__}"}
-        if not tid:
-            ctx.state.rollback_event(fact["id"])
-            return {"error": "开启线索失败"}
-        ctx.fact_events.append(fact)
+        fact, tid, error = commit_world_event(
+            ctx, "thread_opened", actor=ctx.player_name, target=title,
+            text=f"开启线索：{title}", facts_added=[f"thread:{title}"],
+            mutation=lambda: self.world.open_thread(title),
+        )
+        if error:
+            return {"error": f"开启线索失败：{error}"}
         return {"ok": True, "id": tid,
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 
@@ -818,18 +803,13 @@ class NarratorAgent(Agent):
         if not row:
             return {"error": f"没找到未收束的线索：{title}",
                     "open_threads": [t["title"] for t in candidates]}
-        fact = ctx.state.commit_event(
-            "thread_closed", actor=ctx.player_name, target=row["title"],
-            text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"])
-        try:
-            closed = self.world.close_thread(title, status)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            return {"error": f"收束线索失败：{type(exc).__name__}"}
-        if not closed:
-            ctx.state.rollback_event(fact["id"])
-            return {"error": "收束线索失败"}
-        ctx.fact_events.append(fact)
+        fact, closed, error = commit_world_event(
+            ctx, "thread_closed", actor=ctx.player_name, target=row["title"],
+            text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"],
+            mutation=lambda: self.world.close_thread(title, status),
+        )
+        if error:
+            return {"error": f"收束线索失败：{error}"}
         return {"ok": True, "closed": row["title"], "status": row["status"],
                 "open_threads": [t["title"] for t in self.world.threads("open")]}
 

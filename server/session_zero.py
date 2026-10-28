@@ -161,7 +161,7 @@ async def prepare(store, kb, world, provider=None, play=None, event_ctx=None) ->
             _fact, sid, error = commit_world_event(
                 event_ctx, "world_changed", actor="系统", target="session_zero",
                 text=f"生成沙盒开局：{bible.get('place', '')}",
-                facts_added=["session_zero_ready"], mutation=write_world,
+                facts_added=["session_zero_ready"], mutation=write_world, world=world,
             )
             if error:
                 raise RuntimeError(error)

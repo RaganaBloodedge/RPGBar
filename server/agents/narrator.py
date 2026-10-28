@@ -743,6 +743,7 @@ class NarratorAgent(Agent):
             ctx, "entity_declared", actor=ctx.player_name, target=target,
             text=(detail or "")[:200], facts_added=[f"entity:{target}"],
             mutation=lambda: self.world.declare(target, kind=kind, detail=detail),
+            world=self.world,
             decorate=lambda f, r: (f.update(target=r["name"], facts_added=[f"entity:{r['name']}"]))
         )
         if error:
@@ -770,6 +771,7 @@ class NarratorAgent(Agent):
             target=f"{src}|{relationship}|{dst}", text=(reason or "")[:240],
             facts_added=[f"relation:{src}|{relationship}|{dst}"],
             mutation=lambda: self.world.set_relation(src, dst, relationship, reason),
+            world=self.world,
             decorate=lambda f, r: (f.update(
                 target=f"{r['src']}|{r['rel']}|{r['dst']}",
                 facts_added=[f"relation:{r['src']}|{r['rel']}|{r['dst']}"]))
@@ -789,6 +791,7 @@ class NarratorAgent(Agent):
             ctx, "thread_opened", actor=ctx.player_name, target=title,
             text=f"开启线索：{title}", facts_added=[f"thread:{title}"],
             mutation=lambda: self.world.open_thread(title),
+            world=self.world,
         )
         if error:
             return {"error": f"开启线索失败：{error}"}
@@ -807,6 +810,7 @@ class NarratorAgent(Agent):
             ctx, "thread_closed", actor=ctx.player_name, target=row["title"],
             text=f"收束线索：{row['title']}", facts_removed=[f"thread:{row['title']}"],
             mutation=lambda: self.world.close_thread(title, status),
+            world=self.world,
         )
         if error:
             return {"error": f"收束线索失败：{error}"}

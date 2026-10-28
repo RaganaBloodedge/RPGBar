@@ -92,6 +92,19 @@ class World:
         except sqlite3.Error:
             pass
 
+    def transaction_snapshot(self):
+        """取得当前 World SQLite 的内存快照，供跨存储补偿事务使用。"""
+        snapshot = sqlite3.connect(":memory:")
+        self.con.backup(snapshot)
+        return snapshot
+
+    def restore_snapshot(self, snapshot) -> None:
+        """把内存快照恢复到当前 World 连接。调用方负责关闭 snapshot。"""
+        if snapshot is None:
+            return
+        snapshot.backup(self.con)
+        self.con.commit()
+
     # ---------------------------------------------------------------- 键值
     def get(self, key: str, default: str = "") -> str:
         row = self.con.execute("SELECT v FROM pointer WHERE k=?", (key,)).fetchone()

@@ -1365,7 +1365,7 @@ class Room:
                         await self.send_state()
                         return
                 moved = ""
-                if self.world is not None and (self.store.data or {}).get("sandbox"):
+                if self.world is not None and self.play.is_sandbox:
                     # **移动由服务端执行**：玩家说"去码头"，4B 会把它当断言然后否认
                     # （实测回「这里没有码头」）。地名提取与建场景都是几何，不该赌模型。
                     try:

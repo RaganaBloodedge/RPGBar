@@ -35,7 +35,7 @@ class NarratorContext:
     narration_parts: list = field(default_factory=list)  # 系统自己产出的权威旁白
     npc_brief: str = ""  # 本轮涉及 NPC 的「人物卡 + 状态快照 + 反应采样结论」（不含记忆流水账）
     user_action: str = ""  # 本轮玩家原话（工具要拿它做检定关键词匹配，模型传参不可信）
-    oob_verb: str = ""   # 非空 = 玩家动作被判定为越界（剧本机制之外），见 out_of_bounds_verb
+    oob_verb: str = ""   # 非空 = ActionJudge/Validator 判定为当前玩法不支持
     kb_brief: str = ""   # 知识库命中（玩家话里出现库里的名字时，确定性注入，不靠模型调工具）
     world_present: str = ""  # 当前场景**真实存在**的东西（世界层）
     world_digest: str = ""   # 进度：第几轮/第几天/还没收束的线索/去过的地方
@@ -60,12 +60,6 @@ NARRATOR_JSON_HINT = {
 _SUCCESS_WORDS = (
     "成功", "发现", "拿到", "得手", "打开", "推开", "抬起", "破解",
     "找到", "取下", "识破", "看穿", "撬开", "砸开",
-)
-# 越界动作的「做成了」写法跟检定成功不一样——是这套动词自己的完成态。
-# 「火堆燃了起来」「墙被挖开了」都不在通用表里，越界局要用这张表核对。
-_OOB_SUCCESS_WORDS = (
-    "点燃", "燃起", "燃了", "烧起来", "烧了起来", "生了", "烧旺",
-    "挖开", "凿开", "砸穿", "撬下", "升起",
 )
 _NEGATIONS = ("没", "未", "无", "不", "别")
 
@@ -107,7 +101,7 @@ def asserts_success(text: str, words=_SUCCESS_WORDS) -> str:
 
     命中就返回那个词（用于日志与测试），没命中返回空串。
     只看词前 4 个字里有没有否定词 —— 中文的否定几乎都贴着动词。
-    `words` 可换词表：越界动作核对时传 `_OOB_SUCCESS_WORDS`。
+    `words` 可换词表：调用方可以按已确认的事实类型选择更严格的词集。
     """
     for word in words:
         i = text.find(word)
@@ -124,37 +118,6 @@ def echoes_text(text: str, source: str, probe: int = 40) -> bool:
     if len(src) < probe or not text:
         return False
     return src[:probe] in text
-
-
-# ---- 越界动作：剧本机制之外的「改造世界」型动词 ----
-# 生火、挖墙这类动作在剧本里没有对应机制（不是出口触发说法、也不挂任何检定），
-# 提示词只写了「别顺着他演」，但 4B 的实测是照写成功（「火堆燃起来了」）。
-# 与其靠模型自觉，不如**入口就判出来**：命中越界动词、且动作没碰到任何出口/检定
-# 关键词 → 在 user 消息里插一条硬指令，事后核对时旁白若把它写成成功就丢掉。
-_OOB_VERBS = (
-    "生火", "点火", "挖", "凿", "砸墙", "撬墙", "拆墙", "砍墙", "烧掉",
-    "开枪", "射击", "攻击", "施法", "瞬移", "飞走", "跳过剧情", "直接到终点",
-    "直接到最后", "宣布我已经拿到", "宣布获得",
-)
-
-
-def out_of_bounds_verb(text: str, scene: dict) -> str:
-    """玩家动作是否越界。返回命中的越界动词（"" = 没越界）。
-
-    判定两步走：先看动作有没有命中**任何**出口/检定的触发说法（命中说明剧本
-    有机制接它，放行）；再匹配越界动词表。两边都不沾才判越界。
-    """
-    t = text or ""
-    if not t:
-        return ""
-    for thing in scene.get("exits", []) + scene.get("checks", []):
-        for k in thing.get("keywords", []) or []:
-            if k in t:
-                return ""
-    for v in _OOB_VERBS:
-        if v in t:
-            return v
-    return ""
 
 
 # ---- 元问题：入口直接分流，不进模型 ----
@@ -204,6 +167,17 @@ class NarratorAgent(Agent):
         # 没有它，DM 只能靠聊天记录猜，玩家说"我打开门"它就顺着演。
         self.world = world
 
+    @property
+    def play(self):
+        """房间创建时绑定的玩法定义；旧的直接测试仍允许没有该属性。"""
+        return getattr(self.store, "play_definition", None)
+
+    def is_sandbox(self) -> bool:
+        play = self.play
+        if play is not None:
+            return bool(getattr(play, "is_sandbox", False))
+        return bool((self.store.data or {}).get("sandbox"))
+
     async def run(self, ctx, user_input: str = "") -> AgentResult:
         """跑一轮，并在返回前**核一遍旁白与权威结果是否打架**。
 
@@ -219,7 +193,7 @@ class NarratorAgent(Agent):
 
         - 元问题（存档 / 你是 AI / 规则）：答案固定，入口直接回，不进工具循环。
           `source="system"`、`stopped="meta"`，界面不会把它当失败刷屏。
-        - 越界动作（生火、挖墙这类剧本机制外的事）：记在 `ctx.oob_verb` 上，
+        - 当前玩法不支持的动作：由 ActionJudge/Validator 标记到 `ctx.oob_verb`，
           user 消息里追加硬指令（见 `build_user_message`），事后核对兜底（见 guard）。
         """
         ctx.user_action = user_input or ""
@@ -231,7 +205,6 @@ class NarratorAgent(Agent):
                 stopped="meta",
                 data={"meta": True},
             )
-        ctx.oob_verb = out_of_bounds_verb(ctx.user_action, ctx.state.current())
         before = ctx.state.current_scene
         res = await super().run(ctx, user_input)
         reason = self._guard_narration(ctx, res.text or "", before)
@@ -248,6 +221,10 @@ class NarratorAgent(Agent):
             res2 = await super().run(ctx, user_input + "\n（提醒：" + hint + "）")
             reason2 = self._guard_narration(ctx, res2.text or "", before)
             if not reason2:
+                # 重试没有真正产出时不能吞掉第一次护栏命中原因；否则客户端只看到
+                # 空旁白，测试和日志都无法知道是模型失败还是事实冲突。
+                if not (res2.text or "").strip() and getattr(res2, "source", "") != "llm":
+                    res2.drop_reason = reason
                 res2.data = {**(res.data or {}), "retried": True}
                 return res2
             res.drop_reason = reason2
@@ -299,12 +276,12 @@ class NarratorAgent(Agent):
                          if e.get("kind") == "narration"), "")
             if last and _overlap_ratio(t, last) > 0.75 and len(t) > 40:
                 return "与上一轮旁白高度雷同"
-        # 越界动作写成成功：入口已经判过越界（ctx.oob_verb），旁白里又出现了
-        # 那个动词本身 + 成功断言（「生火…火堆燃起来了」）。两个条件同时命中
-        # 才丢 —— 单看成功词会误伤「你发现墙上有火把架」这类合法补充。
+        # ActionJudge/Validator 已经确认当前玩法没有承接这次行动时，
+        # 旁白不能把它写成既成事实。这里不再检查固定动词表，避免把某个剧本
+        # 的词汇误当作所有剧本的规则。
         oob = getattr(ctx, "oob_verb", "") or ""
-        if oob and oob in text and asserts_success(text, _OOB_SUCCESS_WORDS):
-            return f"越界动作（{oob}）被写成了成功"
+        if oob and asserts_success(text):
+            return "当前玩法不支持的行动被写成了成功"
         return ""
 
     # ---- 提示词 ----
@@ -557,7 +534,7 @@ class NarratorAgent(Agent):
                 ]
             )
         if self.world is not None:
-            if (self.store.data or {}).get("sandbox"):
+            if self.is_sandbox():
                 tools.append(
                     Tool(
                         "travel",
@@ -721,7 +698,7 @@ class NarratorAgent(Agent):
             return {"ok": True, "scene_id": sid, "returned": True,
                     "scene": self.store.scene_brief(sid, flags=ctx.state.flags)}
         cur = ctx.state.current() or {}
-        if cur.get("exits") and not (self.store.data or {}).get("sandbox"):
+        if cur.get("exits") and not self.is_sandbox():
             return {"error": "本剧本是固定场景，请用 move_to（出口见【当前场景】）",
                     "available": [e["to"] for e in cur.get("exits") or []]}
         n = int(self.world.get("gen_count", "0") or 0) + 1
@@ -963,7 +940,7 @@ class NarratorAgent(Agent):
             return {"error": "本轮这个检定已经由服务端完成，不要重复投骰；请直接 finish。"}
         scene = ctx.state.current()
         check = next((c for c in scene.get("checks", []) if c["id"] == check_id), None)
-        if not check and (self.store.data or {}).get("sandbox"):
+        if not check and self.is_sandbox():
             # 沙盒没有预注册检定：**直接按技能名临场判**（skill 就是 check_id 的写法）。
             # 这正是规则书该发挥作用的地方：技能值来自书，成功率来自判定档案。
             value, source = self._skill_value(ctx, check_id)

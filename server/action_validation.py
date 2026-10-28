@@ -68,8 +68,11 @@ def validate(scene: dict, text: str, judgement, fact_question: bool = False) -> 
         plan.intent = "move"
         plan.exit_scene = str(exits[0].get("to") or "")
         return plan
-    if getattr(judgement, "intent", "") == "blocked" and confidence >= 0.70:
-        plan.intent = "blocked"
+    judged_intent = getattr(judgement, "intent", "ambiguous") or "ambiguous"
+    if judged_intent == "blocked":
+        # 拒绝是高风险裁定：低置信度只能进入歧义分支，不能把玩家自由行动
+        # 永久锁死。下一层 Narrator 仍可据当前现场给出澄清或普通回应。
+        plan.intent = "blocked" if confidence >= 0.70 else "ambiguous"
     else:
-        plan.intent = getattr(judgement, "intent", "ambiguous") or "ambiguous"
+        plan.intent = judged_intent
     return plan

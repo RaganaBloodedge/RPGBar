@@ -707,8 +707,13 @@ class Room:
                     await self.broadcast({"type": "thinking", "active": True, "who": "dm",
                                           "label": "DM 正在读规则书、准备开局…"})
                     try:
+                        from types import SimpleNamespace
+                        session_events = SimpleNamespace(state=self.state, fact_events=[])
                         bible = await prepare(self.store, self._kb, self.world,
-                                              self.narrator().provider, play=self.play)
+                                              self.narrator().provider, play=self.play,
+                                              event_ctx=session_events)
+                        for fact in session_events.fact_events:
+                            await self.broadcast({"type": "fact_event", "event": fact})
                         await self.broadcast({"type": "system",
                                               "text": summary_text(bible)})
                         if bible.get("hooks"):

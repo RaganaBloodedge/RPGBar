@@ -16,6 +16,9 @@ from __future__ import annotations
 import json
 import random
 import re
+from types import SimpleNamespace
+
+from .fact_transaction import commit_world_event
 
 PROMPT = """你是《{title}》的守秘人。请用这本规则书的素材，design 一个**沙盒开局**。
 
@@ -112,7 +115,7 @@ def _verify(raw: dict, meta: dict) -> dict:
     }
 
 
-async def prepare(store, kb, world, provider=None, play=None) -> dict:
+async def prepare(store, kb, world, provider=None, play=None, event_ctx=None) -> dict:
     """跑一次 session zero，结果落进世界层并返回（可广播、可审查）。"""
     meta = _kb_brief(kb)
     if play is not None:
@@ -137,20 +140,33 @@ async def prepare(store, kb, world, provider=None, play=None) -> dict:
         bible = _fallback(meta, store.title)
     bible["kb_meta"] = {k: meta[k] for k in ("topics", "monsters", "skills", "rules")}
 
-    # 落库：世界层记圣经 + 开场场景
+    # 落库：世界层记圣经 + 开场场景。若房间传入 event_ctx，
+    # 这次初始化必须先成为事实事件，再进入本轮广播与 Chronicle。
     if world is not None:
-        world.set("bible", json.dumps(bible, ensure_ascii=False))
-        sc = world.scene()
-        sid = sc["id"] if sc else "sandbox"
-        if sc is None:
-            world.add_scene(sid, "开场", bible["place"], bible["scene"], source="seed")
-            world.enter(sid)
+        def write_world():
+            world.set("bible", json.dumps(bible, ensure_ascii=False))
+            sc = world.scene()
+            sid = sc["id"] if sc else "sandbox"
+            if sc is None:
+                world.add_scene(sid, "开场", bible["place"], bible["scene"], source="seed")
+                world.enter(sid)
+            else:
+                world.con.execute(
+                    "UPDATE scene SET place=?, description=?, label=? WHERE id=?",
+                    (bible["place"], bible["scene"], "开场", sid))
+                world.set("scene", sid)
+            return sid
+
+        if event_ctx is not None:
+            _fact, sid, error = commit_world_event(
+                event_ctx, "world_changed", actor="系统", target="session_zero",
+                text=f"生成沙盒开局：{bible.get('place', '')}",
+                facts_added=["session_zero_ready"], mutation=write_world,
+            )
+            if error:
+                raise RuntimeError(error)
         else:
-            world.con.execute(
-                "UPDATE scene SET place=?, description=?, label=? WHERE id=?",
-                (bible["place"], bible["scene"], "开场", sid))
-            world.set("scene", sid)
-            world.con.commit()
+            sid = write_world()
 
     # 剧本对象也更新（房间的 state 是从这里读的）
     try:

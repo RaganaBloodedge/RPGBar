@@ -1030,6 +1030,19 @@ class Room:
 
     async def send_state(self):
         snap = self.state.snapshot()
+        if self.world is not None:
+            # 世界层的现场实体和动态关系是当前局事实；放进公开快照，
+            # 让验收器与 ActionJudge 使用同一份状态证据。
+            try:
+                evidence = snap.setdefault("scene_evidence", {})
+                evidence["present_entities"] = [
+                    {"name": e.get("name", ""), "kind": e.get("kind", ""),
+                     "detail": e.get("detail", "")}
+                    for e in self.world.present()[:24]
+                ]
+                evidence["dynamic_relations"] = self.world.relations(limit=24)
+            except Exception:  # noqa: BLE001
+                pass
         if self.npc is not None:
             snap["npcs"] = self.npc.snapshot()
         mem = self.memory_status()

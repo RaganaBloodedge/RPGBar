@@ -176,6 +176,26 @@ class GameState:
 
     def snapshot(self):
         cur = self.current()
+        # 给客户端和状态感知验收器的公开证据：只暴露当前可观察的机制，
+        # 不包含 dm_notes、成功/失败文案等主持人内幕。
+        evidence = {
+            "scene": self.current_scene,
+            "npcs": [
+                {"name": n.get("name", ""), "role": n.get("role", "")}
+                for n in (cur or {}).get("npcs", []) if isinstance(n, dict)
+            ],
+            "exits": [
+                {"to": e.get("to", ""), "label": e.get("label", ""),
+                 "keywords": list(e.get("keywords") or []),
+                 "condition": e.get("condition")}
+                for e in (cur or {}).get("exits", []) if isinstance(e, dict)
+            ],
+            "checks": [
+                {"id": c.get("id", ""), "skill": c.get("skill", ""),
+                 "keywords": list(c.get("keywords") or [])}
+                for c in (cur or {}).get("checks", []) if isinstance(c, dict)
+            ],
+        }
         return {
             "current_scene": self.current_scene,
             "scene_title": cur["title"] if cur else "",
@@ -187,4 +207,5 @@ class GameState:
             "players": [p.to_dict() for p in self.players.values()],
             "turn": self.turn,
             "ended": self.ended,
+            "scene_evidence": evidence,
         }

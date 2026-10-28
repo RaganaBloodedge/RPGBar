@@ -11,6 +11,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.action_validation import validate
+from scripts.player_acceptance import _select_case
 
 
 SCENE = {
@@ -47,6 +48,14 @@ def main():
         SimpleNamespace(intent="blocked", confidence=0.42),
     )
     check("低置信度拒绝不封禁行动", uncertain.intent == "ambiguous", uncertain)
+
+    pending = [
+        {"id": "wrong", "precondition": {"scene": "other"}},
+        {"id": "right", "precondition": {"scene": "hall"}},
+    ]
+    selected, skipped = _select_case(pending, {"current_scene": "hall", "flags": []})
+    check("验收器跳过不适用前置条件", selected["id"] == "right" and len(skipped) == 1,
+          (selected, skipped))
     print("action validation: PASS")
 
 

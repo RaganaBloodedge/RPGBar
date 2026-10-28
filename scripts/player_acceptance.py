@@ -167,11 +167,11 @@ def _case_compatible(case: dict, state: dict) -> bool:
 
 
 def _select_case(cases: list[dict], state: dict) -> tuple[dict | None, list[dict]]:
-    """从待测用例中选当前状态可执行的一条，返回被跳过的前置不符用例。"""
-    for i, case in enumerate(cases):
-        if _case_compatible(case, state):
-            return cases.pop(i), []
-    return (cases.pop(0), []) if cases else (None, [])
+    """从待测用例中选当前状态可执行的一条，并显式返回不适用用例。"""
+    skipped = []
+    while cases and not _case_compatible(cases[0], state):
+        skipped.append(cases.pop(0))
+    return (cases.pop(0) if cases else None), skipped
 
 
 async def run_cases(cases_path: str, url: str) -> int:

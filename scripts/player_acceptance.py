@@ -110,6 +110,10 @@ async def generate(script: str, out: str) -> int:
             row["precondition"] = {
                 "scene": str(pre.get("scene") or ""),
                 "flags": [str(x) for x in (pre.get("flags") or [])],
+                "present_entities": [str(x) for x in (pre.get("present_entities") or [])],
+                "npcs": [str(x) for x in (pre.get("npcs") or [])],
+                "checks": [str(x) for x in (pre.get("checks") or [])],
+                "exits": [str(x) for x in (pre.get("exits") or [])],
             }
         expected_state = c.get("expected_state") or c.get("expected")
         if isinstance(expected_state, dict):
@@ -140,7 +144,26 @@ def _case_compatible(case: dict, state: dict) -> bool:
     pre = case.get("precondition") or {}
     if pre.get("scene") and state.get("current_scene") != pre["scene"]:
         return False
-    return set(pre.get("flags") or []).issubset(set(state.get("flags") or []))
+    if not set(pre.get("flags") or []).issubset(set(state.get("flags") or [])):
+        return False
+    evidence = state.get("scene_evidence") or {}
+    present = {str(x.get("name")) for x in evidence.get("present_entities", [])
+               if isinstance(x, dict) and x.get("name")}
+    npcs = {str(x.get("name")) for x in evidence.get("npcs", [])
+            if isinstance(x, dict) and x.get("name")}
+    checks = {str(x.get("id")) for x in evidence.get("checks", [])
+              if isinstance(x, dict) and x.get("id")}
+    exits = {str(x.get("to")) for x in evidence.get("exits", [])
+             if isinstance(x, dict) and x.get("to")}
+    if not set(pre.get("present_entities") or []).issubset(present):
+        return False
+    if not set(pre.get("npcs") or []).issubset(npcs):
+        return False
+    if not set(pre.get("checks") or []).issubset(checks):
+        return False
+    if not set(pre.get("exits") or []).issubset(exits):
+        return False
+    return True
 
 
 def _select_case(cases: list[dict], state: dict) -> tuple[dict | None, list[dict]]:
@@ -244,7 +267,10 @@ async def run_cases(cases_path: str, url: str) -> int:
                 results.append({"case": pending, "observed_types": sorted(types),
                                 "checks": checks, "passed": passed, "text": text[:1200],
                                 "events": observed[:], "before_state": before_state,
-                                "final_state": final_state, "fact_events": facts,
+                                "before_evidence": before_state.get("scene_evidence") or {},
+                                "final_state": final_state,
+                                "final_evidence": final_state.get("scene_evidence") or {},
+                                "fact_events": facts,
                                 "test_error": test_error, "issues": issues})
                 pending = None
                 phase = "waiting_next_action"

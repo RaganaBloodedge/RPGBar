@@ -711,8 +711,12 @@ class NarratorAgent(Agent):
             sid = row["id"]
             fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
                                           target=sid, allow_generated=True)
+            try:
+                self.world.enter(sid)
+            except Exception as exc:  # noqa: BLE001
+                ctx.state.rollback_event(fact["id"])
+                return {"error": f"返回地点失败：{type(exc).__name__}"}
             ctx.fact_events.append(fact)
-            self.world.enter(sid)
             ctx.events.append({"type": "system", "text": f"回到：{place}"})
             return {"ok": True, "scene_id": sid, "returned": True,
                     "scene": self.store.scene_brief(sid, flags=ctx.state.flags)}
@@ -730,12 +734,21 @@ class NarratorAgent(Agent):
             "flags_required": [], "flags_set": [], "checks": [], "exits": [],
         }
         self.store.scenes[sid] = scene
-        self.world.add_scene(sid, place, place, text,
-                             parent=ctx.state.current_scene or "", source="generated")
         fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
                                       target=sid, allow_generated=True)
+        try:
+            self.world.add_scene(sid, place, place, text,
+                                 parent=ctx.state.current_scene or "", source="generated")
+            self.world.enter(sid)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            self.store.scenes.pop(sid, None)
+            try:
+                self.world.remove_scene(sid)
+            except Exception:
+                pass
+            return {"error": f"生成地点失败：{type(exc).__name__}"}
         ctx.fact_events.append(fact)
-        self.world.enter(sid)
         ctx.events.append({"type": "system", "text": f"进入：{place}"})
         ctx.narration_parts.append(text)
         return {"ok": True, "scene_id": sid, "place": place,
@@ -1084,12 +1097,16 @@ class NarratorAgent(Agent):
         target = self.store.get_scene(scene_id)
         fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
                                       target=scene_id, text=target.get("public_text", ""))
+        try:
+            if self.world is not None:
+                self.world.add_scene(scene_id, target.get("title") or scene_id,
+                                     target.get("location") or "", target.get("public_text") or "",
+                                     parent=ctx.state.current_scene, source="script")
+                self.world.enter(scene_id)
+        except Exception as exc:  # noqa: BLE001
+            ctx.state.rollback_event(fact["id"])
+            return {"error": f"进入场景失败：{type(exc).__name__}"}
         ctx.fact_events.append(fact)
-        if self.world is not None:
-            self.world.add_scene(scene_id, target.get("title") or scene_id,
-                                 target.get("location") or "", target.get("public_text") or "",
-                                 parent=ctx.state.current_scene, source="script")
-            self.world.enter(scene_id)
         ctx.move_used = True
         ctx.events.append({"type": "system", "text": f"进入：{target['title']}"})
         ctx.narration_parts.append(target.get("public_text", ""))

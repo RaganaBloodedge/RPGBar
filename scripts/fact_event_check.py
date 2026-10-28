@@ -36,6 +36,11 @@ def main() -> int:
     assert world_event["facts_added"] == ["world_time:1:10"]
     state.commit_event("scene_entered", actor="玩家", target="secret_room")
     assert state.current_scene == "secret_room"
+    rollback = state.commit_event("scene_entered", actor="玩家", target="courtyard")
+    assert state.current_scene == "courtyard"
+    assert state.rollback_event(rollback["id"])
+    assert state.current_scene == "secret_room"
+    assert not state.rollback_event(rollback["id"])
 
     with tempfile.TemporaryDirectory() as temp:
         archive = Chronicle(Path(temp) / "events.jsonl")

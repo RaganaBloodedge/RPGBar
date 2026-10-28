@@ -128,6 +128,14 @@ class World:
         self.set("scene", scene_id)
         self.con.commit()
 
+    def remove_scene(self, scene_id: str) -> None:
+        """移除尚未广播的沙盒生成场景，用于事实提交失败回滚。"""
+        self.con.execute("DELETE FROM entity WHERE scene_id=?", (scene_id,))
+        self.con.execute("DELETE FROM scene WHERE id=?", (scene_id,))
+        if self.get("scene") == scene_id:
+            self.set("scene", "")
+        self.con.commit()
+
     # ---------------------------------------------------------------- 实体
     def declare(self, name: str, kind: str = "object", detail: str = "",
                 scene_id: str | None = None) -> dict:

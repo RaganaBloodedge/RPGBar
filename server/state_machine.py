@@ -96,7 +96,13 @@ class GameState:
         """
         if not self.fact_events or self.fact_events[-1].get("id") != event_id:
             return False
-        self.fact_events.pop()
+        event = self.fact_events.pop()
+        if event.get("type") == "scene_entered":
+            before = event.get("scene_before")
+            after = event.get("scene_after")
+            self.current_scene = before
+            if after and self.visited and self.visited[-1] == after and after != before:
+                self.visited.pop()
         return True
 
     def remove_player(self, name):

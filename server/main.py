@@ -419,6 +419,9 @@ class Room:
         self.play = PlayDefinition.from_store(self.script_rel, self.store)
         # Agent 只读这份玩法定义，不再各自从 data 推导 mode/rules。
         self.store.play_definition = self.play
+        # 状态机先于 World 建立；即使是房间种子，也必须先登记为事实事件。
+        self.state = GameState(self.store, self.store.start_scene)
+        self._bootstrap_events = []
         # 编译器产出的知识库（五类容器）。**整局共用**，DM 只经 kb_lookup/kb_lore 读它；
         # 没编译过库的机器上这里是 None，DM 少两个工具，游戏照常跑。
         # 知识库和规则都由同一份 PlayDefinition 绑定，房间不再自行按文件名重复推导。
@@ -464,7 +467,6 @@ class Room:
         # 每一局的随机流都一模一样 —— "换个房间重开"其实拿到同一串随机数）。
         # 只进服务端日志、不下发：想复现某一局的剧情，从日志里取这个数。
         self.seed = secrets.randbits(63)
-        self.state = GameState(self.store, self.store.start_scene)
         self.clients = []  # list[(name, websocket)]
         self.lock = asyncio.Lock()
         self.owner = None  # 房主（第一个加入的人；建房者）才能改 DM / 房间设置
@@ -486,6 +488,18 @@ class Room:
             else None
         )
         self._summarized = len(self.chronicle) if self.chronicle else 0
+        if self.chronicle:
+            for fact in self._bootstrap_events:
+                self.chronicle.add(
+                    fact.get("text") or f"系统初始化：{fact.get('target', '')}",
+                    entry=fact["id"] + "-" + self.code,
+                    turn=fact["turn"], kind="event", scene=fact["scene_after"],
+                    actors=[fact["actor"]] if fact.get("actor") else [],
+                    event_type=fact["type"], facts_added=fact["facts_added"],
+                    facts_removed=fact["facts_removed"], source="server",
+                    scene_before=fact["scene_before"], scene_after=fact["scene_after"],
+                    target=fact["target"],
+                )
         # 角色卡：这个本要不要玩家填卡，由模型读剧本后给出（剧本级结论，按内容缓存）。
         # status 三态：pending（还没分析）/ ready（有结论）/ failed（这一轮没产出）。
         # card 为 None 不代表「不需要」——「不需要」是一张 required=false 的卡。
@@ -691,6 +705,9 @@ class Room:
                     "text": f"（剧本《{self.store.title}》建议至少 {self.min_players} 人，现在只有 {n} 人 —— 房主决定照常开始。）",
                 })
             await self.broadcast_room()
+            # 房间种子已经在建房时提交为事实；开局时补发给客户端，保证回放链完整。
+            for fact in self._bootstrap_events:
+                await self.broadcast({"type": "fact_event", "event": fact})
             # ---- session zero：沙盒剧本开局前先读库、定调、铺场景 ----
             try:
                 sandbox = self.play.generation_policy == "session_zero"
@@ -871,7 +888,7 @@ class Room:
         return build_provider(slot, seed=derive_seed(self.seed, label))
 
     def _seed_world(self) -> None:
-        """把剧本的起始场景写进世界层（只写一次；已有世界则原样恢复）。"""
+        """把剧本的起始场景作为一次可回放事实写进世界层。"""
         w = self.world
         if w is None or w.scene() is not None:
             return
@@ -881,14 +898,27 @@ class Room:
             sc = None
         if not sc:
             return
-        w.add_scene(sc["id"], sc.get("title") or sc["id"], sc.get("location") or "",
-                    sc.get("public_text") or "", source="script")
-        w.enter(sc["id"])
-        # 开局定在第一天 08:00（白天）。之后由 advance_time 推进昼夜与天数。
-        if not w.get("day"):
-            w.set("day", 1)
-            w.set("minutes", 8 * 60)
-            w.set("phase", "day")
+        def seed():
+            w.add_scene(sc["id"], sc.get("title") or sc["id"], sc.get("location") or "",
+                        sc.get("public_text") or "", source="script")
+            w.enter(sc["id"])
+            # 开局定在第一天 08:00（白天）。之后由 advance_time 推进昼夜与天数。
+            if not w.get("day"):
+                w.set("day", 1)
+                w.set("minutes", 8 * 60)
+                w.set("phase", "day")
+            return {"scene": sc["id"]}
+        from types import SimpleNamespace
+        ctx = SimpleNamespace(state=self.state, fact_events=[])
+        _fact, _result, error = commit_world_event(
+            ctx, "world_changed", actor="系统", target="room_seed",
+            text=f"初始化起始场景：{sc.get('title') or sc['id']}",
+            facts_added=["world_seed_ready"], mutation=seed, world=w,
+        )
+        if error:
+            print(f"[RPGBar] 世界层种子事务失败：{error}", flush=True)
+            return
+        self._bootstrap_events.extend(ctx.fact_events)
         print(f"[RPGBar] 世界层就绪：{w.path}（起始场景 {sc['id']}）")
 
     def narrator(self) -> NarratorAgent:

@@ -14,7 +14,8 @@ def commit_world_event(ctx, event_type: str, *, actor: str, target: str = "",
                        text: str = "", facts_added=None, facts_removed=None,
                        mutation: Callable[[], object],
                        world=None,
-                       decorate: Callable[[dict, object], None] | None = None):
+                       decorate: Callable[[dict, object], None] | None = None,
+                       allow_generated: bool = False):
     """执行一次 GameState + World 的补偿事务。
 
     返回 ``(fact, result, error)``；成功时 error 为空，失败时 fact/result 为 None。
@@ -24,6 +25,7 @@ def commit_world_event(ctx, event_type: str, *, actor: str, target: str = "",
         fact = ctx.state.commit_event(
             event_type, actor=actor, target=target, text=text,
             facts_added=facts_added, facts_removed=facts_removed,
+            allow_generated=allow_generated,
         )
     except Exception as exc:  # noqa: BLE001
         return None, None, f"事实提交失败：{type(exc).__name__}"

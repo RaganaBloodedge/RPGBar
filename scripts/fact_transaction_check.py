@@ -45,6 +45,37 @@ def main():
         mutation=mutate_then_fail,
     )
     assert error and world.present() == before
+
+    # 场景移动和时间推进也必须走同一个补偿边界：先写 World 再失败时，
+    # GameState 与 SQLite 都应回到提交前状态。
+    store.scenes["txn_scene"] = {
+        "id": "txn_scene", "title": "事务场景", "location": "事务地点",
+        "public_text": "", "dm_notes": "", "npcs": [], "keywords": [],
+        "flags_required": [], "flags_set": [], "checks": [], "exits": [],
+    }
+    ctx3 = SimpleNamespace(state=GameState(store, "gate"), fact_events=[])
+    world_before_scene = world.scene()["id"]
+    def move_then_fail():
+        world.add_scene("txn_scene", "事务场景", "事务地点", "")
+        world.enter("txn_scene")
+        raise RuntimeError("模拟移动后故障")
+    _fact, _result, error = commit_world_event(
+        ctx3, "scene_entered", actor="测试", target="txn_scene", world=world,
+        mutation=move_then_fail,
+    )
+    assert error and ctx3.state.current_scene == "gate"
+    assert world.scene()["id"] == world_before_scene
+
+    ctx4 = SimpleNamespace(state=GameState(store, "gate"), fact_events=[])
+    world_before_turn = world.get("turn", "0")
+    def tick_then_fail():
+        world.bump_turn()
+        raise RuntimeError("模拟时间写入后故障")
+    _fact, _result, error = commit_world_event(
+        ctx4, "time_advanced", actor="测试", target="turn", world=world,
+        mutation=tick_then_fail,
+    )
+    assert error and world.get("turn", "0") == world_before_turn
     world.close()
     world_path.unlink(missing_ok=True)
     print("fact transaction: PASS")

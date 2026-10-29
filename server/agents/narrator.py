@@ -687,14 +687,13 @@ class NarratorAgent(Agent):
             "SELECT * FROM scene WHERE place=? OR label=?", (place, place)).fetchone()
         if row:  # 去过的地方就回去，不重复建
             sid = row["id"]
-            fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
-                                          target=sid, allow_generated=True)
-            try:
-                self.world.enter(sid)
-            except Exception as exc:  # noqa: BLE001
-                ctx.state.rollback_event(fact["id"])
-                return {"error": f"返回地点失败：{type(exc).__name__}"}
-            ctx.fact_events.append(fact)
+            fact, _result, error = commit_world_event(
+                ctx, "scene_entered", actor=ctx.player_name, target=sid,
+                mutation=lambda: (self.world.enter(sid), True)[1],
+                world=self.world, allow_generated=True,
+            )
+            if error:
+                return {"error": f"返回地点失败：{error}"}
             ctx.events.append({"type": "system", "text": f"回到：{place}"})
             return {"ok": True, "scene_id": sid, "returned": True,
                     "scene": self.store.scene_brief(sid, flags=ctx.state.flags)}
@@ -703,7 +702,6 @@ class NarratorAgent(Agent):
             return {"error": "本剧本是固定场景，请用 move_to（出口见【当前场景】）",
                     "available": [e["to"] for e in cur.get("exits") or []]}
         n = int(self.world.get("gen_count", "0") or 0) + 1
-        self.world.set("gen_count", n)
         sid = f"gen{n}"
         text = (description or "").strip()[:600] or f"{place}。"
         scene = {
@@ -711,22 +709,18 @@ class NarratorAgent(Agent):
             "public_text": text, "dm_notes": "", "npcs": [], "keywords": [place],
             "flags_required": [], "flags_set": [], "checks": [], "exits": [],
         }
+        fact, result, error = commit_world_event(
+            ctx, "scene_entered", actor=ctx.player_name, target=sid,
+            mutation=lambda: self.world.grow_place(
+                place, description=text, parent=ctx.state.current_scene or ""),
+            world=self.world, allow_generated=True,
+        )
+        if error or not result:
+            return {"error": f"生成地点失败：{error or 'World 未返回场景'}"}
+        # World 已成功提交后再让 ScriptStore 暴露该动态场景。
+        sid = str(result)
+        scene["id"] = sid
         self.store.scenes[sid] = scene
-        fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
-                                      target=sid, allow_generated=True)
-        try:
-            self.world.add_scene(sid, place, place, text,
-                                 parent=ctx.state.current_scene or "", source="generated")
-            self.world.enter(sid)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            self.store.scenes.pop(sid, None)
-            try:
-                self.world.remove_scene(sid)
-            except Exception:
-                pass
-            return {"error": f"生成地点失败：{type(exc).__name__}"}
-        ctx.fact_events.append(fact)
         ctx.events.append({"type": "system", "text": f"进入：{place}"})
         ctx.narration_parts.append(text)
         return {"ok": True, "scene_id": sid, "place": place,
@@ -820,14 +814,23 @@ class NarratorAgent(Agent):
     def _t_advance_time(self, ctx, minutes=10, reason=""):
         if self.world is None:
             return {"error": "这一局没有世界层"}
-        ev = self.world.advance(minutes)
+        holder = {}
+        def advance():
+            holder["event"] = self.world.advance(minutes)
+            return {"changed": True, "event": holder["event"]}
+        fact, result, error = commit_world_event(
+            ctx, "time_advanced", actor=ctx.player_name, target=str(minutes),
+            text=(reason or "").strip()[:240],
+            mutation=advance, world=self.world,
+            decorate=lambda f, _r: f.update(facts_added=[
+                f"world_time:{self.world.get('day')}:{self.world.get('turn')}"
+            ]),
+        )
+        if error:
+            return {"error": f"时间推进失败：{error}"}
+        ev = holder.get("event")
         if ev:
             ctx.events.append(ev)
-            ctx.fact_events.append(ctx.state.commit_event(
-                "time_advanced", actor=ctx.player_name, target=str(minutes),
-                text=ev.get("text", ""), facts_added=[
-                    f"world_time:{self.world.get('day')}:{self.world.get('turn')}"
-                ]))
         return {"ok": True, "turn": self.world.get("turn"), "day": self.world.get("day"),
                 "phase": self.world.get("phase"),
                 "note": ev["text"] if ev else f"过去 {minutes} 分钟。"}
@@ -1056,18 +1059,21 @@ class NarratorAgent(Agent):
                 "required_flag": ex.get("condition"),
             }
         target = self.store.get_scene(scene_id)
-        fact = ctx.state.commit_event("scene_entered", actor=ctx.player_name,
-                                      target=scene_id, text=target.get("public_text", ""))
-        try:
-            if self.world is not None:
-                self.world.add_scene(scene_id, target.get("title") or scene_id,
-                                     target.get("location") or "", target.get("public_text") or "",
-                                     parent=ctx.state.current_scene, source="script")
-                self.world.enter(scene_id)
-        except Exception as exc:  # noqa: BLE001
-            ctx.state.rollback_event(fact["id"])
-            return {"error": f"进入场景失败：{type(exc).__name__}"}
-        ctx.fact_events.append(fact)
+        def move_world():
+            if self.world is None:
+                return True
+            self.world.add_scene(scene_id, target.get("title") or scene_id,
+                                 target.get("location") or "", target.get("public_text") or "",
+                                 parent=ctx.state.current_scene, source="script")
+            self.world.enter(scene_id)
+            return True
+        fact, _result, error = commit_world_event(
+            ctx, "scene_entered", actor=ctx.player_name, target=scene_id,
+            text=target.get("public_text", ""), mutation=move_world,
+            world=self.world,
+        )
+        if error:
+            return {"error": f"进入场景失败：{error}"}
         ctx.move_used = True
         ctx.events.append({"type": "system", "text": f"进入：{target['title']}"})
         ctx.narration_parts.append(target.get("public_text", ""))

@@ -105,6 +105,7 @@ from .dice import roll
 from .dm import DM
 from .embedding import get_embedder
 from .engine import BACKENDS, derive_seed, gpu_probe, normalize_backend
+from .fact_transaction import commit_world_event
 from .llm import ToolCallingUnsupported, build_provider
 from . import llamacpp as llamacpp_mod
 from .lobby import (
@@ -1380,21 +1381,41 @@ class Room:
                     except Exception:  # noqa: BLE001
                         place = ""
                     if place:
-                        sid = self.world.grow_place(place, parent=self.state.current_scene)
+                        n = int(self.world.get("gen_count", "0") or 0) + 1
+                        sid = f"gen{n}"
                         self.store.scenes[sid] = {
                             "id": sid, "chapter": 1, "title": place, "location": place,
                             "public_text": "", "dm_notes": "", "npcs": [],
                             "keywords": [place], "flags_required": [], "flags_set": [],
                             "checks": [], "exits": [],
                         }
-                        ctx.fact_events.append(self.state.commit_event(
-                            "scene_entered", actor=name, target=sid,
-                            allow_generated=True))
-                        moved = place
-                        ctx.move_used = True
-                        await self.broadcast({"type": "system", "text": f"进入：{place}"})
+                        fact, result, error = commit_world_event(
+                            ctx, "scene_entered", actor=name, target=sid,
+                            mutation=lambda: self.world.grow_place(
+                                place, parent=self.state.current_scene),
+                            world=self.world, allow_generated=True,
+                            decorate=lambda f, r: f.update(target=str(r)),
+                        )
+                        if error:
+                            self.store.scenes.pop(sid, None)
+                            print(f"[RPGBar] 沙盒移动事务失败：{error}", flush=True)
+                        else:
+                            sid = str(result)
+                            moved = place
+                            ctx.move_used = True
+                            await self.broadcast({"type": "system", "text": f"进入：{place}"})
                 if self.world is not None:
-                    self.world.bump_turn()
+                    _fact, _result, error = commit_world_event(
+                        ctx, "time_advanced", actor=name, target="turn",
+                        facts_added=[f"world_turn:{int(self.world.get('turn', '0') or 0) + 1}"],
+                        mutation=lambda: (self.world.bump_turn(), True)[1],
+                        world=self.world,
+                        decorate=lambda f, _r: f.update(facts_added=[
+                            f"world_turn:{self.world.get('turn', '0')}"
+                        ]),
+                    )
+                    if error:
+                        print(f"[RPGBar] 世界回合事务失败：{error}", flush=True)
                     ctx.world_present = self.world.present_text()
                     ctx.world_digest = self.world.digest_text()
                     ctx.world_unresolved = self.world.unresolved(

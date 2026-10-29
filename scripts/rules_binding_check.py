@@ -23,6 +23,10 @@ def main() -> int:
     tomb = PlayDefinition.from_store("totsk_l1.json", ScriptStore("scripts/totsk_l1.json"))
     assert (coc.mode, coc.generation_policy) == ("sandbox", "session_zero")
     assert (tomb.mode, tomb.generation_policy) == ("scenario", "prebuilt_scene_graph")
+    assert coc.load_knowledge() is not None, "PlayDefinition 未能加载 CoC 知识库"
+    assert coc.load_rules(coc.load_knowledge()).is_d100, "PlayDefinition 未能加载 CoC d100"
+    assert tomb.load_knowledge() is None, "固定冒险意外加载 CoC 知识库"
+    assert not tomb.load_rules(None).is_d100, "固定冒险的默认规则不是 d20"
     print("rules binding: PASS (CoC=d100, Tomb=d20 fallback, KB isolated)")
     return 0
 

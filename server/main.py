@@ -421,25 +421,14 @@ class Room:
         self.store.play_definition = self.play
         # 编译器产出的知识库（五类容器）。**整局共用**，DM 只经 kb_lookup/kb_lore 读它；
         # 没编译过库的机器上这里是 None，DM 少两个工具，游戏照常跑。
-        try:
-            from .kb_tools import kb_store as _kb_store
-
-            self._kb = _kb_store(self.script_rel)
-        except Exception:  # noqa: BLE001
-            self._kb = None
+        # 知识库和规则都由同一份 PlayDefinition 绑定，房间不再自行按文件名重复推导。
+        self._kb = self.play.load_knowledge()
         self.knowledge = ScriptKnowledgeAdapter(self.store, self._kb)
         self.store.script_knowledge = self.knowledge
-        # 判定引擎：读知识库目录旁的 rule_profile.json（COC → d100 掷低）。
-        # 没有档案就是 None，DM 退回 d20 —— 老剧本不受影响。
-        self.rules = None
-        try:
-            from .rules import Rules
-
-            self.rules = Rules.load(getattr(self._kb, "path", None))
-            if getattr(self, "rules", None) is not None:
-                print(f"[RPGBar] 判定档案：{self.rules.describe()}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[RPGBar] 判定档案加载失败（退回 d20）：{exc}")
+        # 没有档案时由 Narrator 使用通用 d20；规则来源仍记录在 PlayDefinition。
+        self.rules = self.play.load_rules(self._kb)
+        if self.rules is not None:
+            print(f"[RPGBar] 判定档案：{self.rules.describe()}")
         # 这局的世界层：独立库（data/worlds/<剧本>/<房间>.sqlite）。
         # 剧本只提供**种子场景**，之后世界怎么长由这一局自己记。
         self.world = None

@@ -52,6 +52,22 @@ class PlayDefinition:
     def is_sandbox(self) -> bool:
         return self.mode == "sandbox"
 
+    def load_knowledge(self):
+        """按本玩法绑定的内容引用加载可选编译知识库。"""
+        try:
+            from .kb_tools import kb_store
+            return kb_store(self.script_rel)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def load_rules(self, knowledge=None):
+        """按同一玩法绑定的规则档案加载判定器。"""
+        try:
+            from .rules import Rules
+            return Rules.load(getattr(knowledge, "path", None))
+        except Exception:  # noqa: BLE001
+            return None
+
     @classmethod
     def from_store(cls, script_rel: str, store) -> "PlayDefinition":
         data = getattr(store, "data", None) or {}

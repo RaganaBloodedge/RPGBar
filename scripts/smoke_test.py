@@ -49,6 +49,8 @@ from server.npc import ARCHETYPES, NpcService, PersonaCard, infer_archetype
 from server.rag import ScriptStore
 from server.script_loader import MAX_INDEX_CHUNKS, build_script_prompt, parse_script
 from server.state_machine import GameState
+from server.action_validation import validate as validate_action
+from server.agents.action_judge import ActionJudgement
 
 SCRIPT = Path(__file__).resolve().parent / "sample_script.json"
 TOTSK = Path(__file__).resolve().parent / "totsk_l1.json"
@@ -1064,7 +1066,7 @@ async def run_unit_chronicle():
 
     # --- 9. 热层注入 user 消息（只给结论，不灌全文） ---
     msg = n_with.build_user_message(NarratorContext(state=state), "看看周围")
-    check("DM：user 消息带剧情档案热层", "剧情档案（热层）" in msg, "")
+    check("DM：user 消息带内部记忆热层", "内部记忆：只用于理解" in msg, "")
 
     # --- 10. 预热：把「首次前向」的成本挪到等待室 ---
     #  实测 4B：2000 token 的首次生成 26 秒，同长度第二次 7-10 秒。预热就是空转一次，
@@ -1220,26 +1222,38 @@ async def run_unit_chronicle():
     check("元问题：长句不误伤",
           narrator_mod.meta_answer("我仔细回忆此前的规则，看看能不能用上") == "", "")
 
-    # --- 14. 越界动作：入口判定 + user 消息硬指令 + 事后核对 ---
+    # --- 14. 不可承接动作：由 ActionJudge + Validator 判定，再交给 Narrator 护栏 ---
     st_o = GameState(l1, l1_start)
     st_o.add_player("测试员", {})
     fp_o = FakeProvider([
         _reply(tool_call("finish", {"narration": "你捡来枯枝生火，火堆很快燃了起来。"})),
     ])
     ctx_o = NarratorContext(state=st_o, player_name="测试员")
+    blocked_plan = validate_action(
+        l1.get_scene(l1_start), "我生火取暖",
+        ActionJudgement(intent="blocked", confidence=0.95, refusal=True), False,
+    )
+    check("行动裁定：无机制动作被标为 blocked",
+          blocked_plan.intent == "blocked", str(blocked_plan))
+    # Narrator 单元测试直接接收上游裁定结果；真实房间路径由 on_action 设置该字段。
+    ctx_o.oob_verb = "我生火取暖"
     res_o = await NarratorAgent(l1, fp_o).run(ctx_o, "我生火取暖")
-    check("越界：入口判出越界动词", ctx_o.oob_verb == "生火", ctx_o.oob_verb)
+    check("不可承接动作：Narrator 接收上游护栏", bool(ctx_o.oob_verb), ctx_o.oob_verb)
     msgs = NarratorAgent(l1, None).init_messages(ctx_o, "我生火取暖")
     check("越界：user 消息带硬指令（不得描写成功）",
           "越界动作" in msgs[-1]["content"] and "不得描写这个动作成功" in msgs[-1]["content"],
           msgs[-1]["content"][-120:])
-    check("越界：旁白写成成功 → 丢掉",
-          res_o.text == "" and "越界" in getattr(res_o, "drop_reason", ""),
+    check("不可承接动作：旁白未明确拒绝 → 丢掉",
+          res_o.text == "" and "当前玩法不支持" in getattr(res_o, "drop_reason", ""),
           f"text={res_o.text[:30]!r} reason={getattr(res_o, 'drop_reason', '')}")
-    # 命中检定/出口关键词的动作不判越界
-    check("越界：动作命中触发说法时不判越界",
-          narrator_mod.out_of_bounds_verb("我砸开石像看看", l1.get_scene("guard_room")) == ""
-          if "guard_room" in l1.scenes else True, "")
+    # 命中剧本声明的检定 id 时由 Validator 接受，不依赖通用关键词表。
+    accepted_plan = validate_action(
+        l1.get_scene("guard_tomb"), "我砸开石像看看",
+        ActionJudgement(intent="check", check_id="smash_statue", confidence=0.95), False,
+    )
+    check("行动裁定：声明的检定动作可承接",
+          accepted_plan.intent == "check" and accepted_plan.check_id == "smash_statue",
+          str(accepted_plan))
     # 旁白提到越界动词但没有成功断言（合法的拒绝写法）不丢
     st_o2 = GameState(l1, l1_start)
     st_o2.add_player("测试员", {})
@@ -2657,7 +2671,8 @@ async def run_unit_lobby():
               all("password" not in r for r in listed["rooms"]), str(listed["rooms"][:1]))
         check("大厅列表：带建房表单的缺省值（按活动剧本算）",
               isinstance((listed.get("defaults") or {}).get("players"), dict), str(listed.get("defaults")))
-        check("大厅列表：带上当前活动剧本名", bool(listed.get("active_title")), str(listed.get("active_title")))
+        check("大厅列表：没有默认活动剧本", listed.get("active_title") in (None, ""),
+              str(listed.get("active_title")))
 
         # ---- 进不去的人不该把房间搞脏 ----
         # join_denied 只是"能不能进"的判断，这里顺带确认它**没有副作用**：
